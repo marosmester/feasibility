@@ -132,11 +132,15 @@ uv sync --extra sim                       # standalone env; the shared root env 
 # system CMake must be < 4.0 (openmesh); otherwise prefix a 3.x on PATH — see README
 PATH=~/.local/opt/cmake-3.27.0-linux-x86_64/bin:$PATH uv sync --extra sim
 
-python examples/helhest/surface_drive.py            # Hydra: append key=value overrides
-pytest tests/                                        # ostrich tests DO use pytest
-pytest tests/test_joint_constraints.py -k revolute   # single test (it's parametrized by joint type)
-bash tests/differentiable_simulator/run_all.sh       # gradient-correctness suite
+python examples/helhest/surface_drive.py rendering=headless   # Hydra: append key=value overrides
+pytest tests/test_joint_constraints.py -k revolute   # top-level tests DO use pytest
+bash tests/differentiable_simulator/run_all.sh       # gradient suite — NOT via pytest
 ```
+
+Don't run `pytest tests/` wholesale: `tests/differentiable_simulator/` has its own
+`run_all.sh` that launches **one process per test** "to avoid CUDA state contamination
+between models with different topologies", which pytest's single process defeats. Use pytest
+for the four top-level test files only.
 
 `experiments/` holds the paper-facing studies (sim-to-real, dt stability, gradient quality,
 scalability, terrain traversal); `test_scripts/` is exploratory probe/diagnostic code, not a
