@@ -1,2 +1,4 @@
 .claude
 *.txt
+.venv/
+__pycache__/

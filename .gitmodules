@@ -1,0 +1,6 @@
+[submodule "helhest_stack"]
+	path = helhest_stack
+	url = https://github.com/aleskucera/helhest_stack.git
+[submodule "ostrich"]
+	path = ostrich
+	url = https://github.com/aleskucera/ostrich.git

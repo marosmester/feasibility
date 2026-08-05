@@ -1,0 +1,69 @@
+# Umbrella project: no source of its own, it only exists to resolve ONE shared .venv
+# in which both submodules are importable (`import ostrich`, `import helhest`, and
+# ostrich's `examples.*`, which its wheel also packages).
+#
+# Deliberately NOT a uv workspace: ostrich/pyproject.toml already declares its own
+# `[tool.uv.workspace]` (member third_party/newton), and uv does not support nested
+# workspaces -- making this a workspace would mean editing a submodule's manifest and
+# carrying a permanent diff against upstream. Editable path deps give the same shared
+# env while leaving both trees pristine.
+#
+# Prerequisite (the newton path below does not exist until this is run):
+#     git -C ostrich submodule update --init --recursive
+# Then:
+#     uv sync           # several GB: torch/cu128 + CUDA wheels; builds openmesh (needs CMake < 4.0)
+[project]
+name = "feasibility"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "ostrich[sim]",
+  "helhest-stack[viz,data]",
+  # Direct dep only so the index pin below can take effect -- see the torch note in
+  # [tool.uv.sources]. Version floor matches ostrich's own.
+  "torch>=2.9.1",
+]
+
+[tool.uv]
+# Nothing to build here; this project is just a dependency manifest.
+package = false
+
+# Copied from ostrich/pyproject.toml: newton's two CUDA-flavoured extras are mutually
+# exclusive and uv needs to be told, or resolution fails.
+conflicts = [
+  [
+    { package = "newton", extra = "torch-cu12" },
+    { package = "newton", extra = "torch-cu13" },
+  ],
+]
+
+# IMPORTANT: `tool.uv.sources` is NOT transitive -- uv honours it only for the project
+# being resolved, never for a path dependency's own manifest. So every source that
+# ostrich (and newton) rely on internally has to be restated here, or uv resolves those
+# names against PyPI instead:
+#
+#   * newton    -- ostrich declares `newton = { workspace = true }`, meaningless from
+#                  here; without the override uv would fetch an unrelated PyPI `newton`.
+#   * warp-lang -- ostrich pulls it from the nvidia index.
+#   * torch     -- newton's `torch-cu12` extra is what pins torch to the cu128 registry
+#                  upstream (ostrich's lock: 2.9.1+cu128). That pin is lost here, hence
+#                  the explicit index below plus the direct dependency above.
+[tool.uv.sources]
+ostrich = { path = "ostrich", editable = true }
+helhest-stack = { path = "helhest_stack", editable = true }
+newton = { path = "ostrich/third_party/newton", editable = true }
+warp-lang = { index = "nvidia" }
+torch = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+url = "https://pypi.org/simple"
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com/"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
