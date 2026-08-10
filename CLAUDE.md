@@ -22,6 +22,27 @@ models **Marv** (four-flipper tracked robot) and other platforms.
 everywhere, black line-length 100 + reorder-python-imports, and **device-native Warp arrays
 rather than numpy for any bulk/data-parallel stage**). Read it before editing that tree.
 
+**Root-level `demos/` and `src/feasibility/` are in-progress and currently untracked** —
+don't treat either as settled architecture. `demos/helhest_common.py` +
+`demos/helhest_in_ostrich.py` are copies of `ostrich/examples/helhest_junior/{common,control}.py`,
+running an ostrich example from the shared root env instead of `ostrich`'s own.
+`src/feasibility/__init__.py` is an empty, unreferenced stub — the root `pyproject.toml` has
+`package = false` and no `[build-system]`, so nothing installs or imports it; it looks like
+leftover `uv init` scaffolding.
+
+Two things that copy has to get right, and that any further root-level demo will hit too:
+
+* **Hydra configs and mesh assets live under `ostrich/examples/`, not at the repo root.** A
+  `__file__`-relative `parent.parent/"conf"` (correct in its original home) resolves to a
+  nonexistent `<root>/conf` here. Anchor on the `examples` package instead —
+  `pathlib.Path(examples.__file__).parent` — which the shared editable install resolves to
+  `ostrich/examples/`.
+* **`python demos/foo.py` puts `demos/` on `sys.path`, not the repo root**, so a
+  `from demos.x import ...` self-reference raises `ModuleNotFoundError: No module named 'demos'`.
+  Either run it as `python -m demos.foo` (root on `sys.path`; `demos` resolves as a PEP 420
+  namespace package, no `__init__.py` needed) or keep the try/except fallback to the bare
+  `from x import ...` that ostrich's originals use.
+
 ## Python environment
 
 The root [pyproject.toml](pyproject.toml) is a **dependency manifest only** (`package = false`)
@@ -158,5 +179,8 @@ git -C helhest_stack commit -am "..."   # work happens here (its own branch/remo
 git add helhest_stack && git commit     # superproject only stores the SHA
 ```
 
-The superproject tracks nothing but `.gitmodules` and those two gitlinks — never add source
-files at the root. `*.txt` and `.claude/` are gitignored here, so `context.txt` is local-only.
+By design the superproject should track nothing but `.gitmodules` and those two gitlinks —
+avoid adding permanent source at the root; a submodule's own tree (or its `examples/`) is
+almost always the right home. (See the `demos/`/`src/feasibility/` caveat above for an
+in-progress exception that hasn't been reconciled yet.) `*.txt` and `.claude/` are gitignored
+here, so `context.txt` is local-only.
