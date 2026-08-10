@@ -15,8 +15,8 @@ from ostrich import RenderingConfig
 from ostrich import SimulationConfig
 from omegaconf import DictConfig
 
-# Works both as `python -m demos.helhest_in_ostrich` (CWD on sys.path, `demos` resolves as
-# a namespace package) and as `python demos/helhest_in_ostrich.py` (only `demos/` itself is
+# Works both as `python -m demos.ostrich_keyboard` (CWD on sys.path, `demos` resolves as
+# a namespace package) and as `python demos/ostrich_keyboard.py` (only `demos/` itself is
 # on sys.path, so the package-qualified name is not importable).
 try:
     from demos.helhest_common import create_helhest_junior_model
