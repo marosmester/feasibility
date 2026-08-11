@@ -93,7 +93,7 @@ K_P = 15000.0
 # --- Command schedule: (duration_s, v [m/s], omega [rad/s], CCW+) ---
 V_DRIVE = 1.0
 YAW_RATE = 0.5  # -> 2.5 m nominal turn radius
-T_ARC = (math.pi / 2.0) / YAW_RATE  # exactly 90 deg if the robot never slips
+T_ARC = 5.0318  # empirically tuned, instead of the (math.pi / 2.0) / YAW_RATE  
 PHASES = [
     (2.0, V_DRIVE, 0.0),
     (T_ARC, V_DRIVE, YAW_RATE),
@@ -228,7 +228,7 @@ def ostrich_vel_cmd(cfg: DictConfig):
         f"-> implied alpha {NOMINAL_YAW_RAD / achieved_yaw:.2f}"
     )
 
-    out = pathlib.Path(cfg.get("out", "/tmp/ostrich_vel_cmd.npz"))
+    out = pathlib.Path(cfg.get("out", pathlib.Path(__file__).parent.parent / "outputs" /"ostrich_vel_cmd.npz"))
     np.savez_compressed(
         out,
         dt=np.float32(dt),
