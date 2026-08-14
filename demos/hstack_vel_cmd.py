@@ -350,7 +350,7 @@ def run_view(args: argparse.Namespace) -> None:
         _draw(*terrain[:3], terrain[3])
         if not args.no_ghost:
             draw_trail(
-                list(zip(ghost_xy[:, 0], ghost_xy[:, 1], np.full(len(ghost_xy), 0.03))),
+                list(zip(ghost_xy[:, 0], ghost_xy[:, 1], ostrich_pose[:, 2] + 0.03)),
                 (0.86, 0.08, 0.24),
             )
         draw_trail(trail, (0.27, 0.51, 0.71))
