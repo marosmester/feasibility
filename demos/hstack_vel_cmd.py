@@ -25,6 +25,7 @@ Usage:
     python demos/hstack_vel_cmd.py --no-view                # headless, batch
     python demos/hstack_vel_cmd.py --no-view --k-turn 1.0    # outdoor turn gain
     python demos/hstack_vel_cmd.py --no-view --dt-sweep      # dt-invariance check
+    python demos/hstack_vel_cmd.py --no-view --terrain assets/ramp  # explicit terrain
 """
 
 from __future__ import annotations
@@ -40,9 +41,12 @@ import warp as wp
 
 from helhest import dynamics
 from helhest import friction as friction_mod
-from helhest import heightmap as hm_mod
 from helhest.engine import ForwardSimulator
-from helhest.engine import GridParams
+
+try:
+    from demos.heightmap_reader import HeightMapReader
+except ModuleNotFoundError:
+    from heightmap_reader import HeightMapReader
 
 IN_NPZ = pathlib.Path(__file__).parent.parent / "outputs" / "ostrich_vel_cmd.npz"
 OUT_NPZ = pathlib.Path(__file__).parent.parent / "outputs" / "hstack_vel_cmd.npz"
@@ -76,6 +80,26 @@ def grid_extent(
     return xlim, ylim
 
 
+def load_terrain(
+    terrain_path: str | None,
+    ostrich_npz: pathlib.Path,
+    ostrich_pose: np.ndarray,
+    margin: float,
+    cell: float,
+) -> HeightMapReader:
+    """--terrain PATH if given; else whatever demos/ostrich_vel_cmd.py saved
+    next to its output npz (identical physical terrain to the ostrich run);
+    else flat ground sized from the ostrich trajectory bbox (older npz with
+    no saved terrain asset)."""
+    if terrain_path:
+        return HeightMapReader.load(terrain_path)
+    stem = ostrich_npz.with_suffix("")
+    if stem.with_suffix(".png").exists() and stem.with_suffix(".yaml").exists():
+        return HeightMapReader.load(stem)
+    xlim, ylim = grid_extent(ostrich_pose, margin)
+    return HeightMapReader.flat(xlim=xlim, ylim=ylim, cell=cell)
+
+
 def euler_zyx_to_quat_xyzw(yaw: np.ndarray, pitch: np.ndarray, roll: np.ndarray) -> np.ndarray:
     """(yaw, pitch, roll) [T] -> quaternion [T,4] (qx,qy,qz,qw), R = Rz(yaw)@Ry(pitch)@Rx(roll)."""
     cy, sy = np.cos(yaw * 0.5), np.sin(yaw * 0.5)
@@ -90,14 +114,13 @@ def euler_zyx_to_quat_xyzw(yaw: np.ndarray, pitch: np.ndarray, roll: np.ndarray)
 
 def rollout(
     setpoints: np.ndarray,
-    xlim: tuple[float, float],
-    ylim: tuple[float, float],
+    hmap: HeightMapReader,
     dt: float,
     k_turn: float,
     mu: float,
     device: str,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Runs one ForwardSimulator rollout on flat, uniform-mu ground.
+    """Runs one ForwardSimulator rollout on hmap's terrain, uniform-mu ground.
 
     Returns controlled [T,3] (x,y,yaw), derived [T,3] (z,pitch,roll), clearance [T],
     residual [T], turning [T,2] (alpha, x_icr), wheel_qd [T,3] realized wheel speed
@@ -105,17 +128,18 @@ def rollout(
     sliced to drop the row-0 pre-command pose, so index k lines up with
     setpoints[k] the same way ostrich's pose[k] does."""
     T = len(setpoints)
-    scene = hm_mod.flat(xlim=xlim, ylim=ylim, cell=GRID_CELL)
-    mu_field = friction_mod.uniform(mu, xlim=xlim, ylim=ylim, cell=GRID_CELL)
-    grid = GridParams(scene.nx, scene.ny, scene.cell, scene.x0, scene.y0)
+    elevation, grid = hmap.to_hstack(device)
+    # Reconstruct xlim/ylim that reproduce hmap's exact (nx, ny) grid, so
+    # mu_field.H.shape matches elevation's shape exactly.
+    mu_xlim = (hmap.x0, hmap.x0 + (hmap.nx - 1) * hmap.cell)
+    mu_ylim = (hmap.y0, hmap.y0 + (hmap.ny - 1) * hmap.cell)
+    mu_field = friction_mod.uniform(mu, xlim=mu_xlim, ylim=mu_ylim, cell=hmap.cell)
 
     solver = dynamics.execution_solver(dt=dt, k_turn=k_turn)
     sim = ForwardSimulator(
         dynamics.robot_params(), solver, grid, batch_size=1, n_steps=T, device=device
     )
-    sim.set_terrain(
-        wp.array(np.ascontiguousarray(scene.H, np.float32), dtype=wp.float32, device=device)
-    )
+    sim.set_terrain(elevation)
     sim.set_friction(mu_field)
     controlled, derived, clearance, residual = sim.rollout(
         np.ascontiguousarray(setpoints[:, None, :], np.float32), (0.0, 0.0, 0.0), np.zeros(3)
@@ -157,17 +181,17 @@ def print_summary(
 def run_headless(args: argparse.Namespace) -> None:
     wp.init()
     setpoints, t_new, ostrich_pose, phases = load_ostrich_commands(IN_NPZ, args.dt)
-    xlim, ylim = grid_extent(ostrich_pose, GRID_MARGIN)
+    hmap = load_terrain(args.terrain, IN_NPZ, ostrich_pose, GRID_MARGIN, GRID_CELL)
 
     if args.dt_sweep:
         for dt in (0.1, 0.05, 0.03, 0.01):
             sp, _, _, _ = load_ostrich_commands(IN_NPZ, dt)
-            controlled, *_ = rollout(sp, xlim, ylim, dt, args.k_turn, args.mu, args.device)
+            controlled, *_ = rollout(sp, hmap, dt, args.k_turn, args.mu, args.device)
             print_summary(dt, controlled, ostrich_pose, args.mu, args.k_turn)
         return
 
     controlled, derived, clearance, residual, turning, wheel_qd = rollout(
-        setpoints, xlim, ylim, args.dt, args.k_turn, args.mu, args.device
+        setpoints, hmap, args.dt, args.k_turn, args.mu, args.device
     )
     print_summary(args.dt, controlled, ostrich_pose, args.mu, args.k_turn)
 
@@ -219,15 +243,14 @@ def run_view(args: argparse.Namespace) -> None:
 
     wp.init()
     setpoints, t_new, ostrich_pose, _phases = load_ostrich_commands(IN_NPZ, args.dt)
-    xlim, ylim = grid_extent(ostrich_pose, GRID_MARGIN)
+    hmap = load_terrain(args.terrain, IN_NPZ, ostrich_pose, GRID_MARGIN, GRID_CELL)
     controlled, derived, *_ = rollout(
-        setpoints, xlim, ylim, args.dt, args.k_turn, args.mu, args.device
+        setpoints, hmap, args.dt, args.k_turn, args.mu, args.device
     )
     T = len(controlled)
     print_summary(args.dt, controlled, ostrich_pose, args.mu, args.k_turn)
 
-    scene = hm_mod.flat(xlim=xlim, ylim=ylim, cell=GRID_CELL)
-    terrain = build_terrain(scene)
+    terrain = build_terrain(hmap)
     robot = build_robot()
 
     ghost_xy = ostrich_pose[:, :2] - ostrich_pose[0, :2]
@@ -352,6 +375,14 @@ def main() -> None:
     )
     ap.add_argument(
         "--mu", type=float, default=0.8, help="uniform ground friction (default 0.8, matches ostrich)"
+    )
+    ap.add_argument(
+        "--terrain",
+        default=None,
+        metavar="PATH",
+        help="HeightMapReader PNG+YAML terrain asset (path without extension); default: "
+        "whatever demos/ostrich_vel_cmd.py saved next to outputs/ostrich_vel_cmd.npz, "
+        "or flat ground sized from its trajectory bbox if none was saved",
     )
     ap.add_argument("--device", default="cuda:0", help="Warp device (default cuda:0)")
     ap.add_argument("--no-view", action="store_true", help="headless: skip the GL viewer, save npz")

@@ -39,6 +39,7 @@ Usage:
     python demos/ostrich_vel_cmd.py                       # GL viewer
     python demos/ostrich_vel_cmd.py rendering=headless     # batch, no window
     python demos/ostrich_vel_cmd.py +out=/tmp/run1.npz
+    python demos/ostrich_vel_cmd.py +terrain_path=assets/ramp  # non-flat terrain
 """
 import math
 import pathlib
@@ -63,6 +64,11 @@ try:
     from demos.helhest_common import create_helhest_junior_model
 except ModuleNotFoundError:
     from helhest_common import create_helhest_junior_model
+
+try:
+    from demos.heightmap_reader import HeightMapReader
+except ModuleNotFoundError:
+    from heightmap_reader import HeightMapReader
 
 CONFIG_PATH = pathlib.Path(examples.__file__).parent.joinpath("conf")
 
@@ -89,6 +95,16 @@ HALF_TRACK = 0.365  # [m], (LEFT_WHEEL_POS.y - RIGHT_WHEEL_POS.y) / 2
 # models a stiff velocity source, not a real drivetrain. Use it to isolate
 # ground slip; a torque-limited actuator would be needed for motor realism.
 K_P = 15000.0
+
+# Terrain extent must cover the whole commanded path: add_shape_heightfield is
+# a FINITE shape, unlike the add_ground_plane it replaces -- a query outside
+# the extent gets pushed to "no contact" (sdf_contact.py's intentional
+# ghost-contact-avoidance tradeoff at the footprint boundary), so a robot that
+# drives past the edge falls through. PHASES below covers ~9 m forward with a
+# 2 m-radius arc; these are generous, hand-tuned padding, not derived from it.
+TERRAIN_XLIM = (-2.0, 12.0)
+TERRAIN_YLIM = (-6.0, 6.0)
+TERRAIN_CELL = 0.05
 
 # --- Command schedule: (duration_s, v [m/s], omega [rad/s], CCW+) ---
 V_DRIVE = 1.0
@@ -149,18 +165,27 @@ def yaw_from_quat_xyzw(q: np.ndarray) -> float:
 
 class HelhestVelCmdSimulator(HelhestJuniorReplaySimulator):
     """Same robot/actuator/friction setup as HelhestJuniorReplaySimulator, minus
-    the box obstacle: bare flat ground for an unobstructed open-loop rollout."""
+    the box obstacle: bare ground (flat or loaded terrain) for an unobstructed
+    open-loop rollout."""
+
+    def __init__(self, *args, terrain: HeightMapReader, **kwargs):
+        self.terrain = terrain
+        super().__init__(*args, **kwargs)
 
     @override
     def build_model(self) -> newton.Model:
         self.builder.rigid_gap = 0.2
 
         ground_cfg = newton.ModelBuilder.ShapeConfig(mu=0.8, **self.ground_cfg_kwargs)
-        self.builder.add_ground_plane(cfg=ground_cfg)
+        heightfield, terrain_xform = self.terrain.to_ostrich()
+        self.builder.add_shape_heightfield(xform=terrain_xform, heightfield=heightfield, cfg=ground_cfg)
 
+        # Spawn 0.5 m above the local terrain height (was a bare literal 0.5
+        # when ground was always flat at z=0).
+        spawn_z = float(self.terrain.sample(0.0, 0.0)) + 0.5
         create_helhest_junior_model(
             self.builder,
-            xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()),
+            xform=wp.transform(wp.vec3(0.0, 0.0, spawn_z), wp.quat_identity()),
             control_mode=self.control_mode,
             k_p=self.k_p,
             k_d=self.k_d,
@@ -187,8 +212,15 @@ def ostrich_vel_cmd(cfg: DictConfig):
     # Only target_timestep_seconds (dt) is consumed.
     setpoints = build_setpoints(sim_config.target_timestep_seconds)
 
+    terrain_path = cfg.get("terrain_path")
+    terrain = (
+        HeightMapReader.load(terrain_path)
+        if terrain_path
+        else HeightMapReader.flat(xlim=TERRAIN_XLIM, ylim=TERRAIN_YLIM, cell=TERRAIN_CELL)
+    )
+
     sim = HelhestVelCmdSimulator(
-        sim_config, render_config, engine_config, logging_config, k_p=K_P
+        sim_config, render_config, engine_config, logging_config, k_p=K_P, terrain=terrain
     )
     # replay_graph() captures the per-step physics (control + solver.step + state
     # copy + pose/wheel logging) into one CUDA graph and replays it T times with
@@ -238,6 +270,7 @@ def ostrich_vel_cmd(cfg: DictConfig):
         wheel_qd=wheel_qd,
         phases=np.array(PHASES, dtype=np.float32),
     )
+    terrain.save(out.with_suffix(""))
     print(f"saved {out}")
 
 
