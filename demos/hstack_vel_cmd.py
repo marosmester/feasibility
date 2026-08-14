@@ -43,10 +43,7 @@ from helhest import dynamics
 from helhest import friction as friction_mod
 from helhest.engine import ForwardSimulator
 
-try:
-    from demos.heightmap_reader import HeightMapReader
-except ModuleNotFoundError:
-    from heightmap_reader import HeightMapReader
+from feasibility.heightmap import HeightMapReader
 
 IN_NPZ = pathlib.Path(__file__).parent.parent / "outputs" / "ostrich_vel_cmd.npz"
 OUT_NPZ = pathlib.Path(__file__).parent.parent / "outputs" / "hstack_vel_cmd.npz"

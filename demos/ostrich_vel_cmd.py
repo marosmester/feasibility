@@ -65,10 +65,7 @@ try:
 except ModuleNotFoundError:
     from helhest_common import create_helhest_junior_model
 
-try:
-    from demos.heightmap_reader import HeightMapReader
-except ModuleNotFoundError:
-    from heightmap_reader import HeightMapReader
+from feasibility.heightmap import HeightMapReader
 
 CONFIG_PATH = pathlib.Path(examples.__file__).parent.joinpath("conf")
 
