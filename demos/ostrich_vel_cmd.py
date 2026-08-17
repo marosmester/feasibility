@@ -99,16 +99,22 @@ K_P = 15000.0
 # ghost-contact-avoidance tradeoff at the footprint boundary), so a robot that
 # drives past the edge falls through. PHASES below covers ~9 m forward with a
 # 2 m-radius arc; these are generous, hand-tuned padding, not derived from it.
-TERRAIN_XLIM = (-2.0, 12.0)
-TERRAIN_YLIM = (-6.0, 6.0)
+TERRAIN_XLIM_M = (-2.0, 12.0)
+TERRAIN_YLIM_M = (-6.0, 6.0)
 TERRAIN_CELL = 0.05
+
+# Where the robot spawns in world XY -- independent of the terrain's own
+# origin. PHASES below displaces the robot by roughly x:[0,4] y:[0,4.8]
+# relative to this point, so keep it clear of the terrain's finite edges.
+SPAWN_X_M = 1.0
+SPAWN_Y_M = 3.0
 
 # --- Command schedule: (duration_s, v [m/s], omega [rad/s], CCW+) ---
 V_DRIVE = 1.0
 YAW_RATE = 0.5  # -> 2.5 m nominal turn radius
 T_ARC = 5.0318  # empirically tuned, instead of the (math.pi / 2.0) / YAW_RATE  
 PHASES = [
-    (2.0, V_DRIVE, 0.0),
+    (0.5, V_DRIVE, 0.0),
     (T_ARC, V_DRIVE, YAW_RATE),
     (2.0, V_DRIVE, 0.0),
 ]
@@ -179,10 +185,10 @@ class HelhestVelCmdSimulator(HelhestJuniorReplaySimulator):
 
         # Spawn 0.5 m above the local terrain height (was a bare literal 0.5
         # when ground was always flat at z=0).
-        spawn_z = float(self.terrain.sample(0.0, 0.0)) + 0.5
+        spawn_z = float(self.terrain.sample(SPAWN_X_M, SPAWN_Y_M)) + 0.5
         create_helhest_junior_model(
             self.builder,
-            xform=wp.transform(wp.vec3(0.0, 0.0, spawn_z), wp.quat_identity()),
+            xform=wp.transform(wp.vec3(SPAWN_X_M, SPAWN_Y_M, spawn_z), wp.quat_identity()),
             control_mode=self.control_mode,
             k_p=self.k_p,
             k_d=self.k_d,
@@ -213,7 +219,7 @@ def ostrich_vel_cmd(cfg: DictConfig):
     terrain = (
         HeightMapReader.load(terrain_path)
         if terrain_path
-        else HeightMapReader.flat(xlim=TERRAIN_XLIM, ylim=TERRAIN_YLIM, cell=TERRAIN_CELL)
+        else HeightMapReader.flat(xlim=TERRAIN_XLIM_M, ylim=TERRAIN_YLIM_M, cell=TERRAIN_CELL)
     )
 
     sim = HelhestVelCmdSimulator(

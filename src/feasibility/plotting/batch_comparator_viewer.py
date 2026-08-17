@@ -78,7 +78,7 @@ def main() -> None:
         raise SystemExit(f"--id must be in [0, {n}), got {args.id}")
 
     label = str(d["variant_label"][args.id])
-    hmap = HeightMapReader.load(str(d["terrain_path"]))
+    hmap = HeightMapReader.load(str(d["terrain_path"][args.id]))
 
     fig = plt.figure(figsize=(13, 6))
     fig.suptitle(f"batch_compare variant {args.id}/{n - 1}: {label}")
