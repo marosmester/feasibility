@@ -15,6 +15,11 @@ heightfield/elevation array per build, shared by every world in that build. So e
 its own single-world build+rollout; the loop below is a Python-level sweep over heightmaps, not a
 fused GPU batch over them.
 
+The output npz is self-describing: each variant's terrain (elevation grid + yaml sidecar, see
+comparator.provenance.terrain_fields) is embedded alongside its trajectories, and both submodules'
+git commit/dirty state (comparator.provenance.git_provenance) is recorded once per run -- a viewer
+never has to reach back into assets/ or ask "what code produced this?" to make sense of the file.
+
 Usage:
     python -m feasibility.comparator.batch_compare                # all BUMP_HEIGHTS
     python -m feasibility.comparator.batch_compare +mu=0.5 +k_turn=1.0
@@ -43,6 +48,8 @@ from helhest import dynamics
 from helhest import friction as friction_mod
 from helhest.engine import ForwardSimulator
 
+from feasibility.comparator.provenance import git_provenance
+from feasibility.comparator.provenance import terrain_fields
 from feasibility.heightmap import HeightMapReader
 from feasibility.heightmap.create_speed_bumps import BUMP_X0
 from feasibility.heightmap.create_speed_bumps import speed_bump_paths
@@ -368,12 +375,14 @@ def batch_compare(cfg: DictConfig) -> None:
     print(f"[hstack]   {n} heightmaps x {hstack_setpoints_1.shape[0]} steps @ dt={hstack_dt}")
 
     terrain_paths: list[str] = []
+    terrain_entries: list[tuple[pathlib.Path, HeightMapReader]] = []
     ostrich_poses, ostrich_wheel_qds = [], []
     h_controlleds, h_deriveds, h_clearances, h_residuals, h_turnings, h_wheel_qds = [], [], [], [], [], []
 
     for height, path in bumps:
         terrain = HeightMapReader.load(path)
         terrain_paths.append(str(path))
+        terrain_entries.append((path, terrain))
 
         pose, wheel_qd = run_ostrich_batch(
             sim_config, render_config, engine_config, logging_config, terrain, ostrich_setpoints_1, mu
@@ -412,7 +421,12 @@ def batch_compare(cfg: DictConfig) -> None:
         n=np.int32(n),
         bump_height=bump_heights,
         variant_label=np.array([f"bump_h={h:.2f}m" for h in bump_heights]),
+        # terrain_path stays as a provenance hint (where the terrain came from) but is no
+        # longer load-bearing -- terrain_fields() embeds the grid+sidecar itself below, so a
+        # reader never needs assets/ on disk (see comparator.provenance.terrain_from_npz).
         terrain_path=np.array(terrain_paths),
+        **terrain_fields(terrain_entries),
+        **git_provenance(),
         spawn_xy=np.array([SPAWN_X, SPAWN_Y], dtype=np.float32),
         mu=np.float32(mu),
         k_turn=np.float32(k_turn),

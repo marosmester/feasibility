@@ -17,6 +17,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers the '3d' projection)
 
+from feasibility.comparator.provenance import terrain_from_npz
 from feasibility.heightmap import HeightMapReader
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
@@ -78,7 +79,7 @@ def main() -> None:
         raise SystemExit(f"--id must be in [0, {n}), got {args.id}")
 
     label = str(d["variant_label"][args.id])
-    hmap = HeightMapReader.load(str(d["terrain_path"][args.id]))
+    hmap = terrain_from_npz(d, args.id)
 
     fig = plt.figure(figsize=(13, 6))
     fig.suptitle(f"batch_compare variant {args.id}/{n - 1}: {label}")
