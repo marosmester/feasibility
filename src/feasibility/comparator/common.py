@@ -1,8 +1,8 @@
 """Scenario-independent core shared by comparator/compare_*.py: the ostrich replicated-model
 simulator (with its batched Warp logging kernels), the helhest_stack ForwardSimulator wrapper,
 and the npz assembly -- everything that doesn't depend on WHICH obstacle series is being driven
-over. A scenario module supplies a `ScenarioSpec` (which heightmap series, where the obstacle
-sits, how far to drive) and calls `run_comparison(cfg, spec)`.
+over. A scenario module supplies a `ScenarioSpec` (which heightmap series, where the robot
+spawns, what body twist it's commanded to hold) and calls `run_comparison(cfg, spec)`.
 
 Originally all of this lived in one file (batch_compare.py, the speed-bump-only comparison) --
 split out here once a second scenario (box obstacles) needed the exact same machinery on a
@@ -65,14 +65,18 @@ class ScenarioSpec:
 
     name: str  # -> outputs/compare_<name>.npz
     variants: list[tuple[float, pathlib.Path]]  # (height, asset stem)
-    obstacle_x: float  # feature X; anchors spawn and the replay camera
+    obstacle_x: float  # feature X; anchors the replay camera
     value_name: str  # "bump_height" / "box_height" -- recorded in the npz
     value_header: str  # "bump h [m]" -- print_summary column title
     label_fmt: str  # "bump_h={:.2f}m" -> variant_label
-    spawn_back: float = 3.0  # spawn_x = obstacle_x - spawn_back
+    spawn_x: float  # m, initial chassis pose
     spawn_y: float = 0.0
-    v_drive: float = 1.0
-    drive_s: float = 6.0
+    spawn_yaw: float = 0.0  # rad
+    v_drive: float = 1.0  # m/s, forward body velocity command
+    wz_drive: float = 0.0  # rad/s, yaw-rate command (opposite front-wheel signs -> turn in place)
+    duration_s: float = 6.0  # s, command hold time -- NOT a distance even when v_drive=1.0 makes
+    # it look like one; see build_setpoints. A pure-rotation scenario (v_drive=0) has no
+    # "distance", so the name has to say what it actually is.
 
 
 def cmd_to_wheels(v: float, wz: float) -> tuple[float, float, float]:
@@ -83,11 +87,11 @@ def cmd_to_wheels(v: float, wz: float) -> tuple[float, float, float]:
     return v_l, v_r, v_rear
 
 
-def build_setpoints(dt: float, v_drive: float, drive_s: float) -> np.ndarray:
-    """Sample a straight-approach schedule (drive at `v_drive` for `drive_s` meters) onto the
-    dt grid. [T, 3] float32."""
-    n = int(round(drive_s / dt))
-    return np.tile(cmd_to_wheels(v_drive, 0.0), (n, 1)).astype(np.float32)
+def build_setpoints(dt: float, v_drive: float, wz_drive: float, duration_s: float) -> np.ndarray:
+    """Sample a constant body-twist (v_drive, wz_drive) command onto the dt grid for
+    `duration_s` seconds. [T, 3] float32."""
+    n = int(round(duration_s / dt))
+    return np.tile(cmd_to_wheels(v_drive, wz_drive), (n, 1)).astype(np.float32)
 
 
 def euler_zyx_to_quat_xyzw(yaw: np.ndarray, pitch: np.ndarray, roll: np.ndarray) -> np.ndarray:
@@ -176,9 +180,11 @@ class HelhestBatchSimulator(HelhestJuniorReplaySimulator):
     num_worlds > 1 too (kept from an earlier same-terrain, different-command sweep) and still
     works, just unused at N>1 by the current drivers."""
 
-    def __init__(self, *args, terrain: HeightMapReader, spawn_xy: tuple[float, float], **kwargs):
+    def __init__(
+        self, *args, terrain: HeightMapReader, spawn_pose: tuple[float, float, float], **kwargs
+    ):
         self.terrain = terrain
-        self.spawn_xy = spawn_xy
+        self.spawn_pose = spawn_pose
         super().__init__(*args, **kwargs)
         num_worlds = self.simulation_config.num_worlds
         self.dofs_per_world = self.model.joint_dof_count // num_worlds
@@ -197,11 +203,12 @@ class HelhestBatchSimulator(HelhestJuniorReplaySimulator):
             cfg=newton.ModelBuilder.ShapeConfig(density=0.0, mu=0.8, **self.ground_cfg_kwargs),
         )
 
-        spawn_x, spawn_y = self.spawn_xy
+        spawn_x, spawn_y, spawn_yaw = self.spawn_pose
         spawn_z = float(self.terrain.sample(spawn_x, spawn_y)) + 0.5
+        spawn_q = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), spawn_yaw)
         create_helhest_junior_model(
             self.builder,
-            xform=wp.transform(wp.vec3(spawn_x, spawn_y, spawn_z), wp.quat_identity()),
+            xform=wp.transform(wp.vec3(spawn_x, spawn_y, spawn_z), spawn_q),
             control_mode=self.control_mode,
             k_p=self.k_p,
             k_d=self.k_d,
@@ -301,11 +308,11 @@ def run_ostrich_batch(
     terrain: HeightMapReader,
     setpoints: np.ndarray,
     mu: float,
-    spawn_xy: tuple[float, float],
+    spawn_pose: tuple[float, float, float],
 ) -> tuple[np.ndarray, np.ndarray]:
     sim = HelhestBatchSimulator(
         sim_config, render_config, engine_config, logging_config,
-        k_p=K_P, mu_front=mu, mu_rear=mu, terrain=terrain, spawn_xy=spawn_xy,
+        k_p=K_P, mu_front=mu, mu_rear=mu, terrain=terrain, spawn_pose=spawn_pose,
     )
     return sim.replay_graph_batch(setpoints)
 
@@ -320,7 +327,7 @@ def run_hstack_batch(
     k_turn: float,
     mu: float,
     device: str,
-    spawn_xy: tuple[float, float],
+    spawn_pose: tuple[float, float, float],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """setpoints [T, N, 3]. Returns controlled [T,N,3] (x,y,yaw), derived [T,N,3] (z,pitch,roll),
     clearance [T,N], residual [T,N], turning [T,N,2], wheel_qd [T,N,3] -- all with the row-0
@@ -336,44 +343,89 @@ def run_hstack_batch(
     sim.set_terrain(elevation)
     sim.set_friction(mu_field)
     controlled, derived, clearance, residual = sim.rollout(
-        np.ascontiguousarray(setpoints, np.float32), (spawn_xy[0], spawn_xy[1], 0.0), np.zeros(3)
+        np.ascontiguousarray(setpoints, np.float32), spawn_pose, np.zeros(3)
     )
     turning = sim.turning.numpy()
     wheel_qd = sim.current_wheel_omega.numpy()[1:]
     return controlled[1:], derived[1:], clearance, residual, turning, wheel_qd
 
 
-def print_summary(values: np.ndarray, value_header: str, ostrich_pose: np.ndarray, hstack_controlled: np.ndarray) -> None:
+def _quat_yaw(q: np.ndarray) -> np.ndarray:
+    """q [..., 4] = (qx,qy,qz,qw) -> yaw [...] (rad), Z-up convention matching
+    euler_zyx_to_quat_xyzw's R = Rz(yaw)@Ry(pitch)@Rx(roll)."""
+    qx, qy, qz, qw = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
+    return np.arctan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+
+
+def _net_yaw_deg(yaw: np.ndarray) -> np.ndarray:
+    """yaw [T, n] (rad, wrapped) -> net rotation since t=0 [n] (deg). Unwraps along the time
+    axis first -- a turn-in-place scenario is expected to exceed +-180deg, where a naive
+    yaw[-1]-yaw[0] would alias."""
+    return np.degrees(np.unwrap(yaw, axis=0)[-1] - yaw[0])
+
+
+def print_summary(
+    values: np.ndarray, value_header: str, ostrich_pose: np.ndarray, hstack_controlled: np.ndarray
+) -> None:
     """ostrich_pose [T, n, 7] (x,y,z,qx,qy,qz,qw); hstack_controlled [T, n, 3] (x,y,yaw) -- z
     isn't in `controlled` (it's in `derived`), so compare final X reached (obstacle-induced slip
-    shows up as a shortfall there) and ostrich's peak chassis Z (how far the dynamics model
-    actually lifted going over the obstacle, which the kinematic twin's quasi-static settle can't
-    represent the same way)."""
+    shows up as a shortfall there), ostrich's peak chassis Z (how far the dynamics model actually
+    lifted going over the obstacle, which the kinematic twin's quasi-static settle can't
+    represent the same way), and net yaw for both (the turn-in-place scenario's actual metric --
+    a stalled ostrich falls short of the commanded rotation while helhest_stack, which has no
+    lateral-collision response, keeps turning freely)."""
     ostrich_final_x = ostrich_pose[-1, :, 0]
     ostrich_peak_z = ostrich_pose[:, :, 2].max(axis=0)
+    ostrich_net_yaw = _net_yaw_deg(_quat_yaw(ostrich_pose[:, :, 3:7]))
     hstack_final_x = hstack_controlled[-1, :, 0]
-    print(f"{value_header:>12}{'ostrich x':>12}{'ostrich peak z':>16}{'hstack x':>12}")
-    for v, ox, oz, hx in zip(values, ostrich_final_x, ostrich_peak_z, hstack_final_x):
-        print(f"{v:12.2f}{ox:12.3f}{oz:16.3f}{hx:12.3f}")
+    hstack_net_yaw = _net_yaw_deg(hstack_controlled[:, :, 2])
+    print(
+        f"{value_header:>12}{'ostrich x':>12}{'ostrich peak z':>16}{'ostrich yaw':>14}"
+        f"{'hstack x':>12}{'hstack yaw':>13}"
+    )
+    for v, ox, oz, oyaw, hx, hyaw in zip(
+        values, ostrich_final_x, ostrich_peak_z, ostrich_net_yaw, hstack_final_x, hstack_net_yaw
+    ):
+        print(f"{v:12.2f}{ox:12.3f}{oz:16.3f}{oyaw:14.1f}{hx:12.3f}{hyaw:13.1f}")
+
+
+def select_variants(
+    variants: list[tuple[float, pathlib.Path]], heights: list[float] | None
+) -> list[tuple[float, pathlib.Path]]:
+    """Filter a scenario's full variant series down to just `heights` (matched to 2 decimal
+    places -- the same precision every height in this package is ever specified/printed at, see
+    e.g. label_fmt/box_path's cm rounding), preserving the series' original order regardless of
+    the order `heights` lists them in. `heights=None` (no override) returns `variants` unchanged.
+    Lets a `+heights=[...]` Hydra override sweep e.g. 3 heights instead of all 8 while iterating
+    on a scenario, without touching BOX_HEIGHTS/BUMP_HEIGHTS (the asset-generation source of
+    truth those heights still have to come from -- this only selects among already-generated
+    assets, it doesn't generate new ones)."""
+    if heights is None:
+        return variants
+    wanted = {round(float(h), 2) for h in heights}
+    available = {round(h, 2) for h, _ in variants}
+    missing = wanted - available
+    if missing:
+        raise ValueError(f"heights {sorted(missing)} not in this scenario's series (available: {sorted(available)})")
+    return [(h, p) for h, p in variants if round(h, 2) in wanted]
 
 
 def run_comparison(cfg: DictConfig, spec: ScenarioSpec) -> None:
-    """The full ostrich-vs-hstack sweep over `spec.variants`, writing
-    outputs/compare_<spec.name>.npz. Shared by every comparator/compare_*.py driver -- see the
-    module docstring for what varies per scenario (just `spec`)."""
+    """The full ostrich-vs-hstack sweep over `spec.variants` (or a `+heights=[...]` subset of
+    it, see select_variants), writing outputs/compare_<spec.name>.npz. Shared by every
+    comparator/compare_*.py driver -- see the module docstring for what varies per scenario
+    (just `spec`)."""
     wp.init()
 
     mu = float(cfg.get("mu", 0.8))
     k_turn = float(cfg.get("k_turn", dynamics.K_TURN))
     device = str(cfg.get("device", "cuda:0"))
 
-    variants = spec.variants
+    variants = select_variants(spec.variants, cfg.get("heights", None))
     variant_values = np.array([h for h, _ in variants], dtype=np.float32)
     n = len(variants)
 
-    spawn_x = spec.obstacle_x - spec.spawn_back
-    spawn_y = spec.spawn_y
-    spawn_xy = (spawn_x, spawn_y)
+    spawn_pose = (spec.spawn_x, spec.spawn_y, spec.spawn_yaw)
 
     sim_config: SimulationConfig = hydra.utils.instantiate(cfg.simulation)
     render_config: RenderingConfig = hydra.utils.instantiate(cfg.rendering)
@@ -386,8 +438,8 @@ def run_comparison(cfg: DictConfig, spec: ScenarioSpec) -> None:
 
     ostrich_dt = sim_config.target_timestep_seconds
     hstack_dt = dynamics.DT
-    ostrich_setpoints_1 = build_setpoints(ostrich_dt, spec.v_drive, spec.drive_s)[:, None, :]  # [T, 1, 3]
-    hstack_setpoints_1 = build_setpoints(hstack_dt, spec.v_drive, spec.drive_s)[:, None, :]
+    ostrich_setpoints_1 = build_setpoints(ostrich_dt, spec.v_drive, spec.wz_drive, spec.duration_s)[:, None, :]
+    hstack_setpoints_1 = build_setpoints(hstack_dt, spec.v_drive, spec.wz_drive, spec.duration_s)[:, None, :]
     print(f"[ostrich]  {n} heightmaps x {ostrich_setpoints_1.shape[0]} steps @ dt={ostrich_dt}")
     print(f"[hstack]   {n} heightmaps x {hstack_setpoints_1.shape[0]} steps @ dt={hstack_dt}")
 
@@ -402,13 +454,13 @@ def run_comparison(cfg: DictConfig, spec: ScenarioSpec) -> None:
         terrain_entries.append((path, terrain))
 
         pose, wheel_qd = run_ostrich_batch(
-            sim_config, render_config, engine_config, logging_config, terrain, ostrich_setpoints_1, mu, spawn_xy
+            sim_config, render_config, engine_config, logging_config, terrain, ostrich_setpoints_1, mu, spawn_pose
         )
         ostrich_poses.append(pose[:, 0])
         ostrich_wheel_qds.append(wheel_qd[:, 0])
 
         controlled, derived, clearance, residual, turning, wheel_qd_h = run_hstack_batch(
-            hstack_setpoints_1, terrain, hstack_dt, k_turn, mu, device, spawn_xy
+            hstack_setpoints_1, terrain, hstack_dt, k_turn, mu, device, spawn_pose
         )
         h_controlleds.append(controlled[:, 0])
         h_deriveds.append(derived[:, 0])
@@ -447,7 +499,10 @@ def run_comparison(cfg: DictConfig, spec: ScenarioSpec) -> None:
         terrain_path=np.array(terrain_paths),
         **terrain_fields(terrain_entries),
         **git_provenance(),
-        spawn_xy=np.array(spawn_xy, dtype=np.float32),
+        spawn_pose=np.array(spawn_pose, dtype=np.float32),
+        v_drive=np.float32(spec.v_drive),
+        wz_drive=np.float32(spec.wz_drive),
+        duration_s=np.float32(spec.duration_s),
         mu=np.float32(mu),
         k_turn=np.float32(k_turn),
         k_p=np.float32(K_P),

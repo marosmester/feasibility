@@ -5,7 +5,7 @@ as demos/ostrich_vel_cmd.py / demos/hstack_vel_cmd.py.
 
 Variants differ only in which heightmap they run on -- the bump heights from
 create_speed_bumps.BUMP_HEIGHTS -- not in the command. The robot always spawns upstream of the
-bump on its centerline (BUMP_X0 - spawn_back), facing +X, i.e. perpendicular to the bump (which
+bump on its centerline (BUMP_X0 - 3.0), facing +X, i.e. perpendicular to the bump (which
 spans the full Y width), and drives straight at it. The actual sweep/rollout/npz-writing logic
 lives in comparator.common.run_comparison, shared with every other compare_*.py scenario driver
 (e.g. compare_box_obstacles.py) -- this file only describes the scenario via a ScenarioSpec.
@@ -13,6 +13,7 @@ lives in comparator.common.run_comparison, shared with every other compare_*.py 
 Usage:
     python -m feasibility.comparator.compare_speed_bumps                # all BUMP_HEIGHTS
     python -m feasibility.comparator.compare_speed_bumps +mu=0.5 +k_turn=1.0
+    python -m feasibility.comparator.compare_speed_bumps +heights=[0.2,0.5]  # subset, faster
 """
 
 from __future__ import annotations
@@ -35,6 +36,9 @@ def spec() -> ScenarioSpec:
         value_name="bump_height",
         value_header="bump h [m]",
         label_fmt="bump_h={:.2f}m",
+        spawn_x=BUMP_X0 - 3.0,  # upstream of the bump, on its centerline (spawn_y default 0.0)
+        v_drive=1.0,
+        duration_s=6.0,  # -> travels 6 m at v_drive=1.0, from spawn_x to BUMP_X0+3.0
     )
 
 
