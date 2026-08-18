@@ -2,7 +2,7 @@
 bump spanning the full Y width of the grid, oriented perpendicular to a robot driving
 straight along +X -- i.e. a real speed bump, not an angled ramp. The heightmaps in the
 series differ ONLY in the bump's z height; grid extent, cell size, incline angle, and the
-bump's X position/width are shared. Used by feasibility.comparator.batch_compare to probe how
+bump's X position/width are shared. Used by feasibility.comparator.compare_speed_bumps to probe how
 ostrich (dynamics) vs helhest_stack (kinematic twin) diverge as the bump grows from
 negligible to significant relative to the wheel radius (0.35 m).
 
@@ -29,7 +29,7 @@ import numpy as np
 from feasibility.heightmap import HeightMapReader
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
-ASSETS_DIR = REPO_ROOT / "assets"
+ASSETS_DIR = REPO_ROOT / "assets" / "speed_bumps"
 
 # Grid extent -- matches HeightMapReader.flat()'s own default, so a spawn point tuned against
 # that flat default lands in the same place here.
@@ -58,7 +58,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def bump_path(height: float) -> pathlib.Path:
-    """assets/speed_bump_h<height, cm, no dot> -- no extension, HeightMapReader appends
+    """assets/speed_bumps/speed_bump_h<height, cm, no dot> -- no extension, HeightMapReader appends
     .png/.yaml via pathlib's with_suffix(), which treats the LAST '.' in the name as an
     extension separator. A dotted decimal like "h0.20" would collide "h0.20" and "h0.30"
     onto the same "h0.{yaml,png}" (both get stem "h0", suffix replaced wholesale) -- cm
@@ -67,7 +67,7 @@ def bump_path(height: float) -> pathlib.Path:
 
 
 def speed_bump_paths(heights: tuple[float, ...] = BUMP_HEIGHTS) -> list[tuple[float, pathlib.Path]]:
-    """(height, path) pairs for the series -- the single source of truth batch_compare
+    """(height, path) pairs for the series -- the single source of truth compare_speed_bumps
     reads back, so the two stay in sync without duplicating the height list."""
     return [(h, bump_path(h)) for h in heights]
 

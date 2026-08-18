@@ -1,7 +1,8 @@
-"""GL replay of a single variant from comparator/batch_compare.py's output npz: loads that
-variant's terrain heightfield and plays back the ostrich and/or hstack trajectory over it in
-Newton's interactive GL viewer, in real time, rendering the real Helhest Junior mesh
-(create_helhest_junior_model) -- chassis + 3 wheels -- rather than a box stand-in.
+"""GL replay of a single variant from a comparator/compare_*.py output npz (e.g.
+compare_speed_bumps.py, compare_box_obstacles.py): loads that variant's terrain heightfield and
+plays back the ostrich and/or hstack trajectory over it in Newton's interactive GL viewer, in
+real time, rendering the real Helhest Junior mesh (create_helhest_junior_model) -- chassis + 3
+wheels -- rather than a box stand-in.
 
 Pose-only playback, not physics: each frame we write `joint_q` directly -- the chassis's
 free-joint 7 slots (px,py,pz,qx,qy,qz,qw) from the recorded chassis pose, and each wheel's
@@ -31,10 +32,9 @@ from ostrich.core.model_builder import OstrichModelBuilder
 
 from feasibility.comparator.provenance import terrain_from_npz
 from feasibility.heightmap import HeightMapReader
-from feasibility.heightmap.create_speed_bumps import BUMP_X0
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
-DEFAULT_NPZ = REPO_ROOT / "outputs" / "batch_compare.npz"
+DEFAULT_NPZ = REPO_ROOT / "outputs" / "compare_speed_bumps.npz"
 
 # create_helhest_junior_model always adds exactly 4 joints per robot, in this fixed order:
 # base_joint (free: 7 joint_q slots / 6 joint_qd slots), then left/right/rear wheel_j (revolute:
@@ -47,12 +47,15 @@ WHEEL_NAMES = ("left", "right", "rear")  # order matches create_helhest_junior_m
 # mesh color, nothing to distinguish.
 ROBOT_COLOR = {"ostrich": (0.9, 0.55, 0.1), "hstack": (0.55, 0.2, 0.85)}
 
-# Default camera pose: parked beside the speed bump, a few meters off to the side (-Y) and
-# slightly elevated, facing +Y (yaw=90 in this Z-up viewer's convention -- see
+# Camera pose: parked beside the obstacle, a few meters off to the side (-Y) and slightly
+# elevated, facing +Y (yaw=90 in this Z-up viewer's convention -- see
 # ostrich/third_party/newton/newton/_src/viewer/camera.py's get_front()) -- gives a side-profile
-# view of the whole run as the robot(s) cross the bump. Not a CLI flag on purpose -- edit these
-# constants directly to change the default view.
-CAMERA_POS = wp.vec3(BUMP_X0, -4.0-2, 1.5)
+# view of the whole run as the robot(s) cross the obstacle. Built in main() from the npz's
+# obstacle_x (recorded by comparator.common.run_comparison) rather than hard-coded, since that X
+# differs per scenario (e.g. compare_speed_bumps.py's BUMP_X0 vs compare_box_obstacles.py's
+# BOX_X0). Pitch/yaw aren't CLI flags on purpose -- edit these constants directly to change them.
+CAMERA_Y_OFFSET = -4.0 - 2
+CAMERA_Z = 1.5
 CAMERA_PITCH = -5.0
 CAMERA_YAW = 90.0
 
@@ -117,7 +120,7 @@ def interp_pose(t: np.ndarray, pose: np.ndarray, sim_t: float) -> np.ndarray:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--npz", type=pathlib.Path, default=DEFAULT_NPZ, help=f"batch_compare.npz path (default {DEFAULT_NPZ})")
+    ap.add_argument("--npz", type=pathlib.Path, default=DEFAULT_NPZ, help=f"compare_*.npz path (default {DEFAULT_NPZ})")
     ap.add_argument("--id", type=int, default=0, help="variant index to replay (default 0)")
     ap.add_argument("--which", choices=("ostrich", "hstack", "both"), default="both")
     ap.add_argument("--speed", type=float, default=1.0, help="playback speed multiplier (default 1.0 = real time)")
@@ -132,6 +135,8 @@ def main() -> None:
     which = ("ostrich", "hstack") if args.which == "both" else (args.which,)
     label = str(d["variant_label"][args.id])
     terrain = terrain_from_npz(d, args.id)
+    obstacle_x = float(d["obstacle_x"])
+    camera_pos = wp.vec3(obstacle_x, CAMERA_Y_OFFSET, CAMERA_Z)
 
     tracks = {}
     for name in which:
@@ -145,7 +150,7 @@ def main() -> None:
     model, robots = build_model(terrain, which)
     viewer = newton.viewer.ViewerGL()
     viewer.set_model(model)
-    viewer.set_camera(pos=CAMERA_POS, pitch=CAMERA_PITCH, yaw=CAMERA_YAW)
+    viewer.set_camera(pos=camera_pos, pitch=CAMERA_PITCH, yaw=CAMERA_YAW)
     state = model.state()
 
     q_start = model.joint_q_start.numpy()

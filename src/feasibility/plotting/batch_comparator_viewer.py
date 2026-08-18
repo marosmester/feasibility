@@ -1,11 +1,12 @@
-"""Viewer for comparator/batch_compare.py's output: pick one ostrich/helhest_stack trajectory
-pair by variant id and plot it -- one 3D subplot (terrain heightmap + both (x,y,z) trajectories),
-one 2D subplot (the wheel-velocity commands both sims were driven with, vs time).
+"""Viewer for a comparator/compare_*.py output (e.g. compare_speed_bumps.py,
+compare_box_obstacles.py): pick one ostrich/helhest_stack trajectory pair by variant id and plot
+it -- one 3D subplot (terrain heightmap + both (x,y,z) trajectories), one 2D subplot (the
+wheel-velocity commands both sims were driven with, vs time).
 
 Usage:
     python -m feasibility.plotting.batch_comparator_viewer            # variant 0
     python -m feasibility.plotting.batch_comparator_viewer --id 3
-    python -m feasibility.plotting.batch_comparator_viewer --npz outputs/batch_compare.npz --id 3
+    python -m feasibility.plotting.batch_comparator_viewer --npz outputs/compare_box_obstacles.npz --id 3
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from feasibility.comparator.provenance import terrain_from_npz
 from feasibility.heightmap import HeightMapReader
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
-DEFAULT_NPZ = REPO_ROOT / "outputs" / "batch_compare.npz"
+DEFAULT_NPZ = REPO_ROOT / "outputs" / "compare_speed_bumps.npz"
 
 WHEEL_NAMES = ("left", "right", "rear")
 WHEEL_COLORS = ("tab:red", "tab:green", "tab:blue")
@@ -68,7 +69,7 @@ def plot_commanded_velocity(
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument(
-        "--npz", type=pathlib.Path, default=DEFAULT_NPZ, help=f"batch_compare.npz path (default {DEFAULT_NPZ})"
+        "--npz", type=pathlib.Path, default=DEFAULT_NPZ, help=f"compare_*.npz path (default {DEFAULT_NPZ})"
     )
     ap.add_argument("--id", type=int, default=0, help="variant index to display (default 0)")
     args = ap.parse_args()
@@ -82,7 +83,7 @@ def main() -> None:
     hmap = terrain_from_npz(d, args.id)
 
     fig = plt.figure(figsize=(13, 6))
-    fig.suptitle(f"batch_compare variant {args.id}/{n - 1}: {label}")
+    fig.suptitle(f"compare variant {args.id}/{n - 1}: {label}")
 
     ax3d = fig.add_subplot(1, 2, 1, projection="3d")
     # mplot3d's default per-redraw depth heuristic (computed_zorder=True) re-sorts artists by

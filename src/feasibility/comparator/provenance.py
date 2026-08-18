@@ -1,5 +1,5 @@
-"""Self-description schema for comparator/batch_compare.py's output npz -- writer and reader
-side kept together so they can't drift apart.
+"""Self-description schema for comparator/compare_*.py's output npz (via comparator.common's
+run_comparison) -- writer and reader side kept together so they can't drift apart.
 
 Two independent gaps `batch_compare.py`'s npz used to have (neither closed by just saving
 `terrain_path`, a path string into assets/):
@@ -64,7 +64,7 @@ def terrain_fields(entries: list[tuple[pathlib.Path, HeightMapReader]]) -> dict[
     """entries: (path, terrain) pairs in variant order, `path` the assets/ stem the terrain was
     loaded from (used only to re-read its yaml sidecar verbatim; HeightMapReader itself keeps no
     raw yaml text -- load() parses it into a local dict and discards it). Returns the per-variant
-    terrain block to splice into batch_compare's np.savez_compressed(...) call."""
+    terrain block to splice into comparator.common.run_comparison's np.savez_compressed(...) call."""
     shapes = {(t.ny, t.nx) for _, t in entries}
     if len(shapes) > 1:
         bad = next((p, t) for p, t in entries if (t.ny, t.nx) != next(iter(shapes)))

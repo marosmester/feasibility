@@ -29,13 +29,14 @@ demos that doesn't belong inside either one:
 
 | subpackage | role |
 |---|---|
-| `heightmap/` | simulator-agnostic elevation-grid I/O (`HeightMapReader`, PNG+YAML); `.to_ostrich()`/`.to_hstack()` so both sims see bit-identical terrain; `create_speed_bumps.py` generates a swept series of bump-height heightmaps |
-| `comparator/` | `batch_compare.py` — Hydra-driven CLI (config path anchored under `ostrich/examples/`) that runs the same drive-over-a-speed-bump scenario once in ostrich (dynamics) and once in helhest_stack (kinematic twin) across every bump height, saving poses/wheel velocities/terrain/git-provenance to `outputs/batch_compare.npz`; `provenance.py` is the npz schema (embeds git SHA/dirty state of both submodules so a saved run is self-describing) |
+| `heightmap/` | simulator-agnostic elevation-grid I/O (`HeightMapReader`, PNG+YAML); `.to_ostrich()`/`.to_hstack()` so both sims see bit-identical terrain; `create_speed_bumps.py` generates a swept series of bump-height heightmaps (`assets/speed_bumps/`), `create_box_obstacles.py` a swept series of box-obstacle heights (`assets/box/`) |
+| `comparator/` | `common.py` — the scenario-independent Hydra-driven core (config path anchored under `ostrich/examples/`) that runs the same straight-drive-at-an-obstacle scenario once in ostrich (dynamics) and once in helhest_stack (kinematic twin) across every height in a `ScenarioSpec`'s series, saving poses/wheel velocities/terrain/git-provenance to `outputs/compare_<name>.npz`; `compare_speed_bumps.py` and `compare_box_obstacles.py` are the two current scenario drivers (each just a `ScenarioSpec` + Hydra entry point) reading their height series from `heightmap.create_speed_bumps`/`create_box_obstacles`; `provenance.py` is the npz schema (embeds git SHA/dirty state of both submodules so a saved run is self-describing) |
 | `plotting/` | `batch_comparator_viewer.py` — matplotlib 3D terrain+trajectory and 2D wheel-velocity viewer for one saved variant |
 | `replay/` | `gl_replay.py` — Newton `ViewerGL` real-time playback of a saved trajectory pair on the real Helhest Junior mesh (pose-only, no physics stepping) |
 
 Each entry point runs as `python -m feasibility.<pkg>.<module>` (e.g.
-`python -m feasibility.comparator.batch_compare`,
+`python -m feasibility.comparator.compare_speed_bumps`,
+`python -m feasibility.comparator.compare_box_obstacles`,
 `python -m feasibility.replay.gl_replay --id 3 --which both --speed 0.25 --loop`) and documents
 its own CLI in a module-top docstring — there is no README. Running `gl_replay.py` writes an
 `imgui.ini` window-layout file to the repo root; it isn't yet in `.gitignore`.
