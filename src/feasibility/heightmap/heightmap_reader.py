@@ -130,3 +130,52 @@ class HeightMapReader:
         )
         xform = wp.transform(wp.vec3(cx, cy, 0.0), wp.quat_identity())
         return heightfield, xform
+
+    def to_ostrich_mesh(self, stride: int = 1) -> newton.Mesh:
+        """Same surface as to_ostrich(), as an explicit triangle mesh instead of a
+        newton.Heightfield -- for A/B-ing heightfield collision against ostrich's
+        mesh path (examples/helhest/surface_drive.py's terrain representation).
+
+        Vertices sit at this grid's cell centers in WORLD coordinates, i.e. exactly
+        where to_ostrich()'s heightfield vertices land, so the two adapters describe
+        the same surface and the mesh needs no placing xform (add it at identity).
+        Each cell quad is split into two CCW-wound triangles (+Z normals), matching
+        how Newton's own heightfield collision triangulates cells -- so this is a
+        representation swap, not a geometry change.
+
+        `stride` subsamples the grid (every stride-th row/col, endpoints kept) to
+        trade fidelity for triangle count: a full 801x601 grid is ~960k triangles,
+        which is a heavy BVH. stride>1 loses ramp detail -- keep it at 1 unless the
+        mesh path is too slow to iterate on.
+        """
+        rows = np.arange(0, self.ny, stride)
+        cols = np.arange(0, self.nx, stride)
+        if rows[-1] != self.ny - 1:
+            rows = np.append(rows, self.ny - 1)
+        if cols[-1] != self.nx - 1:
+            cols = np.append(cols, self.nx - 1)
+
+        xs = self.x0 + (cols + 0.5) * self.cell
+        ys = self.y0 + (rows + 0.5) * self.cell
+        X, Y = np.meshgrid(xs, ys)  # [nr, nc], row=y, col=x -- same layout as H
+        Z = self.H[np.ix_(rows, cols)]
+        points = np.stack([X, Y, Z], axis=-1).reshape(-1, 3).astype(np.float32)
+
+        nr, nc = len(rows), len(cols)
+        v = (np.arange(nr - 1)[:, None] * nc + np.arange(nc - 1)[None, :]).ravel()
+        # (v, v+1, v+nc+1) and (v, v+nc+1, v+nc): +X along col, +Y along row, so this
+        # winding gives an upward normal.
+        tris = np.concatenate(
+            [
+                np.stack([v, v + 1, v + nc + 1], axis=-1),
+                np.stack([v, v + nc + 1, v + nc], axis=-1),
+            ]
+        )
+        # An open terrain sheet is not a closed solid: is_solid/compute_inertia would
+        # be meaningless here, and the inertia integral over ~1M triangles is slow.
+        return newton.Mesh(
+            points,
+            tris.ravel().astype(np.int32),
+            compute_inertia=False,
+            is_solid=False,
+        )

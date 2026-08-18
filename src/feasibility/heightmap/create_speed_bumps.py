@@ -1,10 +1,19 @@
 """Generate a series of speed-bump heightmaps: flat ground (z=0) everywhere except one
-box-shaped bump spanning the full Y width of the grid, oriented perpendicular to a robot
-driving straight along +X -- i.e. a real speed bump, not an angled ramp. The heightmaps
-in the series differ ONLY in the bump's z height; grid extent, cell size, and the bump's
-X position/width are shared. Used by feasibility.comparator.batch_compare to probe how
+bump spanning the full Y width of the grid, oriented perpendicular to a robot driving
+straight along +X -- i.e. a real speed bump, not an angled ramp. The heightmaps in the
+series differ ONLY in the bump's z height; grid extent, cell size, and the bump's X
+position/width are shared. Used by feasibility.comparator.batch_compare to probe how
 ostrich (dynamics) vs helhest_stack (kinematic twin) diverge as the bump grows from
 negligible to significant relative to the wheel radius (0.35 m).
+
+The bump's leading/trailing edges are a short linear ramp (RAMP_WIDTH), not an
+instantaneous step. A step forces the whole height jump into whatever one grid cell
+straddles it -- Newton's heightfield collision triangulates every cell exactly (see
+newton/_src/utils/heightfield.py's _heightfield_surface_query), so a one-cell step still
+gets a real contact plane, just a ~86 deg one at the tallest bump height. RAMP_WIDTH is
+set equal to the OLD cell size (0.05 m) precisely so the ramp's slope (height/RAMP_WIDTH)
+is unchanged from the old one-cell step; only CELL shrank (0.05 -> 0.01), so that same
+slope is now resolved by ~5 triangulated cells instead of 1.
 
 Usage:
     python -m feasibility.heightmap.create_speed_bumps
@@ -24,10 +33,11 @@ ASSETS_DIR = REPO_ROOT / "assets"
 # point tuned against that flat default lands in the same place here.
 XLIM = (-2.0, 6.0)
 YLIM = (-3.0, 3.0)
-CELL = 0.05
+CELL = 0.01
 
-BUMP_X0 = 2.0  # m, leading (near) edge of the bump
-BUMP_WIDTH = 0.4  # m, extent along X (direction of travel)
+BUMP_X0 = 2.0  # m, leading (near) edge of the bump's flat top
+BUMP_WIDTH = 0.4  # m, extent of the flat top along X (direction of travel)
+RAMP_WIDTH = 0.05  # m, leading/trailing ramp extent -- see module docstring
 
 BUMP_HEIGHTS =  (0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70)  # m, one heightmap per height
 
@@ -48,14 +58,18 @@ def speed_bump_paths(heights: tuple[float, ...] = BUMP_HEIGHTS) -> list[tuple[fl
 
 
 def build_speed_bump(height: float) -> HeightMapReader:
-    """Flat ground except one box at X in [BUMP_X0, BUMP_X0+BUMP_WIDTH), spanning the
-    full Y range -- perpendicular to a robot driving straight along +X, so any Y offset
-    within the grid hits the bump square-on rather than at an angle."""
+    """Flat ground except a trapezoidal bump straddling [BUMP_X0, BUMP_X0+BUMP_WIDTH)
+    (flat top at `height`, linear ramps of RAMP_WIDTH on each side), spanning the full Y
+    range -- perpendicular to a robot driving straight along +X, so any Y offset within
+    the grid hits the bump square-on rather than at an angle."""
     nx = int(round((XLIM[1] - XLIM[0]) / CELL)) + 1
     ny = int(round((YLIM[1] - YLIM[0]) / CELL)) + 1
-    H = np.zeros((ny, nx), dtype=np.float64)
     xs = XLIM[0] + (np.arange(nx) + 0.5) * CELL
-    H[:, (xs >= BUMP_X0) & (xs < BUMP_X0 + BUMP_WIDTH)] = height
+    # np.interp clamps to fp's end values outside [xp[0], xp[-1]], both 0 here, so this
+    # also covers "flat ground everywhere else" with no separate masking.
+    breakpoints = [BUMP_X0 - RAMP_WIDTH, BUMP_X0, BUMP_X0 + BUMP_WIDTH, BUMP_X0 + BUMP_WIDTH + RAMP_WIDTH]
+    profile = np.interp(xs, breakpoints, [0.0, height, height, 0.0])
+    H = np.tile(profile, (ny, 1))
     return HeightMapReader(H, origin=(XLIM[0], YLIM[0]), cell=CELL)
 
 

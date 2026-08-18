@@ -31,6 +31,7 @@ from ostrich.core.model_builder import OstrichModelBuilder
 
 from feasibility.comparator.provenance import terrain_from_npz
 from feasibility.heightmap import HeightMapReader
+from feasibility.heightmap.create_speed_bumps import BUMP_X0
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 DEFAULT_NPZ = REPO_ROOT / "outputs" / "batch_compare.npz"
@@ -41,6 +42,19 @@ DEFAULT_NPZ = REPO_ROOT / "outputs" / "batch_compare.npz"
 # one shared ModelBuilder therefore puts robot k's joints at indices [4k, 4k+4).
 JOINTS_PER_ROBOT = 4
 WHEEL_NAMES = ("left", "right", "rear")  # order matches create_helhest_junior_model's wheel_j joints
+
+# Only used to tell the two meshes apart in --which both -- a single robot keeps its default
+# mesh color, nothing to distinguish.
+ROBOT_COLOR = {"ostrich": (0.9, 0.55, 0.1), "hstack": (0.55, 0.2, 0.85)}
+
+# Default camera pose: parked beside the speed bump, a few meters off to the side (-Y) and
+# slightly elevated, facing +Y (yaw=90 in this Z-up viewer's convention -- see
+# ostrich/third_party/newton/newton/_src/viewer/camera.py's get_front()) -- gives a side-profile
+# view of the whole run as the robot(s) cross the bump. Not a CLI flag on purpose -- edit these
+# constants directly to change the default view.
+CAMERA_POS = wp.vec3(BUMP_X0, -4.0-2, 1.5)
+CAMERA_PITCH = -5.0
+CAMERA_YAW = 90.0
 
 
 def build_model(terrain: HeightMapReader, which: tuple[str, ...]) -> tuple[newton.Model, dict[str, dict[str, int]]]:
@@ -54,10 +68,22 @@ def build_model(terrain: HeightMapReader, which: tuple[str, ...]) -> tuple[newto
 
     robots: dict[str, dict[str, int]] = {}
     for i, name in enumerate(which):
+        shape_start = builder.shape_count
         create_helhest_junior_model(builder, xform=wp.transform_identity())
         j_base = i * JOINTS_PER_ROBOT
-        robots[name] = {"base": j_base, "left": j_base + 1, "right": j_base + 2, "rear": j_base + 3}
-    return builder.finalize(), robots
+        robots[name] = {
+            "base": j_base, "left": j_base + 1, "right": j_base + 2, "rear": j_base + 3,
+            "shapes": (shape_start, builder.shape_count),
+        }
+
+    model = builder.finalize()
+    if len(which) > 1:
+        colors = model.shape_color.numpy()
+        for name in which:
+            start, end = robots[name]["shapes"]
+            colors[start:end] = ROBOT_COLOR[name]
+        model.shape_color.assign(colors)
+    return model, robots
 
 
 def integrate_wheel_angle(t: np.ndarray, wheel_qd: np.ndarray) -> np.ndarray:
@@ -120,6 +146,7 @@ def main() -> None:
     model, robots = build_model(terrain, which)
     viewer = newton.viewer.ViewerGL()
     viewer.set_model(model)
+    viewer.set_camera(pos=CAMERA_POS, pitch=CAMERA_PITCH, yaw=CAMERA_YAW)
     state = model.state()
 
     q_start = model.joint_q_start.numpy()

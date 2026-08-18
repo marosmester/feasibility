@@ -22,15 +22,34 @@ models **Marv** (four-flipper tracked robot) and other platforms.
 everywhere, black line-length 100 + reorder-python-imports, and **device-native Warp arrays
 rather than numpy for any bulk/data-parallel stage**). Read it before editing that tree.
 
-**Root-level `demos/` and `src/feasibility/` are in-progress and currently untracked** —
-don't treat either as settled architecture. `demos/helhest_common.py` +
-`demos/helhest_in_ostrich.py` are copies of `ostrich/examples/helhest_junior/{common,control}.py`,
-running an ostrich example from the shared root env instead of `ostrich`'s own.
-`src/feasibility/__init__.py` is an empty, unreferenced stub — the root `pyproject.toml` has
-`package = false` and no `[build-system]`, so nothing installs or imports it; it looks like
-leftover `uv init` scaffolding.
+**`src/feasibility/` is an installed package** — root `pyproject.toml` has a
+`[build-system]` (hatchling) packaging `src/feasibility`, so `import feasibility...` works from
+the shared env like `ostrich`/`helhest`. It holds glue code shared between the two submodules'
+demos that doesn't belong inside either one:
 
-Two things that copy has to get right, and that any further root-level demo will hit too:
+| subpackage | role |
+|---|---|
+| `heightmap/` | simulator-agnostic elevation-grid I/O (`HeightMapReader`, PNG+YAML); `.to_ostrich()`/`.to_hstack()` so both sims see bit-identical terrain; `create_speed_bumps.py` generates a swept series of bump-height heightmaps |
+| `comparator/` | `batch_compare.py` — Hydra-driven CLI (config path anchored under `ostrich/examples/`) that runs the same drive-over-a-speed-bump scenario once in ostrich (dynamics) and once in helhest_stack (kinematic twin) across every bump height, saving poses/wheel velocities/terrain/git-provenance to `outputs/batch_compare.npz`; `provenance.py` is the npz schema (embeds git SHA/dirty state of both submodules so a saved run is self-describing) |
+| `plotting/` | `batch_comparator_viewer.py` — matplotlib 3D terrain+trajectory and 2D wheel-velocity viewer for one saved variant |
+| `replay/` | `gl_replay.py` — Newton `ViewerGL` real-time playback of a saved trajectory pair on the real Helhest Junior mesh (pose-only, no physics stepping) |
+
+Each entry point runs as `python -m feasibility.<pkg>.<module>` (e.g.
+`python -m feasibility.comparator.batch_compare`,
+`python -m feasibility.replay.gl_replay --id 3 --which both --speed 0.25 --loop`) and documents
+its own CLI in a module-top docstring — there is no README. Running `gl_replay.py` writes an
+`imgui.ini` window-layout file to the repo root; it isn't yet in `.gitignore`.
+
+`demos/` is smaller and less settled — still worth treating as scratch, not architecture.
+`helhest_common.py`, `ostrich_keyboard.py`, and `ostrich_vel_cmd*.py` mirror
+`ostrich/examples/helhest_junior/{common,control}.py`, running an ostrich example from the
+shared root env instead of `ostrich`'s own; `hstack_vel_cmd.py` is the helhest_stack-side
+counterpart. (`helhest_in_ostrich.py`, referenced in earlier versions of this file, no longer
+exists.)
+
+Two things that pattern has to get right, and that any further root-level `demos/` script will
+hit too — `src/feasibility` already gets both right and is the template to copy instead of the
+older `demos/` scripts:
 
 * **Hydra configs and mesh assets live under `ostrich/examples/`, not at the repo root.** A
   `__file__`-relative `parent.parent/"conf"` (correct in its original home) resolves to a
@@ -45,10 +64,10 @@ Two things that copy has to get right, and that any further root-level demo will
 
 ## Python environment
 
-The root [pyproject.toml](pyproject.toml) is a **dependency manifest only** (`package = false`)
-that resolves one shared `.venv` at the repo root in which both submodules are editable
-installs — `import ostrich`, `import helhest`, and ostrich's `examples.*` all work from the
-same interpreter. Deliberately *not* a uv workspace: ostrich already declares its own
+The root [pyproject.toml](pyproject.toml) resolves one shared `.venv` at the repo root in which
+both submodules are editable installs — `import ostrich`, `import helhest`, and ostrich's
+`examples.*` all work from the same interpreter — and also builds/installs `src/feasibility`
+itself (see above) via a hatchling `[build-system]`. Deliberately *not* a uv workspace: ostrich already declares its own
 `[tool.uv.workspace]`, and uv rejects nested workspaces, so a workspace root here would force
 a permanent local diff inside a submodule.
 
@@ -179,8 +198,9 @@ git -C helhest_stack commit -am "..."   # work happens here (its own branch/remo
 git add helhest_stack && git commit     # superproject only stores the SHA
 ```
 
-By design the superproject should track nothing but `.gitmodules` and those two gitlinks —
-avoid adding permanent source at the root; a submodule's own tree (or its `examples/`) is
-almost always the right home. (See the `demos/`/`src/feasibility/` caveat above for an
-in-progress exception that hasn't been reconciled yet.) `*.txt` and `.claude/` are gitignored
-here, so `context.txt` is local-only.
+By design the superproject should track nothing but `.gitmodules`, those two gitlinks, and
+`src/feasibility/` — avoid adding permanent *simulator* source at the root; a submodule's own
+tree (or its `examples/`) is almost always the right home for that. `src/feasibility/` is the
+sanctioned exception, for glue that belongs to neither submodule (see above); `demos/` remains
+scratch and shouldn't grow further without being folded into `src/feasibility/` or a submodule.
+`*.txt` and `.claude/` are gitignored here, so `context.txt` is local-only.
