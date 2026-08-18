@@ -16,8 +16,8 @@ the same incline angle instead of the same ramp width -- a fixed ramp width woul
 bumps steeper than short ones.
 
 Usage:
-    python -m feasibility.heightmap.create_speed_bumps
-    python -m feasibility.heightmap.create_speed_bumps --cell 0.01 --incline-deg 10
+    python src/feasibility/heightmap/create_speed_bumps.py
+    python src/feasibility/heightmap/create_speed_bumps.py --cell 0.01 --incline-deg 10
 """
 from __future__ import annotations
 

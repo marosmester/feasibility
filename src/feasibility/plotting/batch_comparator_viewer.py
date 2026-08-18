@@ -4,9 +4,9 @@ it -- one 3D subplot (terrain heightmap + both (x,y,z) trajectories), one 2D sub
 wheel-velocity commands both sims were driven with, vs time).
 
 Usage:
-    python -m feasibility.plotting.batch_comparator_viewer            # variant 0
-    python -m feasibility.plotting.batch_comparator_viewer --id 3
-    python -m feasibility.plotting.batch_comparator_viewer --npz outputs/compare_box_obstacles.npz --id 3
+    python src/feasibility/plotting/batch_comparator_viewer.py            # variant 0
+    python src/feasibility/plotting/batch_comparator_viewer.py --id 3
+    python src/feasibility/plotting/batch_comparator_viewer.py --npz outputs/compare_box_obstacles.npz --id 3
 """
 
 from __future__ import annotations

@@ -11,9 +11,9 @@ lives in comparator.common.run_comparison, shared with every other compare_*.py 
 (e.g. compare_box_obstacles.py) -- this file only describes the scenario via a ScenarioSpec.
 
 Usage:
-    python -m feasibility.comparator.compare_speed_bumps                # all BUMP_HEIGHTS
-    python -m feasibility.comparator.compare_speed_bumps +mu=0.5 +k_turn=1.0
-    python -m feasibility.comparator.compare_speed_bumps +heights=[0.2,0.5]  # subset, faster
+    python src/feasibility/comparator/compare_speed_bumps.py                # all BUMP_HEIGHTS
+    python src/feasibility/comparator/compare_speed_bumps.py +mu=0.5 +k_turn=1.0
+    python src/feasibility/comparator/compare_speed_bumps.py +heights=[0.2,0.5]  # subset, faster
 """
 
 from __future__ import annotations

@@ -13,9 +13,9 @@ attached to the chassis and spinning. No solver step, no control targets; `model
 only there to feed the viewer's contact-point overlay.
 
 Usage:
-    python -m feasibility.replay.gl_replay --id 3                 # ostrich, variant 3
-    python -m feasibility.replay.gl_replay --id 3 --which hstack
-    python -m feasibility.replay.gl_replay --id 3 --which both --speed 0.25 --loop
+    python src/feasibility/replay/gl_replay.py --id 3                 # ostrich, variant 3
+    python src/feasibility/replay/gl_replay.py --id 3 --which hstack
+    python src/feasibility/replay/gl_replay.py --id 3 --which both --speed 0.25 --loop
 """
 
 from __future__ import annotations

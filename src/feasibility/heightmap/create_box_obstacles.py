@@ -23,8 +23,8 @@ instead of ballooning into the terrain the way a 15 deg ramp would (2.99m at h=0
 the box itself and large enough to run off the grid's edges).
 
 Usage:
-    python -m feasibility.heightmap.create_box_obstacles
-    python -m feasibility.heightmap.create_box_obstacles --cell 0.01 --incline-deg 60
+    python src/feasibility/heightmap/create_box_obstacles.py
+    python src/feasibility/heightmap/create_box_obstacles.py --cell 0.01 --incline-deg 60
 """
 from __future__ import annotations
 

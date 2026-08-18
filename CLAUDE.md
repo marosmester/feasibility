@@ -34,10 +34,10 @@ demos that doesn't belong inside either one:
 | `plotting/` | `batch_comparator_viewer.py` — matplotlib 3D terrain+trajectory and 2D wheel-velocity viewer for one saved variant |
 | `replay/` | `gl_replay.py` — Newton `ViewerGL` real-time playback of a saved trajectory pair on the real Helhest Junior mesh (pose-only, no physics stepping) |
 
-Each entry point runs as `python -m feasibility.<pkg>.<module>` (e.g.
-`python -m feasibility.comparator.compare_speed_bumps`,
-`python -m feasibility.comparator.compare_box_obstacles`,
-`python -m feasibility.replay.gl_replay --id 3 --which both --speed 0.25 --loop`) and documents
+Each entry point runs as `python src/feasibility/<pkg>/<module>.py` (e.g.
+`python src/feasibility/comparator/compare_speed_bumps.py`,
+`python src/feasibility/comparator/compare_box_obstacles.py`,
+`python src/feasibility/replay/gl_replay.py --id 3 --which both --speed 0.25 --loop`) and documents
 its own CLI in a module-top docstring — there is no README. Running `gl_replay.py` writes an
 `imgui.ini` window-layout file to the repo root; it isn't yet in `.gitignore`.
 
