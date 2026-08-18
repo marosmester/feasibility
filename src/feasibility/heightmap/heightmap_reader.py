@@ -131,23 +131,60 @@ class HeightMapReader:
         xform = wp.transform(wp.vec3(cx, cy, 0.0), wp.quat_identity())
         return heightfield, xform
 
-    def to_ostrich_mesh(self, stride: int = 1) -> newton.Mesh:
+    def _interval_subdivisions(self, lo: int, hi: int, axis: int, max_rise_per_tile: float) -> int:
+        """Subdivision count for original-grid interval [lo, hi] along `axis`: the worst-case
+        elevation change ALONG this axis within the interval, maximized over every line
+        perpendicular to it. Must isolate the axis (per-line reduce, then max) rather than a flat
+        block max-min over the whole interval -- otherwise a speed bump's huge X-driven rise would
+        spuriously force refinement of the (perfectly flat) Y axis too, and vice versa."""
+        if axis == 1:
+            band = self.H[:, lo : hi + 1]
+            per_line_rise = band.max(axis=1) - band.min(axis=1)
+        else:
+            band = self.H[lo : hi + 1, :]
+            per_line_rise = band.max(axis=0) - band.min(axis=0)
+        rise = float(per_line_rise.max())
+        return max(1, int(np.ceil(rise / max_rise_per_tile)))
+
+    def _refine_axis(self, idx: np.ndarray, origin: float, axis: int, max_rise_per_tile: float) -> np.ndarray:
+        """World coordinates for one axis of to_ostrich_mesh's tensor grid. `idx` are the baseline
+        (post-stride) original-grid indices; each interval [idx[i], idx[i+1]] is independently
+        subdivided via _interval_subdivisions, so steep bands get denser sampling than flat ones."""
+        coords = [origin + (idx[0] + 0.5) * self.cell]
+        for i in range(len(idx) - 1):
+            lo, hi = int(idx[i]), int(idx[i + 1])
+            k = self._interval_subdivisions(lo, hi, axis, max_rise_per_tile)
+            c_lo = origin + (lo + 0.5) * self.cell
+            c_hi = origin + (hi + 0.5) * self.cell
+            coords.extend(np.linspace(c_lo, c_hi, k + 1)[1:])  # drop shared left endpoint
+        return np.asarray(coords, dtype=np.float64)
+
+    def to_ostrich_mesh(self, stride: int = 1, max_rise_per_tile: float | None = None) -> newton.Mesh:
         """Same surface as to_ostrich(), as an explicit triangle mesh instead of a
-        newton.Heightfield -- for A/B-ing heightfield collision against ostrich's
-        mesh path (examples/helhest/surface_drive.py's terrain representation).
+        newton.Heightfield -- needs no placing xform (identity), CCW-wound (+Z normal)
+        triangles.
 
-        Vertices sit at this grid's cell centers in WORLD coordinates, i.e. exactly
-        where to_ostrich()'s heightfield vertices land, so the two adapters describe
-        the same surface and the mesh needs no placing xform (add it at identity).
-        Each cell quad is split into two CCW-wound triangles (+Z normals), matching
-        how Newton's own heightfield collision triangulates cells -- so this is a
-        representation swap, not a geometry change.
+        `stride` subsamples the baseline grid to trade fidelity for triangle count in
+        flat regions. `max_rise_per_tile` (meters, default `None` -> self.cell)
+        independently refines each baseline interval along X and Y so no output tile
+        spans more than roughly this much elevation -- e.g. a near-90 deg speed-bump
+        ramp (create_speed_bumps.py's --incline-deg) no longer collapses into one
+        giant sliver. Newton's mesh collision uses input triangles VERBATIM (no
+        engine-side re-tessellation), so triangle size directly sets contact-sampling
+        density; refining only shrinks tile size along the source heightmap's already
+        straight/collinear ramp, it doesn't invent new geometry.
 
-        `stride` subsamples the grid (every stride-th row/col, endpoints kept) to
-        trade fidelity for triangle count: a full 801x601 grid is ~960k triangles,
-        which is a heavy BVH. stride>1 loses ramp detail -- keep it at 1 unless the
-        mesh path is too slow to iterate on.
+        Refinement is a crack-free tensor grid (independent per-band X/Y subdivision),
+        not a full 2D quadtree: a column band's X-refinement spans its whole
+        Y-extent, and vice versa. Exact for this class's real use case (speed bumps
+        span the full Y width); would over-refine a heightmap with sparse localized
+        steep features elsewhere.
         """
+        if max_rise_per_tile is None:
+            max_rise_per_tile = self.cell
+        if max_rise_per_tile <= 0.0:
+            raise ValueError(f"max_rise_per_tile must be > 0, got {max_rise_per_tile}")
+
         rows = np.arange(0, self.ny, stride)
         cols = np.arange(0, self.nx, stride)
         if rows[-1] != self.ny - 1:
@@ -155,13 +192,13 @@ class HeightMapReader:
         if cols[-1] != self.nx - 1:
             cols = np.append(cols, self.nx - 1)
 
-        xs = self.x0 + (cols + 0.5) * self.cell
-        ys = self.y0 + (rows + 0.5) * self.cell
+        xs = self._refine_axis(cols, self.x0, axis=1, max_rise_per_tile=max_rise_per_tile)
+        ys = self._refine_axis(rows, self.y0, axis=0, max_rise_per_tile=max_rise_per_tile)
         X, Y = np.meshgrid(xs, ys)  # [nr, nc], row=y, col=x -- same layout as H
-        Z = self.H[np.ix_(rows, cols)]
+        Z = self.sample(X, Y)  # bilinear -- fine points generally aren't at original cell centers
         points = np.stack([X, Y, Z], axis=-1).reshape(-1, 3).astype(np.float32)
 
-        nr, nc = len(rows), len(cols)
+        nr, nc = len(ys), len(xs)
         v = (np.arange(nr - 1)[:, None] * nc + np.arange(nc - 1)[None, :]).ravel()
         # (v, v+1, v+nc+1) and (v, v+nc+1, v+nc): +X along col, +Y along row, so this
         # winding gives an upward normal.

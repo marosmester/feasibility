@@ -16,13 +16,14 @@ Usage:
     python demos/ostrich_speed_bump.py +out=/tmp/run1.npz
     python demos/ostrich_speed_bump.py +mu=0.5               # override ground friction
     python demos/ostrich_speed_bump.py +bump=0.30            # another height in the series
-    python demos/ostrich_speed_bump.py +terrain=mesh         # triangle mesh terrain
-    python demos/ostrich_speed_bump.py +terrain=mesh +mesh_stride=4   # coarser mesh
+    python demos/ostrich_speed_bump.py +mesh_stride=4         # coarser mesh
+    python demos/ostrich_speed_bump.py +mesh_max_rise=0.02    # finer ramp tiles
+    python demos/ostrich_speed_bump.py +terrain=heightfield   # newton.Heightfield instead
 
-`+terrain` selects the collision representation of the *same* surface: `heightfield`
-(default, what batch_compare uses) or `mesh`, which triangulates the identical grid
-and adds it via add_shape_mesh the way ostrich's examples/helhest/surface_drive.py
-does its terrain -- an A/B to tell heightfield-collision artefacts apart from real
+`+terrain` selects the collision representation of the *same* surface: `mesh` (default),
+which triangulates the grid and adds it via add_shape_mesh the way ostrich's
+examples/helhest/surface_drive.py does its terrain, or `heightfield`, Newton's native
+newton.Heightfield -- an A/B to tell heightfield-collision artefacts apart from real
 dynamics.
 """
 import math
@@ -60,7 +61,7 @@ from feasibility.heightmap.create_speed_bumps import bump_path
 
 CONFIG_PATH = pathlib.Path(examples.__file__).parent.joinpath("conf")
 
-BUMP_HEIGHT = BUMP_HEIGHTS[1]  # smallest variant in the series -- 0.10 m
+BUMP_HEIGHT = BUMP_HEIGHTS[4]  # smallest variant in the series -- 0.10 m
 
 
 def yaw_from_quat_xyzw(q: np.ndarray) -> float:
@@ -75,16 +76,17 @@ class OstrichSpeedBumpSimulator(HelhestJuniorReplaySimulator):
     box obstacle -- the single-run counterpart to batch_compare's
     HelhestBatchSimulator, minus its multi-world CUDA-graph batching machinery."""
 
-    def __init__(self, *args, terrain: HeightMapReader, terrain_repr: str = "heightfield",
-                 mesh_stride: int = 1, **kwargs):
+    def __init__(self, *args, terrain: HeightMapReader, terrain_repr: str = "mesh",
+                 mesh_stride: int = 1, mesh_max_rise: float | None = None, **kwargs):
         self.terrain = terrain
         self.terrain_repr = terrain_repr
         self.mesh_stride = mesh_stride
+        self.mesh_max_rise = mesh_max_rise
         super().__init__(*args, **kwargs)
 
     @override
     def build_model(self) -> newton.Model:
-        self.builder.rigid_gap = 0.10
+        self.builder.rigid_gap = 0.20
 
         ground_cfg = newton.ModelBuilder.ShapeConfig(mu=0.8, **self.ground_cfg_kwargs)
         # Same physical surface either way (see HeightMapReader.to_ostrich_mesh) --
@@ -98,7 +100,9 @@ class OstrichSpeedBumpSimulator(HelhestJuniorReplaySimulator):
             globals_builder = newton.ModelBuilder()
             globals_builder.add_shape_mesh(
                 body=-1,
-                mesh=self.terrain.to_ostrich_mesh(stride=self.mesh_stride),
+                mesh=self.terrain.to_ostrich_mesh(
+                    stride=self.mesh_stride, max_rise_per_tile=self.mesh_max_rise
+                ),
                 cfg=newton.ModelBuilder.ShapeConfig(
                     density=0.0, mu=0.8, **self.ground_cfg_kwargs
                 ),
@@ -137,11 +141,14 @@ def ostrich_speed_bump(cfg: DictConfig):
     logging_config: LoggingConfig = hydra.utils.instantiate(cfg.logging)
 
     mu = float(cfg.get("mu", 0.8))  # matches batch_compare's own default
-    # "heightfield" (default) = add_shape_heightfield, as batch_compare does;
-    # "mesh" = the same surface triangulated and fed through add_shape_mesh, to test
-    # whether observed artefacts come from Newton's heightfield collision path.
-    terrain_repr = str(cfg.get("terrain", "heightfield"))
+    # "mesh" (default) = the surface triangulated and fed through add_shape_mesh;
+    # "heightfield" = add_shape_heightfield, Newton's native representation (what
+    # batch_compare used before it also switched to the mesh path) -- kept as an
+    # opt-in A/B to tell heightfield-collision artefacts apart from real dynamics.
+    terrain_repr = str(cfg.get("terrain", "mesh"))
     mesh_stride = int(cfg.get("mesh_stride", 1))
+    mesh_max_rise_cfg = cfg.get("mesh_max_rise", None)
+    mesh_max_rise = None if mesh_max_rise_cfg is None else float(mesh_max_rise_cfg)
 
     # We drive our own step loop (see replay()/replay_graph() below) instead of
     # run()'s segment loop, so simulation.duration_seconds is unused -- DRIVE_S
@@ -154,7 +161,7 @@ def ostrich_speed_bump(cfg: DictConfig):
     sim = OstrichSpeedBumpSimulator(
         sim_config, render_config, engine_config, logging_config,
         k_p=K_P, mu_front=mu, mu_rear=mu, terrain=terrain,
-        terrain_repr=terrain_repr, mesh_stride=mesh_stride,
+        terrain_repr=terrain_repr, mesh_stride=mesh_stride, mesh_max_rise=mesh_max_rise,
     )
     # replay_graph() captures the per-step physics into one CUDA graph and
     # replays it T times with no Python in the loop -- what

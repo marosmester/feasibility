@@ -11,7 +11,7 @@ spans the full Y width), and drives straight at it.
 Unlike an earlier version of this file that swept commanded yaw rate on ONE shared terrain (and
 so could batch all variants into a single CUDA-graph-captured rollout), each variant here has its
 OWN terrain -- ostrich's replicated model and helhest_stack's ForwardSimulator both take one
-heightfield/elevation array per build, shared by every world in that build. So each heightmap gets
+terrain mesh/elevation array per build, shared by every world in that build. So each heightmap gets
 its own single-world build+rollout; the loop below is a Python-level sweep over heightmaps, not a
 fused GPU batch over them.
 
@@ -192,9 +192,15 @@ class HelhestBatchSimulator(HelhestJuniorReplaySimulator):
     def build_model(self) -> newton.Model:
         self.builder.rigid_gap = 0.2
 
-        ground_cfg = newton.ModelBuilder.ShapeConfig(mu=0.8, **self.ground_cfg_kwargs)
-        heightfield, terrain_xform = self.terrain.to_ostrich()
-        self.builder.add_shape_heightfield(xform=terrain_xform, heightfield=heightfield, cfg=ground_cfg)
+        # Mesh goes in a separate builder so it gets shape_world=-1 (Newton's "global"
+        # sentinel): stored once, broadphase-tested against every world instead of
+        # duplicated per world. Same pattern as demos/ostrich_speed_bump.py.
+        globals_builder = newton.ModelBuilder()
+        globals_builder.add_shape_mesh(
+            body=-1,
+            mesh=self.terrain.to_ostrich_mesh(),
+            cfg=newton.ModelBuilder.ShapeConfig(density=0.0, mu=0.8, **self.ground_cfg_kwargs),
+        )
 
         spawn_z = float(self.terrain.sample(SPAWN_X, SPAWN_Y)) + 0.5
         create_helhest_junior_model(
@@ -211,7 +217,9 @@ class HelhestBatchSimulator(HelhestJuniorReplaySimulator):
             kf=self.wheel_kf,
         )
 
-        return self.builder.finalize_replicated(num_worlds=self.simulation_config.num_worlds)
+        return self.builder.finalize_replicated(
+            num_worlds=self.simulation_config.num_worlds, global_builder=globals_builder
+        )
 
     def _batch_physics_step(self) -> None:
         """One physics step, all worlds at once (capturable) -- the batched analogue of

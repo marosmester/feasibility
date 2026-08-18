@@ -63,8 +63,7 @@ def build_model(terrain: HeightMapReader, which: tuple[str, ...]) -> tuple[newto
     # newton.ModelBuilder doesn't declare -- it's registered by OstrichModelBuilder.
     builder = OstrichModelBuilder()
     ground_cfg = newton.ModelBuilder.ShapeConfig(mu=0.8)
-    heightfield, terrain_xform = terrain.to_ostrich()
-    builder.add_shape_heightfield(xform=terrain_xform, heightfield=heightfield, cfg=ground_cfg)
+    builder.add_shape_mesh(body=-1, mesh=terrain.to_ostrich_mesh(), cfg=ground_cfg)
 
     robots: dict[str, dict[str, int]] = {}
     for i, name in enumerate(which):

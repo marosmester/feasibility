@@ -1,25 +1,27 @@
 """Generate a series of speed-bump heightmaps: flat ground (z=0) everywhere except one
 bump spanning the full Y width of the grid, oriented perpendicular to a robot driving
 straight along +X -- i.e. a real speed bump, not an angled ramp. The heightmaps in the
-series differ ONLY in the bump's z height; grid extent, cell size, and the bump's X
-position/width are shared. Used by feasibility.comparator.batch_compare to probe how
+series differ ONLY in the bump's z height; grid extent, cell size, incline angle, and the
+bump's X position/width are shared. Used by feasibility.comparator.batch_compare to probe how
 ostrich (dynamics) vs helhest_stack (kinematic twin) diverge as the bump grows from
 negligible to significant relative to the wheel radius (0.35 m).
 
-The bump's leading/trailing edges are a short linear ramp (RAMP_WIDTH), not an
-instantaneous step. A step forces the whole height jump into whatever one grid cell
-straddles it -- Newton's heightfield collision triangulates every cell exactly (see
-newton/_src/utils/heightfield.py's _heightfield_surface_query), so a one-cell step still
-gets a real contact plane, just a ~86 deg one at the tallest bump height. RAMP_WIDTH is
-set equal to the OLD cell size (0.05 m) precisely so the ramp's slope (height/RAMP_WIDTH)
-is unchanged from the old one-cell step; only CELL shrank (0.05 -> 0.01), so that same
-slope is now resolved by ~5 triangulated cells instead of 1.
+The bump's leading/trailing edges are a linear ramp, not an instantaneous step -- a step
+forces the whole height jump into whatever one grid cell straddles it (Newton's heightfield
+collision triangulates every cell exactly, see newton/_src/utils/heightfield.py's
+_heightfield_surface_query, so a one-cell step still gets a real contact plane, just a very
+steep one). Ramp width is derived PER bump height from --incline-deg
+(ramp_width = height / tan(incline)) rather than fixed, so every height in the series shares
+the same incline angle instead of the same ramp width -- a fixed ramp width would make tall
+bumps steeper than short ones.
 
 Usage:
     python -m feasibility.heightmap.create_speed_bumps
+    python -m feasibility.heightmap.create_speed_bumps --cell 0.01 --incline-deg 10
 """
 from __future__ import annotations
 
+import argparse
 import pathlib
 
 import numpy as np
@@ -29,17 +31,30 @@ from feasibility.heightmap import HeightMapReader
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 ASSETS_DIR = REPO_ROOT / "assets"
 
-# Grid extent/resolution -- matches HeightMapReader.flat()'s own default, so a spawn
-# point tuned against that flat default lands in the same place here.
+# Grid extent -- matches HeightMapReader.flat()'s own default, so a spawn point tuned against
+# that flat default lands in the same place here.
 XLIM = (-2.0, 6.0)
 YLIM = (-3.0, 3.0)
-CELL = 0.01
 
 BUMP_X0 = 2.0  # m, leading (near) edge of the bump's flat top
 BUMP_WIDTH = 0.4  # m, extent of the flat top along X (direction of travel)
-RAMP_WIDTH = 0.05  # m, leading/trailing ramp extent -- see module docstring
+
+DEFAULT_CELL = 0.05  # m, grid resolution
+DEFAULT_INCLINE_DEG = 15.0  # deg, ramp slope shared by every height in the series
 
 BUMP_HEIGHTS =  (0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70)  # m, one heightmap per height
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--cell", type=float, default=DEFAULT_CELL, help="grid resolution in meters")
+    parser.add_argument(
+        "--incline-deg",
+        type=float,
+        default=DEFAULT_INCLINE_DEG,
+        help="ramp incline angle in degrees, shared by every bump height in the series",
+    )
+    return parser.parse_args()
 
 
 def bump_path(height: float) -> pathlib.Path:
@@ -57,27 +72,32 @@ def speed_bump_paths(heights: tuple[float, ...] = BUMP_HEIGHTS) -> list[tuple[fl
     return [(h, bump_path(h)) for h in heights]
 
 
-def build_speed_bump(height: float) -> HeightMapReader:
+def build_speed_bump(height: float, cell: float, incline_deg: float) -> HeightMapReader:
     """Flat ground except a trapezoidal bump straddling [BUMP_X0, BUMP_X0+BUMP_WIDTH)
-    (flat top at `height`, linear ramps of RAMP_WIDTH on each side), spanning the full Y
-    range -- perpendicular to a robot driving straight along +X, so any Y offset within
-    the grid hits the bump square-on rather than at an angle."""
-    nx = int(round((XLIM[1] - XLIM[0]) / CELL)) + 1
-    ny = int(round((YLIM[1] - YLIM[0]) / CELL)) + 1
-    xs = XLIM[0] + (np.arange(nx) + 0.5) * CELL
+    (flat top at `height`, linear ramps on each side sloped at `incline_deg`), spanning the
+    full Y range -- perpendicular to a robot driving straight along +X, so any Y offset
+    within the grid hits the bump square-on rather than at an angle."""
+    ramp_width = height / np.tan(np.radians(incline_deg))
+    nx = int(round((XLIM[1] - XLIM[0]) / cell)) + 1
+    ny = int(round((YLIM[1] - YLIM[0]) / cell)) + 1
+    xs = XLIM[0] + (np.arange(nx) + 0.5) * cell
     # np.interp clamps to fp's end values outside [xp[0], xp[-1]], both 0 here, so this
     # also covers "flat ground everywhere else" with no separate masking.
-    breakpoints = [BUMP_X0 - RAMP_WIDTH, BUMP_X0, BUMP_X0 + BUMP_WIDTH, BUMP_X0 + BUMP_WIDTH + RAMP_WIDTH]
+    breakpoints = [BUMP_X0 - ramp_width, BUMP_X0, BUMP_X0 + BUMP_WIDTH, BUMP_X0 + BUMP_WIDTH + ramp_width]
     profile = np.interp(xs, breakpoints, [0.0, height, height, 0.0])
     H = np.tile(profile, (ny, 1))
-    return HeightMapReader(H, origin=(XLIM[0], YLIM[0]), cell=CELL)
+    return HeightMapReader(H, origin=(XLIM[0], YLIM[0]), cell=cell)
 
 
 def main() -> None:
+    args = parse_args()
     ASSETS_DIR.mkdir(parents=True, exist_ok=True)
     for height, path in speed_bump_paths():
-        build_speed_bump(height).save(path)
-        print(f"saved {path}.png / {path}.yaml  (bump height {height:.2f} m)")
+        build_speed_bump(height, args.cell, args.incline_deg).save(path)
+        print(
+            f"saved {path}.png / {path}.yaml  "
+            f"(bump height {height:.2f} m, cell {args.cell} m, incline {args.incline_deg:.1f} deg)"
+        )
 
 
 if __name__ == "__main__":
