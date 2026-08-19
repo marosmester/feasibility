@@ -6,7 +6,7 @@ wheel-velocity commands both sims were driven with, vs time).
 Usage:
     python src/feasibility/plotting/batch_comparator_viewer.py            # variant 0
     python src/feasibility/plotting/batch_comparator_viewer.py --id 3
-    python src/feasibility/plotting/batch_comparator_viewer.py --npz outputs/compare_box_obstacles.npz --id 3
+    python src/feasibility/plotting/batch_comparator_viewer.py --file outputs/compare_box_obstacles.h5 --id 3
 """
 
 from __future__ import annotations
@@ -14,15 +14,16 @@ from __future__ import annotations
 import argparse
 import pathlib
 
+import h5py
 import matplotlib.pyplot as plt
 import numpy as np
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers the '3d' projection)
 
-from feasibility.comparator.provenance import terrain_from_npz
+from feasibility.comparator.provenance import terrain_from_h5
 from feasibility.heightmap import HeightMapReader
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
-DEFAULT_NPZ = REPO_ROOT / "outputs" / "compare_speed_bumps.npz"
+DEFAULT_H5 = REPO_ROOT / "outputs" / "compare_speed_bumps.h5"
 
 WHEEL_NAMES = ("left", "right", "rear")
 WHEEL_COLORS = ("tab:red", "tab:green", "tab:blue")
@@ -69,18 +70,26 @@ def plot_commanded_velocity(
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument(
-        "--npz", type=pathlib.Path, default=DEFAULT_NPZ, help=f"compare_*.npz path (default {DEFAULT_NPZ})"
+        "--file", type=pathlib.Path, default=DEFAULT_H5, help=f"compare_*.h5 path (default {DEFAULT_H5})"
     )
     ap.add_argument("--id", type=int, default=0, help="variant index to display (default 0)")
     args = ap.parse_args()
 
-    d = np.load(args.npz)
-    n = int(d["n"])
-    if not (0 <= args.id < n):
-        raise SystemExit(f"--id must be in [0, {n}), got {args.id}")
+    # Materialize everything to numpy inside the `with` -- h5py datasets are invalid once the
+    # file closes, and plt.show() (a blocking call) must run outside it.
+    with h5py.File(args.file, "r") as f:
+        n = int(f.attrs["n"])
+        if not (0 <= args.id < n):
+            raise SystemExit(f"--id must be in [0, {n}), got {args.id}")
 
-    label = str(d["variant_label"][args.id])
-    hmap = terrain_from_npz(d, args.id)
+        label = f["variant_label"].asstr()[args.id]
+        hmap = terrain_from_h5(f, args.id)
+        ostrich_pose = f["ostrich/pose"][:, args.id, :]
+        hstack_pose = f["hstack/pose"][:, args.id, :]
+        ostrich_t = f["ostrich/t"][:]
+        ostrich_cmd = f["ostrich/cmd_wheel_omega"][:, args.id, :]
+        hstack_t = f["hstack/t"][:]
+        hstack_cmd = f["hstack/cmd_wheel_omega"][:, args.id, :]
 
     fig = plt.figure(figsize=(13, 6))
     fig.suptitle(f"compare variant {args.id}/{n - 1}: {label}")
@@ -94,18 +103,14 @@ def main() -> None:
     # always sit above the terrain, so a static order is both correct and cheaper.
     ax3d.computed_zorder = False
     plot_terrain(ax3d, hmap)
-    plot_trajectories(ax3d, d["ostrich_pose"][:, args.id, :], d["hstack_pose"][:, args.id, :])
+    plot_trajectories(ax3d, ostrich_pose, hstack_pose)
     ax3d.set_xlabel("x [m]")
     ax3d.set_ylabel("y [m]")
     ax3d.set_zlabel("z [m]")
     ax3d.legend()
 
     ax_cmd = fig.add_subplot(1, 2, 2)
-    plot_commanded_velocity(
-        ax_cmd,
-        d["ostrich_t"], d["ostrich_cmd_wheel_omega"][:, args.id, :],
-        d["hstack_t"], d["hstack_cmd_wheel_omega"][:, args.id, :],
-    )
+    plot_commanded_velocity(ax_cmd, ostrich_t, ostrich_cmd, hstack_t, hstack_cmd)
 
     fig.tight_layout()
     plt.show()

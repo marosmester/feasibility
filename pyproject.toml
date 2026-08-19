@@ -27,6 +27,10 @@ dependencies = [
   # Pinned exact: the joint resolve otherwise pulls whatever's newest on the nvidia
   # index (drifted to 1.16.0 once); ostrich's own lock tests against 1.14.0.
   "warp-lang==1.14.0",
+  # src/feasibility/comparator writes its own HDF5 output (matching ostrich's own
+  # logging convention) -- was previously only a transitive dep via ostrich[sim] /
+  # helhest-stack[data], now a direct one since feasibility imports h5py itself.
+  "h5py>=3.14",
 ]
 
 [tool.uv]

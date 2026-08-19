@@ -1,6 +1,6 @@
 """Scenario-independent core shared by comparator/compare_*.py: the ostrich replicated-model
 simulator (with its batched Warp logging kernels), the helhest_stack ForwardSimulator wrapper,
-and the npz assembly -- everything that doesn't depend on WHICH obstacle series is being driven
+and the HDF5 assembly -- everything that doesn't depend on WHICH obstacle series is being driven
 over. A scenario module supplies a `ScenarioSpec` (which heightmap series, where the robot
 spawns, what body twist it's commanded to hold) and calls `run_comparison(cfg, spec)`.
 
@@ -38,8 +38,7 @@ from helhest import dynamics
 from helhest import friction as friction_mod
 from helhest.engine import ForwardSimulator
 
-from feasibility.comparator.provenance import git_provenance
-from feasibility.comparator.provenance import terrain_fields
+from feasibility.comparator.provenance import write_comparison
 from feasibility.heightmap import HeightMapReader
 
 CONFIG_PATH = pathlib.Path(examples.__file__).parent.joinpath("conf")
@@ -63,10 +62,10 @@ class ScenarioSpec:
     create_speed_bumps.speed_bump_paths(), create_box_obstacles.box_obstacle_paths()) -- the
     single source of truth for the height series stays in the heightmap package, not here."""
 
-    name: str  # -> outputs/compare_<name>.npz
+    name: str  # -> outputs/compare_<name>.h5
     variants: list[tuple[float, pathlib.Path]]  # (height, asset stem)
     obstacle_x: float  # feature X; anchors the replay camera
-    value_name: str  # "bump_height" / "box_height" -- recorded in the npz
+    value_name: str  # "bump_height" / "box_height" -- recorded in the output file
     value_header: str  # "bump h [m]" -- print_summary column title
     label_fmt: str  # "bump_h={:.2f}m" -> variant_label
     spawn_x: float  # m, initial chassis pose
@@ -98,10 +97,10 @@ class TrialScenarioSpec:
     """Everything run_trial_comparison needs: one shared terrain, a list of Trials run on it.
     `duration_s` is shared by every trial (not per-Trial) so every trial's rollout has the same
     step count T -- run_trial_comparison stacks all trials into single [T, n, ...] arrays, same
-    as run_comparison does across heightmap variants, and the comparator npz schema (consumed
-    generically by plotting/replay) assumes one shared *_t time axis per run."""
+    as run_comparison does across heightmap variants, and the comparator HDF5 schema (consumed
+    generically by plotting/replay) assumes one shared t dataset per sim group per run."""
 
-    name: str  # -> outputs/compare_<name>.npz
+    name: str  # -> outputs/compare_<name>.h5
     terrain_path: pathlib.Path  # single heightmap asset, shared by every trial
     trials: list[Trial]
     obstacle_x: float  # anchors the replay camera -- no single "obstacle" here, so pick a
@@ -442,7 +441,7 @@ def select_variants(
 
 def run_comparison(cfg: DictConfig, spec: ScenarioSpec) -> None:
     """The full ostrich-vs-hstack sweep over `spec.variants` (or a `+heights=[...]` subset of
-    it, see select_variants), writing outputs/compare_<spec.name>.npz. Shared by every
+    it, see select_variants), writing outputs/compare_<spec.name>.h5. Shared by every
     comparator/compare_*.py driver -- see the module docstring for what varies per scenario
     (just `spec`)."""
     wp.init()
@@ -473,14 +472,12 @@ def run_comparison(cfg: DictConfig, spec: ScenarioSpec) -> None:
     print(f"[ostrich]  {n} heightmaps x {ostrich_setpoints_1.shape[0]} steps @ dt={ostrich_dt}")
     print(f"[hstack]   {n} heightmaps x {hstack_setpoints_1.shape[0]} steps @ dt={hstack_dt}")
 
-    terrain_paths: list[str] = []
     terrain_entries: list[tuple[pathlib.Path, HeightMapReader]] = []
     ostrich_poses, ostrich_wheel_qds = [], []
     h_controlleds, h_deriveds, h_clearances, h_residuals, h_turnings, h_wheel_qds = [], [], [], [], [], []
 
     for height, path in variants:
         terrain = HeightMapReader.load(path)
-        terrain_paths.append(str(path))
         terrain_entries.append((path, terrain))
 
         pose, wheel_qd = run_ostrich_batch(
@@ -514,45 +511,49 @@ def run_comparison(cfg: DictConfig, spec: ScenarioSpec) -> None:
     h_quat = euler_zyx_to_quat_xyzw(h_controlled[..., 2], h_derived[..., 1], h_derived[..., 2])
     h_pose = np.concatenate([h_controlled[..., :2], h_derived[..., :1], h_quat], axis=-1).astype(np.float32)
 
-    out_npz = OUT_DIR / f"compare_{spec.name}.npz"
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        out_npz,
-        n=np.int32(n),
-        variant_name=np.array(spec.value_name),
-        variant_value=variant_values,
-        variant_label=np.array([spec.label_fmt.format(h) for h in variant_values]),
-        obstacle_x=np.float32(spec.obstacle_x),
-        # terrain_path stays as a provenance hint (where the terrain came from) but is no
-        # longer load-bearing -- terrain_fields() embeds the grid+sidecar itself below, so a
-        # reader never needs assets/ on disk (see comparator.provenance.terrain_from_npz).
-        terrain_path=np.array(terrain_paths),
-        **terrain_fields(terrain_entries),
-        **git_provenance(),
-        spawn_pose=np.array(spawn_pose, dtype=np.float32),
-        v_drive=np.float32(spec.v_drive),
-        wz_drive=np.float32(spec.wz_drive),
-        duration_s=np.float32(spec.duration_s),
-        mu=np.float32(mu),
-        k_turn=np.float32(k_turn),
-        k_p=np.float32(K_P),
-        ostrich_dt=np.float32(ostrich_dt),
-        ostrich_t=np.arange(ostrich_setpoints_1.shape[0], dtype=np.float32) * ostrich_dt,
-        ostrich_cmd_wheel_omega=np.repeat(ostrich_setpoints_1, n, axis=1),
-        ostrich_pose=ostrich_pose,
-        ostrich_wheel_qd=ostrich_wheel_qd,
-        hstack_dt=np.float32(hstack_dt),
-        hstack_t=np.arange(hstack_setpoints_1.shape[0], dtype=np.float32) * hstack_dt,
-        hstack_cmd_wheel_omega=np.repeat(hstack_setpoints_1, n, axis=1),
-        hstack_pose=h_pose,
-        hstack_controlled=h_controlled,
-        hstack_derived=h_derived,
-        hstack_turning=h_turning,
-        hstack_clearance=h_clearance,
-        hstack_residual=h_residual,
-        hstack_wheel_qd=h_wheel_qd,
+    write_comparison(
+        OUT_DIR / f"compare_{spec.name}.h5",
+        root=dict(
+            n=n,
+            variant_name=spec.value_name,
+            obstacle_x=float(spec.obstacle_x),
+            duration_s=float(spec.duration_s),
+            mu=mu,
+            k_turn=k_turn,
+            k_p=K_P,
+        ),
+        per_variant=dict(
+            variant_value=variant_values,
+            variant_label=np.array([spec.label_fmt.format(h) for h in variant_values]),
+            # spawn_pose/v_drive/wz_drive are broadcast to per-variant rank even though
+            # ScenarioSpec holds one shared value for every variant -- matches
+            # run_trial_comparison's genuinely-per-trial shape, so both writers produce one
+            # schema (see write_comparison's docstring / the plan this followed).
+            spawn_pose=np.tile(np.array(spawn_pose, dtype=np.float32), (n, 1)),
+            v_drive=np.full(n, spec.v_drive, dtype=np.float32),
+            wz_drive=np.full(n, spec.wz_drive, dtype=np.float32),
+        ),
+        terrain_entries=terrain_entries,
+        ostrich=dict(
+            dt=ostrich_dt,
+            t=np.arange(ostrich_setpoints_1.shape[0], dtype=np.float32) * ostrich_dt,
+            cmd_wheel_omega=np.repeat(ostrich_setpoints_1, n, axis=1),
+            pose=ostrich_pose,
+            wheel_qd=ostrich_wheel_qd,
+        ),
+        hstack=dict(
+            dt=hstack_dt,
+            t=np.arange(hstack_setpoints_1.shape[0], dtype=np.float32) * hstack_dt,
+            cmd_wheel_omega=np.repeat(hstack_setpoints_1, n, axis=1),
+            pose=h_pose,
+            controlled=h_controlled,
+            derived=h_derived,
+            turning=h_turning,
+            clearance=h_clearance,
+            residual=h_residual,
+            wheel_qd=h_wheel_qd,
+        ),
     )
-    print(f"saved {out_npz}")
 
 
 def select_trials(trials: list[Trial], labels: list[str] | None) -> list[Trial]:
@@ -595,12 +596,12 @@ def print_trial_summary(labels: list[str], ostrich_pose: np.ndarray, hstack_cont
 
 def run_trial_comparison(cfg: DictConfig, spec: TrialScenarioSpec) -> None:
     """The ostrich-vs-hstack sweep over `spec.trials` (or a `+trials=[...]` subset, see
-    select_trials) run on spec's SINGLE shared terrain, writing outputs/compare_<spec.name>.npz.
+    select_trials) run on spec's SINGLE shared terrain, writing outputs/compare_<spec.name>.h5.
     The mirror of run_comparison: there the terrain varies and spawn/command are shared; here
     the terrain is shared and each trial supplies its own spawn pose + commanded twist. Reuses
     the exact same per-call batch simulators (run_ostrich_batch/run_hstack_batch already take
     terrain/setpoints/spawn_pose as plain arguments, so nothing about them assumes which one
-    varies) and npz schema, so comparator/plotting and comparator/replay work unmodified on
+    varies) and HDF5 schema, so comparator/plotting and comparator/replay work unmodified on
     either kind of output."""
     wp.init()
 
@@ -676,41 +677,45 @@ def run_trial_comparison(cfg: DictConfig, spec: TrialScenarioSpec) -> None:
     h_quat = euler_zyx_to_quat_xyzw(h_controlled[..., 2], h_derived[..., 1], h_derived[..., 2])
     h_pose = np.concatenate([h_controlled[..., :2], h_derived[..., :1], h_quat], axis=-1).astype(np.float32)
 
-    out_npz = OUT_DIR / f"compare_{spec.name}.npz"
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        out_npz,
-        n=np.int32(n),
-        variant_name=np.array("trial"),
-        variant_value=np.arange(n, dtype=np.float32),  # no single scalar parameter here -- trial
-        # index, purely so the field stays populated for any generic consumer that expects it
-        variant_label=np.array([t.label for t in trials]),
-        obstacle_x=np.float32(spec.obstacle_x),
-        terrain_path=np.array([str(spec.terrain_path)] * n),
-        **terrain_fields([(spec.terrain_path, terrain)] * n),
-        **git_provenance(),
-        spawn_pose=np.array(spawn_poses, dtype=np.float32),  # [n, 3] -- per trial, unlike
-        # ScenarioSpec's single pose shared by every variant
-        v_drive=np.array(v_drives, dtype=np.float32),  # [n]
-        wz_drive=np.array(wz_drives, dtype=np.float32),  # [n]
-        duration_s=np.float32(spec.duration_s),
-        mu=np.float32(mu),
-        k_turn=np.float32(k_turn),
-        k_p=np.float32(K_P),
-        ostrich_dt=np.float32(ostrich_dt),
-        ostrich_t=np.arange(ostrich_setpoints_1.shape[0], dtype=np.float32) * ostrich_dt,
-        ostrich_cmd_wheel_omega=ostrich_cmd_wheel_omega,
-        ostrich_pose=ostrich_pose,
-        ostrich_wheel_qd=ostrich_wheel_qd,
-        hstack_dt=np.float32(hstack_dt),
-        hstack_t=np.arange(hstack_setpoints_1.shape[0], dtype=np.float32) * hstack_dt,
-        hstack_cmd_wheel_omega=hstack_cmd_wheel_omega,
-        hstack_pose=h_pose,
-        hstack_controlled=h_controlled,
-        hstack_derived=h_derived,
-        hstack_turning=h_turning,
-        hstack_clearance=h_clearance,
-        hstack_residual=h_residual,
-        hstack_wheel_qd=h_wheel_qd,
+    write_comparison(
+        OUT_DIR / f"compare_{spec.name}.h5",
+        root=dict(
+            n=n,
+            variant_name="trial",
+            obstacle_x=float(spec.obstacle_x),
+            duration_s=float(spec.duration_s),
+            mu=mu,
+            k_turn=k_turn,
+            k_p=K_P,
+        ),
+        per_variant=dict(
+            # no single scalar parameter here -- trial index, purely so the field stays
+            # populated for any generic consumer that expects it
+            variant_value=np.arange(n, dtype=np.float32),
+            variant_label=np.array([t.label for t in trials]),
+            spawn_pose=np.array(spawn_poses, dtype=np.float32),  # [n, 3] -- per trial, unlike
+            # ScenarioSpec's single pose broadcast to every variant
+            v_drive=np.array(v_drives, dtype=np.float32),  # [n]
+            wz_drive=np.array(wz_drives, dtype=np.float32),  # [n]
+        ),
+        terrain_entries=[(spec.terrain_path, terrain)] * n,
+        ostrich=dict(
+            dt=ostrich_dt,
+            t=np.arange(ostrich_setpoints_1.shape[0], dtype=np.float32) * ostrich_dt,
+            cmd_wheel_omega=ostrich_cmd_wheel_omega,
+            pose=ostrich_pose,
+            wheel_qd=ostrich_wheel_qd,
+        ),
+        hstack=dict(
+            dt=hstack_dt,
+            t=np.arange(hstack_setpoints_1.shape[0], dtype=np.float32) * hstack_dt,
+            cmd_wheel_omega=hstack_cmd_wheel_omega,
+            pose=h_pose,
+            controlled=h_controlled,
+            derived=h_derived,
+            turning=h_turning,
+            clearance=h_clearance,
+            residual=h_residual,
+            wheel_qd=h_wheel_qd,
+        ),
     )
-    print(f"saved {out_npz}")

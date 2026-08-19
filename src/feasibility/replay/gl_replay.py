@@ -1,4 +1,4 @@
-"""GL replay of a single variant from a comparator/compare_*.py output npz (e.g.
+"""GL replay of a single variant from a comparator/compare_*.py output HDF5 (e.g.
 compare_speed_bumps.py, compare_box_obstacles.py): loads that variant's terrain heightfield and
 plays back the ostrich and/or hstack trajectory over it in Newton's interactive GL viewer, in
 real time, rendering the real Helhest Junior mesh (create_helhest_junior_model) -- chassis + 3
@@ -6,8 +6,8 @@ wheels -- rather than a box stand-in.
 
 Pose-only playback, not physics: each frame we write `joint_q` directly -- the chassis's
 free-joint 7 slots (px,py,pz,qx,qy,qz,qw) from the recorded chassis pose, and each wheel's
-revolute-joint 1 slot from a wheel angle WE integrate ourselves (the npz only logs wheel
-angular *velocity* -- ostrich_wheel_qd/hstack_wheel_qd -- not angle) -- then call
+revolute-joint 1 slot from a wheel angle WE integrate ourselves (the file only logs wheel
+angular *velocity* -- ostrich/wheel_qd and hstack/wheel_qd -- not angle) -- then call
 `newton.eval_fk` to propagate `joint_q` -> `state.body_q` for every body, so the wheels render
 attached to the chassis and spinning. No solver step, no control targets; `model.collide()` is
 only there to feed the viewer's contact-point overlay.
@@ -24,17 +24,18 @@ import argparse
 import pathlib
 import time
 
+import h5py
 import newton
 import numpy as np
 import warp as wp
 from examples.helhest_junior.common import create_helhest_junior_model
 from ostrich.core.model_builder import OstrichModelBuilder
 
-from feasibility.comparator.provenance import terrain_from_npz
+from feasibility.comparator.provenance import terrain_from_h5
 from feasibility.heightmap import HeightMapReader
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
-DEFAULT_NPZ = REPO_ROOT / "outputs" / "compare_speed_bumps.npz"
+DEFAULT_H5 = REPO_ROOT / "outputs" / "compare_speed_bumps.h5"
 
 # create_helhest_junior_model always adds exactly 4 joints per robot, in this fixed order:
 # base_joint (free: 7 joint_q slots / 6 joint_qd slots), then left/right/rear wheel_j (revolute:
@@ -120,30 +121,34 @@ def interp_pose(t: np.ndarray, pose: np.ndarray, sim_t: float) -> np.ndarray:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--npz", type=pathlib.Path, default=DEFAULT_NPZ, help=f"compare_*.npz path (default {DEFAULT_NPZ})")
+    ap.add_argument("--file", type=pathlib.Path, default=DEFAULT_H5, help=f"compare_*.h5 path (default {DEFAULT_H5})")
     ap.add_argument("--id", type=int, default=0, help="variant index to replay (default 0)")
     ap.add_argument("--which", choices=("ostrich", "hstack", "both"), default="both")
     ap.add_argument("--speed", type=float, default=1.0, help="playback speed multiplier (default 1.0 = real time)")
     ap.add_argument("--loop", action="store_true", help="loop playback instead of freezing on the last frame")
     args = ap.parse_args()
 
-    d = np.load(args.npz)
-    n = int(d["n"])
-    if not (0 <= args.id < n):
-        raise SystemExit(f"--id must be in [0, {n}), got {args.id}")
-
     which = ("ostrich", "hstack") if args.which == "both" else (args.which,)
-    label = str(d["variant_label"][args.id])
-    terrain = terrain_from_npz(d, args.id)
-    obstacle_x = float(d["obstacle_x"])
-    camera_pos = wp.vec3(obstacle_x, CAMERA_Y_OFFSET, CAMERA_Z)
 
-    tracks = {}
-    for name in which:
-        t = d[f"{name}_t"]
-        pose = d[f"{name}_pose"][:, args.id, :]
-        wheel_theta = integrate_wheel_angle(t, d[f"{name}_wheel_qd"][:, args.id, :])
-        tracks[name] = (t, pose, wheel_theta)
+    # Materialize everything to numpy inside the `with` -- h5py datasets are invalid once the
+    # file closes, and the render loop below runs long after this returns.
+    with h5py.File(args.file, "r") as f:
+        n = int(f.attrs["n"])
+        if not (0 <= args.id < n):
+            raise SystemExit(f"--id must be in [0, {n}), got {args.id}")
+
+        label = f["variant_label"].asstr()[args.id]
+        terrain = terrain_from_h5(f, args.id)
+        obstacle_x = float(f.attrs["obstacle_x"])
+
+        tracks = {}
+        for name in which:
+            t = f[name]["t"][:]
+            pose = f[name]["pose"][:, args.id, :]
+            wheel_theta = integrate_wheel_angle(t, f[name]["wheel_qd"][:, args.id, :])
+            tracks[name] = (t, pose, wheel_theta)
+
+    camera_pos = wp.vec3(obstacle_x, CAMERA_Y_OFFSET, CAMERA_Z)
     t_end = max(float(t[-1]) for t, _, _ in tracks.values())
 
     wp.init()

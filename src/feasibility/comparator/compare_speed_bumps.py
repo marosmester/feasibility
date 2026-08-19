@@ -6,7 +6,7 @@ as demos/ostrich_vel_cmd.py / demos/hstack_vel_cmd.py.
 Variants differ only in which heightmap they run on -- the bump heights from
 create_speed_bumps.BUMP_HEIGHTS -- not in the command. The robot always spawns upstream of the
 bump on its centerline (BUMP_X0 - 3.0), facing +X, i.e. perpendicular to the bump (which
-spans the full Y width), and drives straight at it. The actual sweep/rollout/npz-writing logic
+spans the full Y width), and drives straight at it. The actual sweep/rollout/HDF5-writing logic
 lives in comparator.common.run_comparison, shared with every other compare_*.py scenario driver
 (e.g. compare_box_obstacles.py) -- this file only describes the scenario via a ScenarioSpec.
 
