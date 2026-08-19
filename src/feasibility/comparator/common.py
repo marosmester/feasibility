@@ -79,6 +79,36 @@ class ScenarioSpec:
     # "distance", so the name has to say what it actually is.
 
 
+@dataclass(frozen=True)
+class Trial:
+    """One (initial condition, control sequence) pair within a TrialScenarioSpec -- the mirror
+    of ScenarioSpec's per-variant heightmap: here the terrain is the thing held fixed, and
+    spawn pose + commanded twist are what vary from row to row."""
+
+    label: str  # -> variant_label, e.g. "climb_south_face"
+    spawn_x: float  # m, initial chassis pose
+    spawn_y: float = 0.0
+    spawn_yaw: float = 0.0  # rad
+    v_drive: float = 1.0  # m/s, forward body velocity command
+    wz_drive: float = 0.0  # rad/s, yaw-rate command (opposite front-wheel signs -> turn in place)
+
+
+@dataclass(frozen=True)
+class TrialScenarioSpec:
+    """Everything run_trial_comparison needs: one shared terrain, a list of Trials run on it.
+    `duration_s` is shared by every trial (not per-Trial) so every trial's rollout has the same
+    step count T -- run_trial_comparison stacks all trials into single [T, n, ...] arrays, same
+    as run_comparison does across heightmap variants, and the comparator npz schema (consumed
+    generically by plotting/replay) assumes one shared *_t time axis per run."""
+
+    name: str  # -> outputs/compare_<name>.npz
+    terrain_path: pathlib.Path  # single heightmap asset, shared by every trial
+    trials: list[Trial]
+    obstacle_x: float  # anchors the replay camera -- no single "obstacle" here, so pick a
+    # representative X (e.g. the terrain's feature of interest) rather than an obstacle's edge
+    duration_s: float = 6.0  # s, command hold time shared by every trial -- see class docstring
+
+
 def cmd_to_wheels(v: float, wz: float) -> tuple[float, float, float]:
     """Ideal no-slip differential drive: body twist (v, omega) -> per-wheel rad/s [left, right, rear]."""
     v_l = (v - wz * HALF_TRACK) / WHEEL_RADIUS
@@ -514,6 +544,167 @@ def run_comparison(cfg: DictConfig, spec: ScenarioSpec) -> None:
         hstack_dt=np.float32(hstack_dt),
         hstack_t=np.arange(hstack_setpoints_1.shape[0], dtype=np.float32) * hstack_dt,
         hstack_cmd_wheel_omega=np.repeat(hstack_setpoints_1, n, axis=1),
+        hstack_pose=h_pose,
+        hstack_controlled=h_controlled,
+        hstack_derived=h_derived,
+        hstack_turning=h_turning,
+        hstack_clearance=h_clearance,
+        hstack_residual=h_residual,
+        hstack_wheel_qd=h_wheel_qd,
+    )
+    print(f"saved {out_npz}")
+
+
+def select_trials(trials: list[Trial], labels: list[str] | None) -> list[Trial]:
+    """Like select_variants but keyed by Trial.label instead of height -- lets a
+    `+trials=[...]` Hydra override run a subset of a TrialScenarioSpec's trials while iterating
+    on a scenario, preserving the spec's original order regardless of the order `labels` lists
+    them in. `labels=None` (no override) returns `trials` unchanged."""
+    if labels is None:
+        return trials
+    wanted = set(labels)
+    available = {t.label for t in trials}
+    missing = wanted - available
+    if missing:
+        raise ValueError(f"trial labels {sorted(missing)} not in this scenario's trials (available: {sorted(available)})")
+    return [t for t in trials if t.label in wanted]
+
+
+def print_trial_summary(labels: list[str], ostrich_pose: np.ndarray, hstack_controlled: np.ndarray) -> None:
+    """Like print_summary but keyed by trial label instead of a numeric obstacle value. Each
+    trial has its OWN spawn pose and command, so final X alone isn't comparable across rows the
+    way it is across compare_speed_bumps/compare_box_obstacles' shared-spawn variants -- report
+    final (x, y) instead."""
+    ostrich_final = ostrich_pose[-1, :, :2]
+    ostrich_peak_z = ostrich_pose[:, :, 2].max(axis=0)
+    ostrich_net_yaw = _net_yaw_deg(_quat_yaw(ostrich_pose[:, :, 3:7]))
+    hstack_final = hstack_controlled[-1, :, :2]
+    hstack_net_yaw = _net_yaw_deg(hstack_controlled[:, :, 2])
+    print(
+        f"{'trial':<26}{'ostrich xy':>18}{'ostrich peak z':>16}{'ostrich yaw':>14}"
+        f"{'hstack xy':>18}{'hstack yaw':>13}"
+    )
+    for i, label in enumerate(labels):
+        ox, oy = ostrich_final[i]
+        hx, hy = hstack_final[i]
+        print(
+            f"{label:<26}{f'({ox:.2f},{oy:.2f})':>18}{ostrich_peak_z[i]:16.3f}{ostrich_net_yaw[i]:14.1f}"
+            f"{f'({hx:.2f},{hy:.2f})':>18}{hstack_net_yaw[i]:13.1f}"
+        )
+
+
+def run_trial_comparison(cfg: DictConfig, spec: TrialScenarioSpec) -> None:
+    """The ostrich-vs-hstack sweep over `spec.trials` (or a `+trials=[...]` subset, see
+    select_trials) run on spec's SINGLE shared terrain, writing outputs/compare_<spec.name>.npz.
+    The mirror of run_comparison: there the terrain varies and spawn/command are shared; here
+    the terrain is shared and each trial supplies its own spawn pose + commanded twist. Reuses
+    the exact same per-call batch simulators (run_ostrich_batch/run_hstack_batch already take
+    terrain/setpoints/spawn_pose as plain arguments, so nothing about them assumes which one
+    varies) and npz schema, so comparator/plotting and comparator/replay work unmodified on
+    either kind of output."""
+    wp.init()
+
+    mu = float(cfg.get("mu", 0.8))
+    k_turn = float(cfg.get("k_turn", dynamics.K_TURN))
+    device = str(cfg.get("device", "cuda:0"))
+
+    trials = select_trials(spec.trials, cfg.get("trials", None))
+    n = len(trials)
+
+    terrain = HeightMapReader.load(spec.terrain_path)
+
+    sim_config: SimulationConfig = hydra.utils.instantiate(cfg.simulation)
+    render_config: RenderingConfig = hydra.utils.instantiate(cfg.rendering)
+    engine_config: EngineConfig = hydra.utils.instantiate(cfg.engine)
+    logging_config: LoggingConfig = hydra.utils.instantiate(cfg.logging)
+    # One world per call below -- each trial has its own spawn pose, so (like run_comparison's
+    # per-variant terrain) they can't share a single replicated build.
+    sim_config.num_worlds = 1
+    render_config.vis_type = "null"  # headless: no GL viewer
+
+    ostrich_dt = sim_config.target_timestep_seconds
+    hstack_dt = dynamics.DT
+    print(f"[ostrich]  {n} trials on {spec.terrain_path.name} @ dt={ostrich_dt}")
+    print(f"[hstack]   {n} trials on {spec.terrain_path.name} @ dt={hstack_dt}")
+
+    spawn_poses, v_drives, wz_drives = [], [], []
+    ostrich_cmds, hstack_cmds = [], []
+    ostrich_poses, ostrich_wheel_qds = [], []
+    h_controlleds, h_deriveds, h_clearances, h_residuals, h_turnings, h_wheel_qds = [], [], [], [], [], []
+
+    for trial in trials:
+        spawn_pose = (trial.spawn_x, trial.spawn_y, trial.spawn_yaw)
+        spawn_poses.append(spawn_pose)
+        v_drives.append(trial.v_drive)
+        wz_drives.append(trial.wz_drive)
+
+        ostrich_setpoints_1 = build_setpoints(ostrich_dt, trial.v_drive, trial.wz_drive, spec.duration_s)[:, None, :]
+        hstack_setpoints_1 = build_setpoints(hstack_dt, trial.v_drive, trial.wz_drive, spec.duration_s)[:, None, :]
+        ostrich_cmds.append(ostrich_setpoints_1[:, 0])
+        hstack_cmds.append(hstack_setpoints_1[:, 0])
+
+        pose, wheel_qd = run_ostrich_batch(
+            sim_config, render_config, engine_config, logging_config, terrain, ostrich_setpoints_1, mu, spawn_pose
+        )
+        ostrich_poses.append(pose[:, 0])
+        ostrich_wheel_qds.append(wheel_qd[:, 0])
+
+        controlled, derived, clearance, residual, turning, wheel_qd_h = run_hstack_batch(
+            hstack_setpoints_1, terrain, hstack_dt, k_turn, mu, device, spawn_pose
+        )
+        h_controlleds.append(controlled[:, 0])
+        h_deriveds.append(derived[:, 0])
+        h_clearances.append(clearance[:, 0])
+        h_residuals.append(residual[:, 0])
+        h_turnings.append(turning[:, 0])
+        h_wheel_qds.append(wheel_qd_h[:, 0])
+        print(f"  {trial.label}  done")
+
+    ostrich_pose = np.stack(ostrich_poses, axis=1)  # [T, n, 7]
+    ostrich_wheel_qd = np.stack(ostrich_wheel_qds, axis=1)
+    ostrich_cmd_wheel_omega = np.stack(ostrich_cmds, axis=1)  # [T, n, 3]
+    h_controlled = np.stack(h_controlleds, axis=1)  # [T, n, 3]
+    h_derived = np.stack(h_deriveds, axis=1)
+    h_clearance = np.stack(h_clearances, axis=1)
+    h_residual = np.stack(h_residuals, axis=1)
+    h_turning = np.stack(h_turnings, axis=1)
+    h_wheel_qd = np.stack(h_wheel_qds, axis=1)
+    hstack_cmd_wheel_omega = np.stack(hstack_cmds, axis=1)
+
+    print_trial_summary([t.label for t in trials], ostrich_pose, h_controlled)
+
+    h_quat = euler_zyx_to_quat_xyzw(h_controlled[..., 2], h_derived[..., 1], h_derived[..., 2])
+    h_pose = np.concatenate([h_controlled[..., :2], h_derived[..., :1], h_quat], axis=-1).astype(np.float32)
+
+    out_npz = OUT_DIR / f"compare_{spec.name}.npz"
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        out_npz,
+        n=np.int32(n),
+        variant_name=np.array("trial"),
+        variant_value=np.arange(n, dtype=np.float32),  # no single scalar parameter here -- trial
+        # index, purely so the field stays populated for any generic consumer that expects it
+        variant_label=np.array([t.label for t in trials]),
+        obstacle_x=np.float32(spec.obstacle_x),
+        terrain_path=np.array([str(spec.terrain_path)] * n),
+        **terrain_fields([(spec.terrain_path, terrain)] * n),
+        **git_provenance(),
+        spawn_pose=np.array(spawn_poses, dtype=np.float32),  # [n, 3] -- per trial, unlike
+        # ScenarioSpec's single pose shared by every variant
+        v_drive=np.array(v_drives, dtype=np.float32),  # [n]
+        wz_drive=np.array(wz_drives, dtype=np.float32),  # [n]
+        duration_s=np.float32(spec.duration_s),
+        mu=np.float32(mu),
+        k_turn=np.float32(k_turn),
+        k_p=np.float32(K_P),
+        ostrich_dt=np.float32(ostrich_dt),
+        ostrich_t=np.arange(ostrich_setpoints_1.shape[0], dtype=np.float32) * ostrich_dt,
+        ostrich_cmd_wheel_omega=ostrich_cmd_wheel_omega,
+        ostrich_pose=ostrich_pose,
+        ostrich_wheel_qd=ostrich_wheel_qd,
+        hstack_dt=np.float32(hstack_dt),
+        hstack_t=np.arange(hstack_setpoints_1.shape[0], dtype=np.float32) * hstack_dt,
+        hstack_cmd_wheel_omega=hstack_cmd_wheel_omega,
         hstack_pose=h_pose,
         hstack_controlled=h_controlled,
         hstack_derived=h_derived,
