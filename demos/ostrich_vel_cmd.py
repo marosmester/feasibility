@@ -38,7 +38,7 @@ mu=0.8), both open:
 Usage:
     python demos/ostrich_vel_cmd.py                       # GL viewer
     python demos/ostrich_vel_cmd.py rendering=headless     # batch, no window
-    python demos/ostrich_vel_cmd.py +out=/tmp/run1.npz
+    python demos/ostrich_vel_cmd.py +out=/tmp/run1.h5
     python demos/ostrich_vel_cmd.py +terrain_path=assets/ramp  # non-flat terrain
 """
 import math
@@ -65,6 +65,7 @@ try:
 except ModuleNotFoundError:
     from helhest_common import create_helhest_junior_model
 
+from feasibility.comparator.provenance import write_run
 from feasibility.heightmap import HeightMapReader
 
 CONFIG_PATH = pathlib.Path(examples.__file__).parent.joinpath("conf")
@@ -263,18 +264,22 @@ def ostrich_vel_cmd(cfg: DictConfig):
         f"-> implied alpha {NOMINAL_YAW_RAD / achieved_yaw:.2f}"
     )
 
-    out = pathlib.Path(cfg.get("out", pathlib.Path(__file__).parent.parent / "outputs" /"ostrich_vel_cmd.npz"))
-    np.savez_compressed(
+    out = pathlib.Path(cfg.get("out", pathlib.Path(__file__).parent.parent / "outputs" /"ostrich_vel_cmd.h5"))
+    write_run(
         out,
-        dt=np.float32(dt),
-        t=t,
-        cmd_wheel_omega=setpoints,
-        pose=poses,
-        wheel_qd=wheel_qd,
-        phases=np.array(PHASES, dtype=np.float32),
+        attrs={"dt": float(dt)},
+        arrays={
+            "t": t,
+            "cmd_wheel_omega": setpoints,
+            "pose": poses,
+            "wheel_qd": wheel_qd,
+            "phases": np.array(PHASES, dtype=np.float32),
+        },
+        terrain=terrain,
+        # None for the flat default -- it has no assets/ file to reference. The grid itself is
+        # embedded either way, which is what demos/hstack_vel_cmd.py reads back.
+        terrain_path=pathlib.Path(terrain_path) if terrain_path else None,
     )
-    terrain.save(out.with_suffix(""))
-    print(f"saved {out}")
 
 
 if __name__ == "__main__":

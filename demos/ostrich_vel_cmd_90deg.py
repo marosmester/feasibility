@@ -35,9 +35,14 @@ from ostrich import SimulationConfig
 try:
     from demos.ostrich_vel_cmd import HelhestVelCmdSimulator, K_P, WHEEL_RADIUS, HALF_TRACK
     from demos.ostrich_vel_cmd import cmd_to_wheels, yaw_from_quat_xyzw
+    from demos.ostrich_vel_cmd import TERRAIN_XLIM_M, TERRAIN_YLIM_M, TERRAIN_CELL
 except ModuleNotFoundError:
     from ostrich_vel_cmd import HelhestVelCmdSimulator, K_P, WHEEL_RADIUS, HALF_TRACK
     from ostrich_vel_cmd import cmd_to_wheels, yaw_from_quat_xyzw
+    from ostrich_vel_cmd import TERRAIN_XLIM_M, TERRAIN_YLIM_M, TERRAIN_CELL
+
+from feasibility.comparator.provenance import write_run
+from feasibility.heightmap import HeightMapReader
 
 CONFIG_PATH = pathlib.Path(examples.__file__).parent.joinpath("conf")
 
@@ -69,8 +74,12 @@ def ostrich_vel_cmd_90deg(cfg: DictConfig):
 
     setpoints = build_setpoints(sim_config.target_timestep_seconds)
 
+    # Same flat default ostrich_vel_cmd.py builds -- HelhestVelCmdSimulator requires a terrain,
+    # and it is also what gets embedded in the output file below.
+    terrain = HeightMapReader.flat(xlim=TERRAIN_XLIM_M, ylim=TERRAIN_YLIM_M, cell=TERRAIN_CELL)
+
     sim = HelhestVelCmdSimulator(
-        sim_config, render_config, engine_config, logging_config, k_p=K_P
+        sim_config, render_config, engine_config, logging_config, k_p=K_P, terrain=terrain
     )
     if sim_config.use_cuda_graph:
         poses, wheel_qd = sim.replay_graph(setpoints)
@@ -85,18 +94,20 @@ def ostrich_vel_cmd_90deg(cfg: DictConfig):
     achieved_yaw = yaw_from_quat_xyzw(poses[-1, 3:7]) - yaw_from_quat_xyzw(poses[0, 3:7])
     print(f"achieved yaw : {math.degrees(achieved_yaw):6.2f} deg  (target 90.0)")
 
-    out = pathlib.Path(cfg.get("out", "/tmp/ostrich_vel_cmd_90deg.npz"))
+    out = pathlib.Path(cfg.get("out", "/tmp/ostrich_vel_cmd_90deg.h5"))
     dt = sim_config.target_timestep_seconds
-    np.savez_compressed(
+    write_run(
         out,
-        dt=np.float32(dt),
-        t=np.arange(len(setpoints), dtype=np.float32) * dt,
-        cmd_wheel_omega=setpoints,
-        pose=poses,
-        wheel_qd=wheel_qd,
-        phases=np.array(PHASES, dtype=np.float32),
+        attrs={"dt": float(dt)},
+        arrays={
+            "t": np.arange(len(setpoints), dtype=np.float32) * dt,
+            "cmd_wheel_omega": setpoints,
+            "pose": poses,
+            "wheel_qd": wheel_qd,
+            "phases": np.array(PHASES, dtype=np.float32),
+        },
+        terrain=terrain,  # flat default, no assets/ file to reference
     )
-    print(f"saved {out}")
 
 
 if __name__ == "__main__":

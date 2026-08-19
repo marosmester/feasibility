@@ -3,7 +3,7 @@ kinematic twin, on the same flat ground / mu / robot geometry, for a direct
 ostrich-(dynamics) vs helhest_stack-(kinematic) comparison.
 
 ostrich_vel_cmd.py drives Helhest Junior with an open-loop straight/arc-left/straight
-wheel-velocity schedule and saves outputs/ostrich_vel_cmd.npz. Its docstring flags the
+wheel-velocity schedule and saves outputs/ostrich_vel_cmd.h5. Its docstring flags the
 missing half of the experiment: a helhest_stack replay of the *same* commands, to see
 how well the kinematic model's skid-steer slip law (alpha = 1 + k_turn*mu,
 engine/step.py) reproduces ostrich's dynamic under-rotation. This is that replay.
@@ -43,10 +43,12 @@ from helhest import dynamics
 from helhest import friction as friction_mod
 from helhest.engine import ForwardSimulator
 
+from feasibility.comparator.provenance import read_run
+from feasibility.comparator.provenance import write_run
 from feasibility.heightmap import HeightMapReader
 
-IN_NPZ = pathlib.Path(__file__).parent.parent / "outputs" / "ostrich_vel_cmd.npz"
-OUT_NPZ = pathlib.Path(__file__).parent.parent / "outputs" / "hstack_vel_cmd.npz"
+IN_H5 = pathlib.Path(__file__).parent.parent / "outputs" / "ostrich_vel_cmd.h5"
+OUT_H5 = pathlib.Path(__file__).parent.parent / "outputs" / "hstack_vel_cmd.h5"
 
 DEFAULT_DT = 0.1  # [s] helhest_stack's canonical control rate (dynamics.DT)
 GRID_MARGIN = 3.0  # [m] padding around the ostrich trajectory bbox
@@ -54,17 +56,25 @@ GRID_CELL = 0.05  # [m]
 
 
 def load_ostrich_commands(
-    npz_path: pathlib.Path, dt: float
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    h5_path: pathlib.Path, dt: float
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, HeightMapReader]:
     """Zero-order-hold ostrich's [N,3] cmd_wheel_omega onto a dt grid.
 
-    Returns (setpoints [T,3] float32, t_new [T], ostrich_pose [N,7], phases [3,3])."""
-    d = np.load(npz_path)
-    t_src, cmd_src, dt_src = d["t"], d["cmd_wheel_omega"], float(d["dt"])
+    Returns (setpoints [T,3] float32, t_new [T], ostrich_pose [N,7], phases [3,3], terrain).
+    The terrain rides along because it is embedded in the same file (comparator.provenance's
+    write_run), so the replay is guaranteed the identical surface ostrich ran on."""
+    attrs, arrays, terrain = read_run(h5_path)
+    t_src, cmd_src, dt_src = arrays["t"], arrays["cmd_wheel_omega"], float(attrs["dt"])
     T = int(round((t_src[-1] + dt_src) / dt))
     t_new = np.arange(T) * dt
     idx = np.clip(np.searchsorted(t_src, t_new, side="right") - 1, 0, len(t_src) - 1)
-    return cmd_src[idx].astype(np.float32), t_new.astype(np.float32), d["pose"], d["phases"]
+    return (
+        cmd_src[idx].astype(np.float32),
+        t_new.astype(np.float32),
+        arrays["pose"],
+        arrays["phases"],
+        terrain,
+    )
 
 
 def grid_extent(
@@ -79,20 +89,18 @@ def grid_extent(
 
 def load_terrain(
     terrain_path: str | None,
-    ostrich_npz: pathlib.Path,
+    embedded: HeightMapReader | None,
     ostrich_pose: np.ndarray,
     margin: float,
     cell: float,
 ) -> HeightMapReader:
-    """--terrain PATH if given; else whatever demos/ostrich_vel_cmd.py saved
-    next to its output npz (identical physical terrain to the ostrich run);
-    else flat ground sized from the ostrich trajectory bbox (older npz with
-    no saved terrain asset)."""
+    """--terrain PATH if given; else the terrain embedded in ostrich_vel_cmd.py's output file
+    (bit-identical to the surface the ostrich run actually used); else flat ground sized from
+    the ostrich trajectory bbox."""
     if terrain_path:
         return HeightMapReader.load(terrain_path)
-    stem = ostrich_npz.with_suffix("")
-    if stem.with_suffix(".png").exists() and stem.with_suffix(".yaml").exists():
-        return HeightMapReader.load(stem)
+    if embedded is not None:
+        return embedded
     xlim, ylim = grid_extent(ostrich_pose, margin)
     return HeightMapReader.flat(xlim=xlim, ylim=ylim, cell=cell)
 
@@ -177,12 +185,12 @@ def print_summary(
 
 def run_headless(args: argparse.Namespace) -> None:
     wp.init()
-    setpoints, t_new, ostrich_pose, phases = load_ostrich_commands(IN_NPZ, args.dt)
-    hmap = load_terrain(args.terrain, IN_NPZ, ostrich_pose, GRID_MARGIN, GRID_CELL)
+    setpoints, t_new, ostrich_pose, phases, embedded = load_ostrich_commands(IN_H5, args.dt)
+    hmap = load_terrain(args.terrain, embedded, ostrich_pose, GRID_MARGIN, GRID_CELL)
 
     if args.dt_sweep:
         for dt in (0.1, 0.05, 0.03, 0.01):
-            sp, _, _, _ = load_ostrich_commands(IN_NPZ, dt)
+            sp, *_ = load_ostrich_commands(IN_H5, dt)
             controlled, *_ = rollout(sp, hmap, dt, args.k_turn, args.mu, args.device)
             print_summary(dt, controlled, ostrich_pose, args.mu, args.k_turn)
         return
@@ -195,24 +203,24 @@ def run_headless(args: argparse.Namespace) -> None:
     quat = euler_zyx_to_quat_xyzw(controlled[:, 2], derived[:, 1], derived[:, 2])
     pose = np.concatenate([controlled[:, :2], derived[:, :1], quat], axis=1).astype(np.float32)
 
-    OUT_NPZ.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        OUT_NPZ,
-        dt=np.float32(args.dt),
-        t=t_new,
-        cmd_wheel_omega=setpoints,
-        pose=pose,
-        wheel_qd=wheel_qd,
-        phases=phases,
-        controlled=controlled,
-        derived=derived,
-        turning=turning,
-        clearance=clearance,
-        residual=residual,
-        k_turn=np.float32(args.k_turn),
-        mu=np.float32(args.mu),
+    write_run(
+        OUT_H5,
+        attrs={"dt": float(args.dt), "k_turn": float(args.k_turn), "mu": float(args.mu)},
+        arrays={
+            "t": t_new,
+            "cmd_wheel_omega": setpoints,
+            "pose": pose,
+            "wheel_qd": wheel_qd,
+            "phases": phases,
+            "controlled": controlled,
+            "derived": derived,
+            "turning": turning,
+            "clearance": clearance,
+            "residual": residual,
+        },
+        terrain=hmap,
+        terrain_path=pathlib.Path(args.terrain) if args.terrain else None,
     )
-    print(f"saved {OUT_NPZ}")
 
 
 # --- GL viewer -----------------------------------------------------------------
@@ -239,8 +247,8 @@ def run_view(args: argparse.Namespace) -> None:
     from helhest.viz.render import build_terrain
 
     wp.init()
-    setpoints, t_new, ostrich_pose, _phases = load_ostrich_commands(IN_NPZ, args.dt)
-    hmap = load_terrain(args.terrain, IN_NPZ, ostrich_pose, GRID_MARGIN, GRID_CELL)
+    setpoints, t_new, ostrich_pose, _phases, embedded = load_ostrich_commands(IN_H5, args.dt)
+    hmap = load_terrain(args.terrain, embedded, ostrich_pose, GRID_MARGIN, GRID_CELL)
     controlled, derived, *_ = rollout(
         setpoints, hmap, args.dt, args.k_turn, args.mu, args.device
     )
@@ -378,11 +386,11 @@ def main() -> None:
         default=None,
         metavar="PATH",
         help="HeightMapReader PNG+YAML terrain asset (path without extension); default: "
-        "whatever demos/ostrich_vel_cmd.py saved next to outputs/ostrich_vel_cmd.npz, "
+        "the terrain embedded in outputs/ostrich_vel_cmd.h5, "
         "or flat ground sized from its trajectory bbox if none was saved",
     )
     ap.add_argument("--device", default="cuda:0", help="Warp device (default cuda:0)")
-    ap.add_argument("--no-view", action="store_true", help="headless: skip the GL viewer, save npz")
+    ap.add_argument("--no-view", action="store_true", help="headless: skip the GL viewer, save h5")
     ap.add_argument("--no-ghost", action="store_true", help="viewer: hide the ostrich trail overlay")
     ap.add_argument(
         "--dt-sweep",
@@ -394,8 +402,8 @@ def main() -> None:
     )
     args = ap.parse_args()
 
-    if not IN_NPZ.exists():
-        raise SystemExit(f"missing {IN_NPZ} -- run demos/ostrich_vel_cmd.py first")
+    if not IN_H5.exists():
+        raise SystemExit(f"missing {IN_H5} -- run demos/ostrich_vel_cmd.py first")
 
     if args.no_view:
         run_headless(args)

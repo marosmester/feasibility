@@ -17,6 +17,10 @@ Two independent gaps `batch_compare.py`'s npz used to have (neither closed by ju
 HDF5 layout written by write_comparison(): scalars as root attrs, per-variant/time-series arrays
 as datasets, grouped `terrain/`, `git/`, `ostrich/`, `hstack/` -- matching the grouping+attrs
 convention ostrich's own loggers use (ostrich/src/ostrich/logging/*_logger.py).
+
+write_run()/read_run() are the single-run counterpart used by the demos/ scripts: one simulator
+and one trajectory, so the arrays are flat [T, ...] and the two sim groups are absent, but the
+same embedded `terrain/` + `git/` groups close both gaps above.
 """
 from __future__ import annotations
 
@@ -66,12 +70,19 @@ def git_provenance() -> dict[str, object]:
     return fields
 
 
-def terrain_fields(entries: list[tuple[pathlib.Path, HeightMapReader]]) -> dict[str, np.ndarray]:
+def terrain_fields(
+    entries: list[tuple[pathlib.Path | None, HeightMapReader]]
+) -> dict[str, np.ndarray]:
     """entries: (path, terrain) pairs in variant order, `path` the assets/ stem the terrain was
     loaded from (used both as an archival reference and to re-read its yaml sidecar verbatim;
     HeightMapReader itself keeps no raw yaml text -- load() parses it into a local dict and
     discards it). Returns the per-variant terrain block to splice into the file's `terrain/`
-    group by write_comparison()."""
+    group by write_comparison()/write_run().
+
+    `path` may be None for a terrain that was built in memory rather than loaded from assets/
+    (e.g. HeightMapReader.flat() in demos/ostrich_vel_cmd.py) -- yaml/path record "" for that
+    variant. The elevation grid itself is embedded either way, so a None path costs only the
+    archival reference, never the ability to replay."""
     shapes = {(t.ny, t.nx) for _, t in entries}
     if len(shapes) > 1:
         bad = next((p, t) for p, t in entries if (t.ny, t.nx) != next(iter(shapes)))
@@ -90,9 +101,12 @@ def terrain_fields(entries: list[tuple[pathlib.Path, HeightMapReader]]) -> dict[
         "min_z": np.array([t.min_z for _, t in entries], dtype=np.float64),
         "max_z": np.array([t.max_z for _, t in entries], dtype=np.float64),
         "yaml": np.array(
-            [pathlib.Path(p).with_suffix(".yaml").read_text() for p, _ in entries]
+            [
+                "" if p is None else pathlib.Path(p).with_suffix(".yaml").read_text()
+                for p, _ in entries
+            ]
         ),
-        "path": np.array([str(p) for p, _ in entries]),
+        "path": np.array(["" if p is None else str(p) for p, _ in entries]),
     }
 
 
@@ -161,3 +175,50 @@ def write_comparison(
             _write_group(grp, fields)
 
     print(f"saved {path}")
+
+
+def write_run(
+    path: pathlib.Path,
+    *,
+    attrs: dict[str, object],
+    arrays: dict[str, np.ndarray],
+    terrain: HeightMapReader,
+    terrain_path: pathlib.Path | None = None,
+) -> None:
+    """Single-run counterpart to write_comparison(), for the demos/ scripts: ONE simulator, ONE
+    trajectory, so the arrays are flat [T, ...] with no per-variant axis and there are no
+    `ostrich/`/`hstack/` groups. Everything else matches -- `attrs` become root attrs, `arrays`
+    root datasets, and the same embedded `terrain/` + `git/` groups make the file self-describing
+    (see this module's docstring for why a `terrain_path` string alone is not enough).
+
+    `terrain_path` is the assets/ stem the terrain came from, or None when it was built in
+    memory (HeightMapReader.flat()) -- see terrain_fields()."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with h5py.File(path, "w") as f:
+        for name, value in attrs.items():
+            f.attrs[name] = value
+
+        _write_group(f, arrays)
+
+        grp_terrain = f.create_group("terrain")
+        # One-entry variant list: the terrain/ group keeps its leading axis of length 1, so
+        # terrain_from_h5(f, 0) reads a single-run file and a comparison file identically.
+        _write_group(grp_terrain, terrain_fields([(terrain_path, terrain)]))
+
+        grp_git = f.create_group("git")
+        for name, value in git_provenance().items():
+            grp_git.attrs[name] = value
+
+    print(f"saved {path}")
+
+
+def read_run(
+    path: pathlib.Path,
+) -> tuple[dict[str, object], dict[str, np.ndarray], HeightMapReader]:
+    """Inverse of write_run(): (attrs, arrays, terrain). Everything is materialized to numpy
+    inside the `with` -- h5py datasets are invalid once the file closes."""
+    with h5py.File(path, "r") as f:
+        attrs = dict(f.attrs)
+        arrays = {name: f[name][()] for name in f if not isinstance(f[name], h5py.Group)}
+        terrain = terrain_from_h5(f, 0)
+    return attrs, arrays, terrain
