@@ -40,7 +40,7 @@ BUMP_X0 = 2.0  # m, leading (near) edge of the bump's flat top
 BUMP_WIDTH = 0.4  # m, extent of the flat top along X (direction of travel)
 
 DEFAULT_CELL = 0.05  # m, grid resolution
-DEFAULT_INCLINE_DEG = 15.0  # deg, ramp slope shared by every height in the series
+DEFAULT_INCLINE_DEG = 80.0  # deg, ramp slope shared by every height in the series
 
 BUMP_HEIGHTS =  (0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70)  # m, one heightmap per height
 

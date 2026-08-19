@@ -14,6 +14,7 @@ only there to feed the viewer's contact-point overlay.
 
 Usage:
     python src/feasibility/replay/gl_replay.py --id 3                 # ostrich, variant 3
+    python src/feasibility/replay/gl_replay.py --file outputs/compare_speed_bumps.h5 --id 3
     python src/feasibility/replay/gl_replay.py --id 3 --which hstack
     python src/feasibility/replay/gl_replay.py --id 3 --which both --speed 0.25 --loop
 """
