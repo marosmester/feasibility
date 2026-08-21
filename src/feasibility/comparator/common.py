@@ -203,17 +203,28 @@ def _advance_kernel(step_buf: wp.array(dtype=wp.int32)):
 
 class HelhestBatchSimulator(HelhestJuniorReplaySimulator):
     """HelhestJuniorReplaySimulator's robot/actuator/friction setup, replicated across
-    `simulation_config.num_worlds` worlds via `finalize_replicated`. Each compare_*.py driver
-    builds one of these per heightmap in its scenario's series (num_worlds=1) since each variant
-    needs its own terrain; the replication/batch-kernel machinery here is generic to
-    num_worlds > 1 too (kept from an earlier same-terrain, different-command sweep) and still
-    works, just unused at N>1 by the current drivers."""
+    `simulation_config.num_worlds` worlds via `finalize_replicated`. `spawn_pose` is either one
+    (x, y, yaw) shared by every world (today's compare_*.py drivers, num_worlds=1 -- each variant
+    needs its own terrain, so they build one of these per heightmap) or an [N, 3] array giving
+    each world its own spawn -- a dataset generator's per-world batch, all N worlds sharing one
+    terrain. Either way the robot is built once, at identity, and _apply_spawn_poses places each
+    world afterwards; the batch-kernel machinery (_batch_control_kernel etc.) was already generic
+    to N > 1, so nothing below the model build needed to change."""
 
     def __init__(
-        self, *args, terrain: HeightMapReader, spawn_pose: tuple[float, float, float], **kwargs
+        self,
+        *args,
+        terrain: HeightMapReader,
+        spawn_pose: tuple[float, float, float] | np.ndarray,
+        **kwargs,
     ):
         self.terrain = terrain
-        self.spawn_pose = spawn_pose
+        # Normalize to [N, 3] up front so build_model (called from inside super().__init__())
+        # only has one shape to handle.
+        spawn_pose_arr = np.asarray(spawn_pose, dtype=np.float64)
+        if spawn_pose_arr.ndim == 1:
+            spawn_pose_arr = spawn_pose_arr[None, :]
+        self.spawn_poses = spawn_pose_arr  # [N, 3] (x, y, yaw)
         super().__init__(*args, **kwargs)
         num_worlds = self.simulation_config.num_worlds
         self.dofs_per_world = self.model.joint_dof_count // num_worlds
@@ -222,9 +233,18 @@ class HelhestBatchSimulator(HelhestJuniorReplaySimulator):
     def build_model(self) -> newton.Model:
         self.builder.rigid_gap = 0.2
 
+        num_worlds = self.simulation_config.num_worlds
+        if self.spawn_poses.shape[0] != num_worlds:
+            raise ValueError(
+                f"spawn_pose supplies {self.spawn_poses.shape[0]} pose(s) but "
+                f"simulation_config.num_worlds={num_worlds}"
+            )
+
         # Mesh goes in a separate builder so it gets shape_world=-1 (Newton's "global"
         # sentinel): stored once, broadphase-tested against every world instead of
-        # duplicated per world. Same pattern as demos/ostrich_speed_bump.py.
+        # duplicated per world. Same pattern as demos/ostrich_speed_bump.py. Must stay the
+        # first thing finalize_replicated adds -- _build_world_starts only counts LEADING
+        # world==-1 entities as globals.
         globals_builder = newton.ModelBuilder()
         globals_builder.add_shape_mesh(
             body=-1,
@@ -232,12 +252,13 @@ class HelhestBatchSimulator(HelhestJuniorReplaySimulator):
             cfg=newton.ModelBuilder.ShapeConfig(density=0.0, mu=0.8, **self.ground_cfg_kwargs),
         )
 
-        spawn_x, spawn_y, spawn_yaw = self.spawn_pose
-        spawn_z = float(self.terrain.sample(spawn_x, spawn_y)) + 0.5
-        spawn_q = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), spawn_yaw)
+        # Build the robot once, at identity -- every world gets an identical copy via
+        # finalize_replicated's default (translation-only, all-zero-offset) replicate(). Actual
+        # per-world placement happens afterwards in _apply_spawn_poses, so this needs no
+        # per-world xform here (and no change to ostrich/newton).
         create_helhest_junior_model(
             self.builder,
-            xform=wp.transform(wp.vec3(spawn_x, spawn_y, spawn_z), spawn_q),
+            xform=wp.transform_identity(),
             control_mode=self.control_mode,
             k_p=self.k_p,
             k_d=self.k_d,
@@ -249,9 +270,52 @@ class HelhestBatchSimulator(HelhestJuniorReplaySimulator):
             kf=self.wheel_kf,
         )
 
-        return self.builder.finalize_replicated(
-            num_worlds=self.simulation_config.num_worlds, global_builder=globals_builder
-        )
+        model = self.builder.finalize_replicated(num_worlds=num_worlds, global_builder=globals_builder)
+        self._apply_spawn_poses(model, num_worlds)
+        return model
+
+    def _apply_spawn_poses(self, model: newton.Model, num_worlds: int) -> None:
+        """Moves each world's robot from the identity build above to its own (x, y, yaw) --
+        the composition newton.ModelBuilder.add_builder(..., xform=...) itself performs when
+        replicating a builder with a non-identity transform (see the FREE-joint branch and the
+        unconditional per-body transform_mul in newton/_src/sim/builder.py), just applied to the
+        already-finalized model instead of during finalize, so this file is the only thing that
+        changes -- ostrich/newton stay untouched.
+
+        Patches BOTH the free base joint's initial `joint_q` (7 floats: pos+quat) -- what
+        `newton.eval_fk` in BaseSimulator.__init__ actually reconstructs body_q from once
+        build_model() returns -- AND `model.body_q` directly for every body in the world, since
+        `state()`/`model.collide()` run before that eval_fk and would otherwise see every world's
+        robot still overlapping at the identity build pose.
+        """
+        joints_per_world = model.joint_count // num_worlds
+        bodies_per_world = model.body_count // num_worlds
+        joint_type_np = model.joint_type.numpy()[:joints_per_world]
+        local_free_idx = int(np.nonzero(joint_type_np == int(newton.JointType.FREE))[0][0])
+
+        joint_q_start_np = model.joint_q_start.numpy()
+        joint_q_np = model.joint_q.numpy()
+        body_q_np = model.body_q.numpy()
+
+        for w in range(num_worlds):
+            x, y, yaw = (float(v) for v in self.spawn_poses[w])
+            z = float(self.terrain.sample(x, y)) + 0.5
+            spawn_xf = wp.transform(wp.vec3(x, y, z), wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), yaw))
+
+            joint_idx = w * joints_per_world + local_free_idx
+            qi = int(joint_q_start_np[joint_idx])
+            local_xf = wp.transform(*joint_q_np[qi : qi + 7])
+            joint_q_np[qi : qi + 7] = np.array(wp.transform_multiply(spawn_xf, local_xf), dtype=np.float32)
+
+            for b in range(bodies_per_world):
+                body_idx = w * bodies_per_world + b
+                local_body_xf = wp.transform(*body_q_np[body_idx])
+                body_q_np[body_idx] = np.array(
+                    wp.transform_multiply(spawn_xf, local_body_xf), dtype=np.float32
+                )
+
+        model.joint_q.assign(joint_q_np)
+        model.body_q.assign(body_q_np)
 
     def _batch_physics_step(self) -> None:
         """One physics step, all worlds at once (capturable) -- the batched analogue of
@@ -337,8 +401,10 @@ def run_ostrich_batch(
     terrain: HeightMapReader,
     setpoints: np.ndarray,
     mu: float,
-    spawn_pose: tuple[float, float, float],
+    spawn_pose: tuple[float, float, float] | np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
+    """`spawn_pose` is either one (x, y, yaw) shared by every world (setpoints' W dimension must
+    then be 1) or an [N, 3] array giving each world its own -- see HelhestBatchSimulator."""
     sim = HelhestBatchSimulator(
         sim_config, render_config, engine_config, logging_config,
         k_p=K_P, mu_front=mu, mu_rear=mu, terrain=terrain, spawn_pose=spawn_pose,
@@ -356,11 +422,14 @@ def run_hstack_batch(
     k_turn: float,
     mu: float,
     device: str,
-    spawn_pose: tuple[float, float, float],
+    spawn_pose: tuple[float, float, float] | np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """setpoints [T, N, 3]. Returns controlled [T,N,3] (x,y,yaw), derived [T,N,3] (z,pitch,roll),
-    clearance [T,N], residual [T,N], turning [T,N,2], wheel_qd [T,N,3] -- all with the row-0
-    pre-command pose dropped, matching hstack_vel_cmd.py's single-rollout convention."""
+    """setpoints [T, N, 3]. `spawn_pose` is either one (x, y, yaw) shared by every rollout in the
+    batch (today's compare_*.py callers) or an [N, 3] array giving each rollout its own -- a
+    dataset generator's per-row spawn. Returns controlled [T,N,3] (x,y,yaw), derived [T,N,3]
+    (z,pitch,roll), clearance [T,N], residual [T,N], turning [T,N,2], wheel_qd [T,N,3] -- all
+    with the row-0 pre-command pose dropped, matching hstack_vel_cmd.py's single-rollout
+    convention."""
     T, n, _ = setpoints.shape
     elevation, grid = hmap.to_hstack(device)
     mu_xlim = (hmap.x0, hmap.x0 + (hmap.nx - 1) * hmap.cell)
@@ -371,9 +440,27 @@ def run_hstack_batch(
     sim = ForwardSimulator(dynamics.robot_params(), solver, grid, batch_size=n, n_steps=T, device=device)
     sim.set_terrain(elevation)
     sim.set_friction(mu_field)
-    controlled, derived, clearance, residual = sim.rollout(
-        np.ascontiguousarray(setpoints, np.float32), spawn_pose, np.zeros(3)
-    )
+
+    spawn_pose_arr = np.asarray(spawn_pose, dtype=np.float64)
+    if spawn_pose_arr.ndim == 1:
+        controlled, derived, clearance, residual = sim.rollout(
+            np.ascontiguousarray(setpoints, np.float32), spawn_pose, np.zeros(3)
+        )
+    else:
+        # Per-row spawn: `rollout()` itself only ever tiles one pose across the batch
+        # (helhest.engine.simulator.ForwardSimulator.rollout), but the buffer it tiles into,
+        # self.start_pose, is already [B, 3] -- so assigning it directly and calling
+        # rollout_launch() gets a per-row spawn with no change inside helhest_stack.
+        if spawn_pose_arr.shape[0] != n:
+            raise ValueError(f"spawn_pose has {spawn_pose_arr.shape[0]} rows but setpoints has n={n}")
+        sim.start_pose.assign(np.ascontiguousarray(spawn_pose_arr, np.float32))
+        sim.target_wheel_omega.assign(np.ascontiguousarray(setpoints, np.float32))
+        sim.init_current_wheel_omega.zero_()
+        sim.rollout_launch()
+        controlled = sim.controlled.numpy()
+        derived = sim.derived.numpy()
+        clearance = sim.clearance.numpy()
+        residual = sim.residual.numpy()
     turning = sim.turning.numpy()
     wheel_qd = sim.current_wheel_omega.numpy()[1:]
     return controlled[1:], derived[1:], clearance, residual, turning, wheel_qd

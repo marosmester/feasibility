@@ -8,13 +8,14 @@ e_rot) mapping this dataset exposes:
     x = (v_drive, wz_drive, spawn_x, spawn_y, spawn_yaw)          [n, 5]
     y = (e_pos, e_rot)  -- final-pose SE(3) error, see pose_error [n, 2]
 
-No generator for such files exists yet; this module only reads them. In the meantime it also
-loads fine against a *sweep*-style file (compare_speed_bumps.py/compare_box_obstacles.py),
-where spawn_pose/v_drive/wz_drive happen to be constant across rows instead of terrain --
-useful for smoke-testing since those files already exist under outputs/.
+feasibility.learning.generate_dataset generates exactly this: N randomized (spawn pose, constant
+body twist) trials on one fixed centered-box heightmap. This module also loads fine against a
+*sweep*-style file (compare_speed_bumps.py/compare_box_obstacles.py), where
+spawn_pose/v_drive/wz_drive happen to be constant across rows instead of terrain -- useful for
+smoke-testing since those files already exist under outputs/.
 
     python -c "
-    from feasibility.learning.dataset import make_dataloaders
+    from feasibility.learning.custom_dataset import make_dataloaders
     train, val, ds = make_dataloaders('outputs/compare_on_surface.h5', batch_size=2)
     xb, yb = next(iter(train))
     print(xb.shape, yb.shape)

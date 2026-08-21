@@ -22,8 +22,22 @@ series) so it stays a thin collision-friendly bevel well inside the grid at ever
 instead of ballooning into the terrain the way a 15 deg ramp would (2.99m at h=0.8, wider than
 the box itself and large enough to run off the grid's edges).
 
+Also generates a SECOND series, box_centered_h* (on a wider square grid -- 12m x 12m by default,
+--extent -- with the box footprint centered at the world origin instead of near one edge) -- for
+a random-spawn dataset generator that needs room to place the robot on every side of the
+obstacle. Each run generates ONE of the two series, never both: the centered series by default,
+or the original off-center 8m x 6m BOX_X0-anchored series (box_obstacle_h*, still what
+compare_box_obstacles.py reads) via --off-center (whose extent isn't a knob -- it's tied to
+compare_box_obstacles.py's tuned corner spawn, see CORNER_MARGIN there). They're kept as
+separate series rather than widening BOX_CX/BOX_CY in place because the robot's turning reach
+(1.101m, see comparator/compare_box_obstacles.py) plus the box's own half-footprint (up to
+0.964m at h=0.8) leaves almost no legal non-overlapping spawn positions on the original grid
+once you also need clearance from its edges.
+
 Usage:
-    python src/feasibility/heightmap/create_box_obstacles.py
+    python src/feasibility/heightmap/create_box_obstacles.py                  # centered series (default)
+    python src/feasibility/heightmap/create_box_obstacles.py --extent 20      # wider centered grid
+    python src/feasibility/heightmap/create_box_obstacles.py --off-center     # original off-center series
     python src/feasibility/heightmap/create_box_obstacles.py --cell 0.01 --incline-deg 60
 """
 from __future__ import annotations
@@ -53,6 +67,14 @@ DEFAULT_INCLINE_DEG = 75.0  # deg, ramp slope shared by every height in the seri
 
 BOX_HEIGHTS = (0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80)  # m, one heightmap per height
 
+# --- centered series: wider square grid, box footprint at the origin -- see module docstring ---
+DEFAULT_CENTERED_EXTENT = 16.0  # m, full width/height of the centered series' square grid --
+# knob: --extent. Box footprint is always centered in it (CENTERED_CX/CY), so any extent keeps
+# the box at the grid's center.
+CENTERED_ASSETS_DIR = REPO_ROOT / "assets" / "box_centered"
+CENTERED_CX = 0.0
+CENTERED_CY = 0.0
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -63,7 +85,23 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_INCLINE_DEG,
         help="ramp incline angle in degrees, shared by every obstacle height in the series",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--off-center",
+        action="store_true",
+        help="generate the original off-center 8m x 6m box_obstacle_h* series instead of the "
+        "default centered box_centered_h* series",
+    )
+    parser.add_argument(
+        "--extent",
+        type=float,
+        default=DEFAULT_CENTERED_EXTENT,
+        help="full width/height in meters of the centered series' square grid (default "
+        f"{DEFAULT_CENTERED_EXTENT}); ignored with --off-center, whose extent is fixed",
+    )
+    args = parser.parse_args()
+    if args.off_center and args.extent != DEFAULT_CENTERED_EXTENT:
+        parser.error("--extent has no effect with --off-center (its grid extent is fixed)")
+    return args
 
 
 def box_path(height: float) -> pathlib.Path:
@@ -81,35 +119,74 @@ def box_obstacle_paths(heights: tuple[float, ...] = BOX_HEIGHTS) -> list[tuple[f
     return [(h, box_path(h)) for h in heights]
 
 
-def build_box_obstacle(height: float, cell: float, incline_deg: float) -> HeightMapReader:
-    """Flat ground except a square frustum centered at (BOX_CX, BOX_CY): flat top at `height`
-    over the BOX_SIZE x BOX_SIZE footprint, linear ramp down to ground on all four sides
-    (mitered corners, via Euclidean distance to the footprint rectangle) sloped at
-    `incline_deg`."""
+def centered_box_path(height: float) -> pathlib.Path:
+    """assets/box_centered/box_centered_h<height, cm, no dot> -- see box_path's docstring for
+    why cm integers, not a dotted decimal."""
+    return CENTERED_ASSETS_DIR / f"box_centered_h{round(height * 100):03d}cm"
+
+
+def centered_box_paths(heights: tuple[float, ...] = BOX_HEIGHTS) -> list[tuple[float, pathlib.Path]]:
+    """(height, path) pairs for the centered series -- mirrors box_obstacle_paths()."""
+    return [(h, centered_box_path(h)) for h in heights]
+
+
+def build_box_obstacle(
+    height: float,
+    cell: float,
+    incline_deg: float,
+    *,
+    xlim: tuple[float, float] = XLIM,
+    ylim: tuple[float, float] = YLIM,
+    cx: float = BOX_CX,
+    cy: float = BOX_CY,
+) -> HeightMapReader:
+    """Flat ground except a square frustum centered at (cx, cy): flat top at `height` over the
+    BOX_SIZE x BOX_SIZE footprint, linear ramp down to ground on all four sides (mitered
+    corners, via Euclidean distance to the footprint rectangle) sloped at `incline_deg`."""
     ramp_width = height / np.tan(np.radians(incline_deg))
-    nx = int(round((XLIM[1] - XLIM[0]) / cell)) + 1
-    ny = int(round((YLIM[1] - YLIM[0]) / cell)) + 1
-    xs = XLIM[0] + (np.arange(nx) + 0.5) * cell
-    ys = YLIM[0] + (np.arange(ny) + 0.5) * cell
+    nx = int(round((xlim[1] - xlim[0]) / cell)) + 1
+    ny = int(round((ylim[1] - ylim[0]) / cell)) + 1
+    xs = xlim[0] + (np.arange(nx) + 0.5) * cell
+    ys = ylim[0] + (np.arange(ny) + 0.5) * cell
     X, Y = np.meshgrid(xs, ys)  # [ny, nx], row=y, col=x
 
     half = BOX_SIZE / 2.0
-    dx = np.maximum(0.0, np.abs(X - BOX_CX) - half)
-    dy = np.maximum(0.0, np.abs(Y - BOX_CY) - half)
+    dx = np.maximum(0.0, np.abs(X - cx) - half)
+    dy = np.maximum(0.0, np.abs(Y - cy) - half)
     d = np.hypot(dx, dy)  # Euclidean distance outside the footprint rectangle, 0 inside it
     H = height * np.clip(1.0 - d / ramp_width, 0.0, 1.0)
-    return HeightMapReader(H, origin=(XLIM[0], YLIM[0]), cell=cell)
+    return HeightMapReader(H, origin=(xlim[0], ylim[0]), cell=cell)
+
+
+def build_centered_box(
+    height: float, cell: float, incline_deg: float, extent: float = DEFAULT_CENTERED_EXTENT
+) -> HeightMapReader:
+    """build_box_obstacle on a square grid `extent` meters wide/tall, footprint at the origin."""
+    half = extent / 2.0
+    return build_box_obstacle(
+        height, cell, incline_deg, xlim=(-half, half), ylim=(-half, half), cx=CENTERED_CX, cy=CENTERED_CY
+    )
 
 
 def main() -> None:
     args = parse_args()
-    ASSETS_DIR.mkdir(parents=True, exist_ok=True)
-    for height, path in box_obstacle_paths():
-        build_box_obstacle(height, args.cell, args.incline_deg).save(path)
-        print(
-            f"saved {path}.png / {path}.yaml  "
-            f"(box height {height:.2f} m, cell {args.cell} m, incline {args.incline_deg:.1f} deg)"
-        )
+    if args.off_center:
+        ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+        for height, path in box_obstacle_paths():
+            build_box_obstacle(height, args.cell, args.incline_deg).save(path)
+            print(
+                f"saved {path}.png / {path}.yaml  "
+                f"(box height {height:.2f} m, cell {args.cell} m, incline {args.incline_deg:.1f} deg)"
+            )
+    else:
+        CENTERED_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+        for height, path in centered_box_paths():
+            build_centered_box(height, args.cell, args.incline_deg, args.extent).save(path)
+            print(
+                f"saved {path}.png / {path}.yaml  "
+                f"(centered box height {height:.2f} m, extent {args.extent:.1f} m, "
+                f"cell {args.cell} m, incline {args.incline_deg:.1f} deg)"
+            )
 
 
 if __name__ == "__main__":
