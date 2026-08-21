@@ -18,18 +18,33 @@ now both accept a per-world/per-row [N, 3] spawn_pose) rather than rebuilding th
 sample -- see the module's own docstrings for how. This is what makes N in the hundreds-to-
 thousands practical; run_trial_comparison's one-build-per-trial loop would not be.
 
-Spawn sampling: (x, y) on a SPAWN_STEP-meter lattice within a fixed +-SPAWN_LIMIT m square
-centered on the heightmap (10m x 10m by default, well inside its 16m x 16m default extent), yaw
-one of N_YAW evenly-spaced headings. A pose is rejected if the robot's oriented footprint would
-overlap the box's (inflated-by-ramp-and-safety-margin) footprint -- an exact separating-axis
-test, not a distance heuristic -- but nothing biases sampling TOWARD the box: trials that spawn
-facing away and simply drive off are valid, useful samples too. (v_drive, wz_drive) are drawn
-uniformly from V_RANGE/WZ_RANGE independently of spawn pose.
+Spawn sampling comes in two modes (`+spawn_mode=`), both confined to a fixed +-SPAWN_LIMIT m
+square centered on the heightmap (10m x 10m by default, well inside its 16m x 16m default
+extent), and both rejecting any pose whose oriented robot footprint would overlap the box's
+(inflated-by-ramp-and-safety-margin) footprint -- an exact separating-axis test, not a distance
+heuristic. Nothing biases sampling TOWARD the box either way: trials that spawn facing away and
+simply drive off are valid, useful samples too.
+
+    lattice     (x, y) on a SPAWN_STEP-meter grid, yaw one of N_YAW evenly-spaced headings,
+                drawn WITH replacement. The original behaviour, and still the default.
+    continuous  (x, y) ~ U(-SPAWN_LIMIT, SPAWN_LIMIT) and yaw ~ U(0, 2pi), by rejection
+                sampling against the same footprint test.
+
+The lattice is small enough to matter once n grows: at SPAWN_STEP=0.5/SPAWN_LIMIT=2.0/N_YAW=8
+only 292 of its 648 candidate poses survive the footprint test at box_height=0.70 (348 at 0.50,
+a 45-54% acceptance rate), so an n=5000 lattice run repeats each distinct pose ~17 times and the
+spawn subspace is effectively categorical -- a model fit on it can only interpolate BETWEEN
+lattice points by luck. Prefer `continuous` for anything meant to be learned from; `lattice`
+stays the default so existing runs stay reproducible.
+
+(v_drive, wz_drive) are drawn uniformly from V_RANGE/WZ_RANGE independently of spawn pose in
+both modes -- they were always continuous.
 
 Usage:
-    python src/feasibility/learning/generate_dataset.py                       # 512 defaults
+    python src/feasibility/learning/generate_dataset.py                       # DEFAULT_N, lattice
     python src/feasibility/learning/generate_dataset.py +n_samples=2000 +seed=1
     python src/feasibility/learning/generate_dataset.py +box_height=0.5 +chunk=64
+    python src/feasibility/learning/generate_dataset.py +spawn_mode=continuous +n_samples=5000
     python src/feasibility/learning/generate_dataset.py +duration_s=1.2       # exact multiple of
                                                                                 # both sims' dt
 """
@@ -87,7 +102,12 @@ SPAWN_LIMIT = 2.0  # m, |x|, |y| <= this -- spawns stay within a FIXED 10m x 10m
 # so this is no longer a hold-by-construction invariant the way it was when SPAWN_LIMIT was
 # derived from containment (see git history); widen the heightmap's --extent or shrink
 # V_RANGE/duration_s together if that matters for your run.
-N_YAW = 8  # yaw = k * 360/N_YAW deg, k in 0..N_YAW-1
+N_YAW = 8  # yaw = k * 360/N_YAW deg, k in 0..N_YAW-1 -- `lattice` mode only
+DEFAULT_SPAWN_MODE = "lattice"  # see module docstring; "continuous" is what large-n runs want
+SPAWN_MODES = ("lattice", "continuous")
+SPAWN_MODE_TAGS = {"lattice": "", "continuous": "_cont"}  # output-filename suffix per mode, so a
+# continuous run can't silently overwrite a lattice run of the same n/height (the default mode
+# keeps an empty tag, leaving every already-generated filename untouched)
 V_RANGE = (0.0, 1.5)  # m/s, forward body velocity command
 WZ_RANGE = (-1.0, 1.0)  # rad/s, yaw-rate command
 SAFETY_MARGIN = 0.05  # m, extra clearance between the robot's footprint and the box's (already
@@ -100,33 +120,60 @@ SAFETY_MARGIN = 0.05  # m, extra clearance between the robot's footprint and the
 ROBOT_X_MIN = float(HelhestJuniorConfig.REAR_WHEEL_POS[0]) - HelhestJuniorConfig.WHEEL_RADIUS
 ROBOT_X_MAX = HelhestJuniorConfig.WHEEL_RADIUS
 ROBOT_Y_HALF = float(HelhestJuniorConfig.LEFT_WHEEL_POS[1]) + HelhestJuniorConfig.WHEEL_WIDTH / 2.0
+ROBOT_CORNERS_LOCAL = np.array(
+    [
+        [ROBOT_X_MIN, -ROBOT_Y_HALF],
+        [ROBOT_X_MAX, -ROBOT_Y_HALF],
+        [ROBOT_X_MAX, ROBOT_Y_HALF],
+        [ROBOT_X_MIN, ROBOT_Y_HALF],
+    ]
+)  # [4, 2], body frame -- hoisted out of the SAT test so the continuous sampler's rejection
+# loop doesn't rebuild it per candidate batch
+
+
+def _robot_box_disjoint_batch(xy: np.ndarray, yaw: np.ndarray, box_half: float) -> np.ndarray:
+    """Exact separating-axis test, vectorized over m poses: does the robot's oriented
+    rectangular footprint at each (x, y, yaw) overlap the box's axis-aligned footprint (a
+    box_half x box_half square centered at the origin -- the centered series' box is always at
+    (0, 0), see create_box_obstacles.py)? Returns a [m] bool mask, True where they do NOT
+    overlap (i.e. that spawn pose is legal).
+
+    Two axis-aligned axes plus the robot's own two -- the four face normals of the two
+    rectangles, which is the complete SAT axis set for convex quads. Batched because the
+    continuous sampler rejects roughly half of every candidate batch and would otherwise pay a
+    Python-level call per draw; legal_spawn_poses() uses it too rather than keeping a second
+    copy of the geometry.
+
+    xy: [m, 2], yaw: [m] (radians)."""
+    xy = np.asarray(xy, dtype=np.float64).reshape(-1, 2)
+    yaw = np.asarray(yaw, dtype=np.float64).reshape(-1)
+    c, s = np.cos(yaw), np.sin(yaw)
+
+    rot = np.stack([np.stack([c, -s], -1), np.stack([s, c], -1)], -2)  # [m, 2, 2]
+    corners = ROBOT_CORNERS_LOCAL @ np.swapaxes(rot, -1, -2) + xy[:, None, :]  # [m, 4, 2]
+    box_corners = box_half * np.array([[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]])
+
+    zero, one = np.zeros_like(c), np.ones_like(c)
+    axes = np.stack(
+        [
+            np.stack([one, zero], -1),
+            np.stack([zero, one], -1),
+            np.stack([c, s], -1),
+            np.stack([-s, c], -1),
+        ],
+        axis=1,
+    )  # [m, 4 axes, 2]
+
+    p_robot = np.einsum("mca,mka->mkc", corners, axes)  # [m, 4 axes, 4 robot corners]
+    p_box = np.einsum("ba,mka->mkb", box_corners, axes)  # [m, 4 axes, 4 box corners]
+    separated = (p_robot.max(-1) < p_box.min(-1)) | (p_box.max(-1) < p_robot.min(-1))
+    return separated.any(axis=1)
 
 
 def _robot_box_disjoint(x: float, y: float, yaw: float, box_half: float) -> bool:
-    """Exact separating-axis test: does the robot's oriented rectangular footprint at (x, y,
-    yaw) overlap the box's axis-aligned footprint (a box_half x box_half square centered at the
-    origin -- the centered series' box is always at (0, 0), see create_box_obstacles.py)?
-    Returns True iff they do NOT overlap (i.e. this spawn pose is legal)."""
-    corners_local = np.array(
-        [
-            [ROBOT_X_MIN, -ROBOT_Y_HALF],
-            [ROBOT_X_MAX, -ROBOT_Y_HALF],
-            [ROBOT_X_MAX, ROBOT_Y_HALF],
-            [ROBOT_X_MIN, ROBOT_Y_HALF],
-        ]
-    )
-    c, s = np.cos(yaw), np.sin(yaw)
-    rot = np.array([[c, -s], [s, c]])
-    corners = corners_local @ rot.T + np.array([x, y])
-    box_corners = np.array(
-        [[-box_half, -box_half], [box_half, -box_half], [box_half, box_half], [-box_half, box_half]]
-    )
-    for axis in (np.array([1.0, 0.0]), np.array([0.0, 1.0]), np.array([c, s]), np.array([-s, c])):
-        p_robot = corners @ axis
-        p_box = box_corners @ axis
-        if p_robot.max() < p_box.min() or p_box.max() < p_robot.min():
-            return True
-    return False
+    """Scalar convenience wrapper over _robot_box_disjoint_batch() -- the geometry lives in
+    exactly one place. True iff the spawn pose is legal."""
+    return bool(_robot_box_disjoint_batch(np.array([[x, y]]), np.array([yaw]), box_half)[0])
 
 
 def box_half_extent(box_height: float, incline_deg: float = DEFAULT_INCLINE_DEG) -> float:
@@ -140,31 +187,77 @@ def box_half_extent(box_height: float, incline_deg: float = DEFAULT_INCLINE_DEG)
 def legal_spawn_poses(box_half: float) -> np.ndarray:
     """All (x, y, yaw) on the SPAWN_STEP/N_YAW lattice within +-SPAWN_LIMIT whose robot
     footprint doesn't overlap the box -- [M, 3], M <= (2*SPAWN_LIMIT/SPAWN_STEP + 1)**2 * N_YAW.
-    Precomputed once per box height and drawn from by sample_dataset(), not filtered per-draw."""
+    Precomputed once per box height and drawn from by sample_dataset()'s "lattice" mode, not
+    filtered per-draw. Row order matches the nested x -> y -> yaw enumeration it always had, so
+    a given seed keeps drawing the same poses."""
     lattice = np.arange(-SPAWN_LIMIT, SPAWN_LIMIT + 1e-9, SPAWN_STEP)
     yaws = np.arange(N_YAW) * (2.0 * np.pi / N_YAW)
-    poses = [
-        (x, y, yaw)
-        for x in lattice
-        for y in lattice
-        for yaw in yaws
-        if _robot_box_disjoint(x, y, yaw, box_half)
-    ]
-    return np.array(poses, dtype=np.float64)
+    grid_x, grid_y, grid_yaw = np.meshgrid(lattice, lattice, yaws, indexing="ij")
+    poses = np.stack([grid_x.ravel(), grid_y.ravel(), grid_yaw.ravel()], axis=1)
+    return poses[_robot_box_disjoint_batch(poses[:, :2], poses[:, 2], box_half)]
+
+
+def continuous_spawn_poses(
+    n: int, rng: np.random.Generator, box_half: float, max_rounds: int = 100
+) -> np.ndarray:
+    """n (x, y, yaw) poses drawn continuously -- (x, y) ~ U(-SPAWN_LIMIT, SPAWN_LIMIT), yaw ~
+    U(0, 2pi) -- by rejection against the same footprint test the lattice mode uses. [n, 3].
+
+    Rejection rather than a closed-form legal region because the legal set is the complement of
+    a Minkowski sum of two oriented rectangles, which has no clean parameterization to sample
+    from directly; acceptance is ~50% at the box heights in the series (see module docstring),
+    so rejection costs about two draws per accepted pose.
+
+    Loops instead of oversampling once: a taller box (a larger box_half) lowers acceptance, and
+    a single oversized draw would then silently return fewer than n poses. Raises rather than
+    under-delivering if the requested count is still unreached after max_rounds."""
+    accepted: list[np.ndarray] = []
+    total = 0
+    for _ in range(max_rounds):
+        # 2.5x the shortfall: ~2x for the acceptance rate, the rest headroom so the common case
+        # finishes in one round.
+        m = max(64, int(np.ceil((n - total) * 2.5)))
+        xy = rng.uniform(-SPAWN_LIMIT, SPAWN_LIMIT, size=(m, 2))
+        yaw = rng.uniform(0.0, 2.0 * np.pi, size=m)
+        legal = _robot_box_disjoint_batch(xy, yaw, box_half)
+        accepted.append(np.column_stack([xy[legal], yaw[legal]]))
+        total += int(legal.sum())
+        if total >= n:
+            return np.concatenate(accepted, axis=0)[:n].astype(np.float64)
+    raise RuntimeError(
+        f"continuous_spawn_poses: only {total}/{n} legal poses after {max_rounds} rounds with "
+        f"box_half={box_half:.3f} m against SPAWN_LIMIT={SPAWN_LIMIT} m -- the box (inflated by "
+        f"its ramp, see box_half_extent) leaves almost no legal area in the spawn square. "
+        f"Widen SPAWN_LIMIT or lower box_height."
+    )
 
 
 def sample_dataset(
-    n: int, seed: int, box_height: float
+    n: int, seed: int, box_height: float, spawn_mode: str = DEFAULT_SPAWN_MODE
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Draws n (spawn_pose, v_drive, wz_drive) samples. spawn_pose is drawn WITH replacement
-    from the legal lattice (a repeated pose under a different twist is still a useful sample);
-    v_drive/wz_drive are independent continuous draws, uniform over V_RANGE/WZ_RANGE -- spawn
-    pose and command are not correlated, so a trial that starts facing away from the box and
-    simply drives off is exactly as likely (and exactly as valid a sample) as one that drives
-    into it. Returns spawn_pose [n, 3] float64, v_drive [n] float32, wz_drive [n] float32."""
-    legal = legal_spawn_poses(box_half_extent(box_height))
+    """Draws n (spawn_pose, v_drive, wz_drive) samples. spawn_mode selects how spawn_pose is
+    drawn (see module docstring): "lattice" draws WITH replacement from the legal SPAWN_STEP/
+    N_YAW grid (a repeated pose under a different twist is still a useful sample), "continuous"
+    draws uniformly over the spawn square and the full yaw circle.
+
+    v_drive/wz_drive are independent continuous draws, uniform over V_RANGE/WZ_RANGE in either
+    mode -- spawn pose and command are not correlated, so a trial that starts facing away from
+    the box and simply drives off is exactly as likely (and exactly as valid a sample) as one
+    that drives into it.
+
+    Returns spawn_pose [n, 3] float64, v_drive [n] float32, wz_drive [n] float32. The rng is
+    consumed pose-first then v then wz, so a "lattice" run at a given seed still produces
+    exactly the poses it did before this mode existed."""
+    if spawn_mode not in SPAWN_MODES:
+        raise ValueError(f"spawn_mode must be one of {SPAWN_MODES}, got {spawn_mode!r}")
+
+    box_half = box_half_extent(box_height)
     rng = np.random.default_rng(seed)
-    spawn_pose = legal[rng.integers(0, len(legal), size=n)]
+    if spawn_mode == "lattice":
+        legal = legal_spawn_poses(box_half)
+        spawn_pose = legal[rng.integers(0, len(legal), size=n)]
+    else:
+        spawn_pose = continuous_spawn_poses(n, rng, box_half)
     v_drive = rng.uniform(*V_RANGE, size=n).astype(np.float32)
     wz_drive = rng.uniform(*WZ_RANGE, size=n).astype(np.float32)
     return spawn_pose, v_drive, wz_drive
@@ -178,6 +271,7 @@ def generate(cfg: DictConfig) -> None:
     box_height = float(cfg.get("box_height", DEFAULT_BOX_HEIGHT))
     duration_s = float(cfg.get("duration_s", DEFAULT_DURATION_S))
     chunk = int(cfg.get("chunk", DEFAULT_CHUNK))
+    spawn_mode = str(cfg.get("spawn_mode", DEFAULT_SPAWN_MODE))
     mu = float(cfg.get("mu", 0.8))
     k_turn = float(cfg.get("k_turn", dynamics.K_TURN))
     device = str(cfg.get("device", "cuda:0"))
@@ -185,7 +279,7 @@ def generate(cfg: DictConfig) -> None:
     terrain_path = centered_box_path(box_height)
     terrain = HeightMapReader.load(terrain_path)
 
-    spawn_pose, v_drive, wz_drive = sample_dataset(n, seed, box_height)
+    spawn_pose, v_drive, wz_drive = sample_dataset(n, seed, box_height, spawn_mode)
     labels = np.array([f"s{i:05d}" for i in range(n)])
 
     sim_config: SimulationConfig = hydra.utils.instantiate(cfg.simulation)
@@ -215,6 +309,7 @@ def generate(cfg: DictConfig) -> None:
             f"duration_s={DEFAULT_DURATION_S} (the default) already is.",
             stacklevel=2,
         )
+    print(f"[spawn]    mode={spawn_mode}, {len(np.unique(spawn_pose, axis=0))} distinct poses")
     print(f"[ostrich]  {n} samples x {T_o} steps @ dt={ostrich_dt}, chunk={chunk}")
     print(f"[hstack]   {n} samples x {T_h} steps @ dt={hstack_dt}, chunk={chunk}")
 
@@ -278,11 +373,20 @@ def generate(cfg: DictConfig) -> None:
     h_quat = euler_zyx_to_quat_xyzw(h_controlled[..., 2], h_derived[..., 1], h_derived[..., 2])
     h_pose = np.concatenate([h_controlled[..., :2], h_derived[..., :1], h_quat], axis=-1).astype(np.float32)
 
-    out_path = OUT_DIR / f"dataset_box_h{round(box_height * 100):03d}cm_n{n}.h5"
+    tag = SPAWN_MODE_TAGS[spawn_mode]
+    out_path = OUT_DIR / f"dataset_box_h{round(box_height * 100):03d}cm_n{n}{tag}.h5"
     write_comparison(
         out_path,
         root=dict(
-            n=n, variant_name="sample", obstacle_x=0.0, duration_s=duration_s, mu=mu, k_turn=k_turn, k_p=K_P
+            n=n,
+            variant_name="sample",
+            obstacle_x=0.0,
+            duration_s=duration_s,
+            mu=mu,
+            k_turn=k_turn,
+            k_p=K_P,
+            spawn_mode=spawn_mode,  # so a saved file says how its poses were drawn, not just
+            # what they were -- see comparator/provenance.py on self-describing runs
         ),
         per_variant=dict(
             # no single scalar parameter here -- sample index, purely so the field stays
