@@ -16,7 +16,7 @@ smoke-testing since those files already exist under outputs/.
 
     python -c "
     from feasibility.learning.custom_dataset import make_dataloaders
-    train, val, ds = make_dataloaders('outputs/compare_on_surface.h5', batch_size=2)
+    train, val, ds, train_subset = make_dataloaders('outputs/compare_on_surface.h5', batch_size=2)
     xb, yb = next(iter(train))
     print(xb.shape, yb.shape)
     "
@@ -161,10 +161,14 @@ def make_dataloaders(
     normalize_targets: bool = False,
     num_workers: int = 0,
     **ds_kwargs: object,
-) -> tuple[DataLoader, DataLoader, PoseErrorDataset]:
+) -> tuple[DataLoader, DataLoader, PoseErrorDataset, Subset]:
     """Build a PoseErrorDataset over `path`, split it, fit x/y Normalizers on the TRAIN rows
     only (fitting on all rows would leak val statistics into training), attach them to the
-    (shared) underlying dataset, and return (train_loader, val_loader, dataset).
+    (shared) underlying dataset, and return (train_loader, val_loader, dataset, train_subset).
+
+    train_subset is returned (not just consumed internally) so a caller can fit further
+    TRAIN-only statistics of its own -- e.g. model.TargetTransform.fit(ds.y[train_subset.indices])
+    -- without re-deriving the split itself.
 
     normalize_targets defaults to False: e_pos (m) and e_rot (rad) are already on comparable
     scales for these scenarios, so leaving y raw keeps a loss directly readable in physical
@@ -183,4 +187,4 @@ def make_dataloaders(
     val_loader = DataLoader(
         val_subset, batch_size=batch_size, shuffle=False, num_workers=num_workers
     )
-    return train_loader, val_loader, ds
+    return train_loader, val_loader, ds, train_subset
