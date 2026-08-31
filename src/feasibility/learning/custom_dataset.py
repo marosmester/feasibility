@@ -127,8 +127,27 @@ class PoseErrorDataset(Dataset):
             self.FEATURE_NAMES = FEATURE_NAMES_RAW
         self.TARGET_NAMES = TARGET_NAMES
 
-        self.x = torch.from_numpy(np.stack(cols, axis=1))
-        self.y = torch.from_numpy(final_pose_errors(self.source))
+        x_arr = np.stack(cols, axis=1)
+        y_arr = final_pose_errors(self.source)
+
+        # A handful of rows can carry a non-finite target -- typically the ostrich dynamics
+        # solver diverging on that one trial (see final_pose_errors/se3_error). A single such
+        # row poisons every downstream torch.mean/std over the whole column (nanmean would only
+        # fix that for stats we compute ourselves, not the loss on the row itself, and the row's
+        # target is simply invalid) -- so drop it here, once, before anything else touches y.
+        finite = np.isfinite(x_arr).all(axis=1) & np.isfinite(y_arr).all(axis=1)
+        n_dropped = int((~finite).sum())
+        if n_dropped:
+            dropped_idx = np.flatnonzero(~finite).tolist()
+            print(
+                f"[dataset] {self.source.name}: dropping {n_dropped}/{len(finite)} row(s) with "
+                f"non-finite x/y (indices {dropped_idx})"
+            )
+            x_arr, y_arr = x_arr[finite], y_arr[finite]
+            self.labels = [label for label, keep in zip(self.labels, finite) if keep]
+
+        self.x = torch.from_numpy(x_arr)
+        self.y = torch.from_numpy(y_arr)
 
     def __len__(self) -> int:
         return self.x.shape[0]
