@@ -36,6 +36,17 @@ become the contact point.
 wheel at exactly 0 -- "opposite commands to front wheels" with the rear simply dragged along,
 per the scenario request.
 
+CLI parameters (Hydra overrides read by comparator.common.run_comparison; `+` prefix required
+since none of these exist in the base "helhest" config):
+    +mu=FLOAT              ground friction coefficient (default: 0.8)
+    +k_turn=FLOAT          helhest_stack ICR turning-rate gain (default: dynamics.K_TURN)
+    +device=STR            helhest_stack torch/warp device (default: "cuda:0")
+    +heights=[F,F,...]     subset of create_box_obstacles.BOX_HEIGHTS to run, values must match
+                           an already-generated asset to 2 decimals (default: full series)
+    Also accepts any standard Hydra config-group override against the "helhest" base config
+    (e.g. engine=mujoco, logging=..., simulation=...) -- see ostrich/examples/conf/helhest.yaml
+    for the groups. rendering/num_worlds are forced by run_comparison and cannot be overridden.
+
 Usage:
     python src/feasibility/comparator/compare_box_obstacles.py                # all BOX_HEIGHTS
     python src/feasibility/comparator/compare_box_obstacles.py +mu=0.5

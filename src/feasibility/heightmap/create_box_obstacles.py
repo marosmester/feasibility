@@ -34,6 +34,15 @@ separate series rather than widening BOX_CX/BOX_CY in place because the robot's 
 0.964m at h=0.8) leaves almost no legal non-overlapping spawn positions on the original grid
 once you also need clearance from its edges.
 
+CLI parameters:
+    --cell FLOAT          grid resolution in meters (default: 0.05)
+    --incline-deg FLOAT   ramp incline angle in degrees, shared by every obstacle height in the
+                           series (default: 75.0)
+    --off-center          generate the original off-center 8m x 6m box_obstacle_h* series
+                           instead of the default centered box_centered_h* series
+    --extent FLOAT        full width/height in meters of the centered series' square grid
+                           (default: 16.0); ignored with --off-center, whose extent is fixed
+
 Usage:
     python src/feasibility/heightmap/create_box_obstacles.py                  # centered series (default)
     python src/feasibility/heightmap/create_box_obstacles.py --extent 20      # wider centered grid

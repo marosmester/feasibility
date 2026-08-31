@@ -16,6 +16,28 @@ Two design points worth stating up front:
   (train_loader, val_loader, ds) precisely so a caller can fit further train-only statistics --
   like this -- without re-deriving the split itself.
 
+CLI parameters:
+    --dataset PATH                          dataset .h5 (custom_dataset.PoseErrorDataset
+                                             schema) (default: outputs/dataset_box_h070cm_n128_cont.h5)
+    --val-frac FLOAT                        fraction of rows held out for validation (default: 0.2)
+    --seed INT                              seeds the train/val split and model init (default: 0)
+    --yaw-encoding {raw,sincos}             spawn yaw feature encoding (default: raw)
+    --batch-size INT                        default: 32
+    --epochs INT                            default: 200
+    --lr FLOAT                              Adam learning rate (default: 1e-3)
+    --weight-decay FLOAT                    Adam weight decay (default: 0.0)
+    --hidden INT                            trunk width (default: 256)
+    --depth INT                             trunk layers (default: 3)
+    --patience INT                          epochs of no val_loss improvement before early
+                                             stop; 0 disables (default: 0)
+    --device STR                            torch device (default: cuda if available else cpu)
+    --checkpoint PATH                       save path (default: outputs/checkpoints/<dataset stem>.pt)
+    --log-every INT                         epochs between stdout progress lines (default: 10)
+    --wandb-project STR                     (default: "feasibility-pose-error-mlp")
+    --wandb-entity STR                      (default: None)
+    --wandb-mode {online,offline,disabled}  (default: online)
+    --wandb-name STR                        (default: None, wandb auto-generates a name)
+
 Usage:
     python src/feasibility/learning/train.py
     python src/feasibility/learning/train.py --dataset outputs/dataset_box_h070cm_n256.h5 --epochs 100

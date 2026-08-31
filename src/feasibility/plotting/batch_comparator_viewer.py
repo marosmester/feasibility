@@ -3,6 +3,10 @@ compare_box_obstacles.py): pick one ostrich/helhest_stack trajectory pair by var
 it -- one 3D subplot (terrain heightmap + both (x,y,z) trajectories), one 2D subplot (the
 wheel-velocity commands both sims were driven with, vs time).
 
+CLI parameters:
+    --file PATH   compare_*.h5 path (default: outputs/compare_speed_bumps.h5)
+    --id INT      variant index to display (default: 0)
+
 Usage:
     python src/feasibility/plotting/batch_comparator_viewer.py            # variant 0
     python src/feasibility/plotting/batch_comparator_viewer.py --id 3

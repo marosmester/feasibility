@@ -40,6 +40,26 @@ stays the default so existing runs stay reproducible.
 (v_drive, wz_drive) are drawn uniformly from V_RANGE/WZ_RANGE independently of spawn pose in
 both modes -- they were always continuous.
 
+CLI parameters (Hydra overrides read by generate(); `+` prefix required since none of these
+exist in the base "helhest" config):
+    +n_samples=INT          trajectory pairs to generate (default: 128)
+    +seed=INT               RNG seed for spawn/command sampling (default: 0)
+    +box_height=FLOAT       which centered_box_paths() height to load, e.g. 0.10..0.80
+                            (default: 0.70)
+    +duration_s=FLOAT       command hold time in seconds; ideally an exact multiple of both
+                            sims' dt (ostrich 3e-2, hstack 0.1) or a warning is printed
+                            (default: 2.4)
+    +chunk=INT              robots per ostrich model build/batch (tuning knob only, not a hard
+                            limit) (default: 128)
+    +spawn_mode=STR         "lattice" (grid poses, drawn with replacement) or "continuous"
+                            (uniform + rejection sampling) (default: "lattice")
+    +mu=FLOAT               ground friction coefficient (default: 0.8)
+    +k_turn=FLOAT           helhest_stack ICR turning-rate gain (default: dynamics.K_TURN)
+    +device=STR             helhest_stack torch/warp device (default: "cuda:0")
+    Also accepts any standard Hydra config-group override against the "helhest" base config
+    (e.g. engine=mujoco, logging=..., simulation=...) -- see ostrich/examples/conf/helhest.yaml
+    for the groups. rendering is forced to headless by generate() and cannot be overridden.
+
 Usage:
     python src/feasibility/learning/generate_dataset.py                       # DEFAULT_N, lattice
     python src/feasibility/learning/generate_dataset.py +n_samples=2000 +seed=1

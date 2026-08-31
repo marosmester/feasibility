@@ -10,6 +10,17 @@ spans the full Y width), and drives straight at it. The actual sweep/rollout/HDF
 lives in comparator.common.run_comparison, shared with every other compare_*.py scenario driver
 (e.g. compare_box_obstacles.py) -- this file only describes the scenario via a ScenarioSpec.
 
+CLI parameters (Hydra overrides read by comparator.common.run_comparison; `+` prefix required
+since none of these exist in the base "helhest" config):
+    +mu=FLOAT              ground friction coefficient (default: 0.8)
+    +k_turn=FLOAT          helhest_stack ICR turning-rate gain (default: dynamics.K_TURN)
+    +device=STR            helhest_stack torch/warp device (default: "cuda:0")
+    +heights=[F,F,...]     subset of create_speed_bumps.BUMP_HEIGHTS to run, values must match
+                           an already-generated asset to 2 decimals (default: full series)
+    Also accepts any standard Hydra config-group override against the "helhest" base config
+    (e.g. engine=mujoco, logging=..., simulation=...) -- see ostrich/examples/conf/helhest.yaml
+    for the groups. rendering/num_worlds are forced by run_comparison and cannot be overridden.
+
 Usage:
     python src/feasibility/comparator/compare_speed_bumps.py                # all BUMP_HEIGHTS
     python src/feasibility/comparator/compare_speed_bumps.py +mu=0.5 +k_turn=1.0

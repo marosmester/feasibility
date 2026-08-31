@@ -21,6 +21,12 @@ Two design points worth stating, both measured on the outputs/dataset_box_*.h5 f
 No optimizer, no scheduler, no training loop -- this module is architecture only. The trainer
 constructs its own optimizer, matching how ostrich's PPOTrainer takes one as an argument.
 
+CLI parameters:
+    --in-dim INT    input columns (default: 5)
+    --hidden INT    trunk width (default: 256)
+    --depth INT     trunk layers (default: 3)
+
+Usage:
     python src/feasibility/learning/model.py            # shape + round-trip smoke check
     python -c "
     import torch

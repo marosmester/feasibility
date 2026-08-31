@@ -11,6 +11,8 @@ SAME (SCALE, Z_OFFSET) ostrich/examples/helhest/surface_drive.py applies at load
 (`mesh_points = points * scale + offset`), so this asset matches every other place in the repo
 that already renders "the surface": x,y in +-15 m, z in [0.05, ~1.54] m.
 
+CLI parameters: none.
+
 Usage:
     python src/feasibility/heightmap/create_surface.py
 """

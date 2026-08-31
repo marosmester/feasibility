@@ -28,6 +28,19 @@ trials instead of across terrain. Each trial probes a different feature of the s
 Surface extent is x,y in [-15.12, 15.12] m (see create_surface.py); every trial's spawn + travel
 stays well inside that.
 
+CLI parameters (Hydra overrides read by comparator.common.run_trial_comparison; `+` prefix
+required since none of these exist in the base "helhest" config):
+    +mu=FLOAT              ground friction coefficient (default: 0.8)
+    +k_turn=FLOAT          helhest_stack ICR turning-rate gain (default: dynamics.K_TURN)
+    +device=STR            helhest_stack torch/warp device (default: "cuda:0")
+    +trials=[LABEL,...]    subset of TRIALS' labels to run, e.g. flat_baseline,
+                           climb_south_face, descend_from_summit, flank_traverse,
+                           turn_in_place_on_slope (default: all trials)
+    Also accepts any standard Hydra config-group override against the "helhest" base config
+    (e.g. engine=mujoco, logging=..., simulation=...) -- see ostrich/examples/conf/helhest.yaml
+    for the groups. rendering/num_worlds are forced by run_trial_comparison and cannot be
+    overridden.
+
 Usage:
     python src/feasibility/comparator/compare_on_surface.py                     # all TRIALS
     python src/feasibility/comparator/compare_on_surface.py +mu=0.5

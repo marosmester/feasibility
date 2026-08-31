@@ -1,6 +1,11 @@
 """Final-pose SE(3) error between ostrich and hstack trajectories saved by
 comparator/common.py's run_comparison (see comparator/provenance.py for the HDF5 schema).
 
+CLI parameters:
+    --file PATH   comparator output .h5 (required)
+    --id INT      variant index (default: 0)
+
+Usage:
     python src/feasibility/learning/pose_error.py --file outputs/compare_box_obstacles.h5 --id 3
 
 For variant `id`, loads `ostrich/pose[-1, id]` and `hstack/pose[-1, id]` -- each (x, y, z, qx,

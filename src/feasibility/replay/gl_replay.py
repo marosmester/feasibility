@@ -12,6 +12,13 @@ angular *velocity* -- ostrich/wheel_qd and hstack/wheel_qd -- not angle) -- then
 attached to the chassis and spinning. No solver step, no control targets; `model.collide()` is
 only there to feed the viewer's contact-point overlay.
 
+CLI parameters:
+    --file PATH             compare_*.h5 path (default: outputs/compare_speed_bumps.h5)
+    --id INT                variant index to replay (default: 0)
+    --which {ostrich,hstack,both}   which trajectory/trajectories to render (default: both)
+    --speed FLOAT           playback speed multiplier (default: 1.0 = real time)
+    --loop                  loop playback instead of freezing on the last frame
+
 Usage:
     python src/feasibility/replay/gl_replay.py --id 3                 # ostrich, variant 3
     python src/feasibility/replay/gl_replay.py --file outputs/compare_speed_bumps.h5 --id 3

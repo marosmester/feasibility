@@ -9,6 +9,13 @@ plotted sample (aligned to the same sample index on the x-axis above) and one ro
 feature -- x, y, yaw, v, omega -- so a spike in the error plot can be read off against the
 commanded twist/spawn pose that produced it.
 
+CLI parameters:
+    --file PATH          dataset .h5 (custom_dataset.PoseErrorDataset schema)
+                          (default: outputs/dataset_box_h070cm_n128.h5)
+    --num-samples INT    M: number of leading samples to plot (default: 64)
+    --out PATH           save to this path instead of showing interactively (default: show)
+
+Usage:
     python src/feasibility/learning/error_visual.py --file outputs/dataset_box_h070cm_n128.h5
     python src/feasibility/learning/error_visual.py --file outputs/dataset_box_h070cm_n128.h5 --num-samples 40
 """

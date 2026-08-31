@@ -15,6 +15,11 @@ steep one). Ramp width is derived PER bump height from --incline-deg
 the same incline angle instead of the same ramp width -- a fixed ramp width would make tall
 bumps steeper than short ones.
 
+CLI parameters:
+    --cell FLOAT          grid resolution in meters (default: 0.05)
+    --incline-deg FLOAT   ramp incline angle in degrees, shared by every bump height in the
+                           series (default: 80.0)
+
 Usage:
     python src/feasibility/heightmap/create_speed_bumps.py
     python src/feasibility/heightmap/create_speed_bumps.py --cell 0.01 --incline-deg 10
