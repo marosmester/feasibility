@@ -51,6 +51,9 @@ exist in the base "helhest" config):
                             (default: 2.4)
     +chunk=INT              robots per ostrich model build/batch (tuning knob only, not a hard
                             limit) (default: 128)
+    +settle_steps=INT       ostrich steps spent settling the robot onto the terrain before
+                            recording starts, paid once per chunk; raise it if a spawn is still
+                            moving at t=0 (default: 12)
     +spawn_mode=STR         "lattice" (grid poses, drawn with replacement) or "continuous"
                             (uniform + rejection sampling) (default: "lattice")
     +mu=FLOAT               ground friction coefficient (default: 0.8)
@@ -110,6 +113,14 @@ DEFAULT_SEED = 0
 DEFAULT_CHUNK = 128  # robots per ostrich model build -- a tuning knob, not a hard limit; see
 # generate_dataset.py's plan / ostrich/experiments/4_scalability for headroom (65536 worlds at
 # 6.3 GB WITH an adjoint tape -- this is forward-only and graph-captured, far cheaper per world).
+DEFAULT_SETTLE_STEPS = 12  # ostrich steps spent dropping the robot onto the terrain at zero
+# command before recording starts. Overrides run_ostrich_batch's None default, which would let
+# _resolve_settle_steps pick max(60, 0.5s/dt) = 60 steps (1.8 s) at ostrich's dt=3e-2 -- a floor
+# sized for the dt=5e-4 replay case. Measured on a 32-world continuous batch at box_height=0.70:
+# the chassis free-falls for 6 steps from its +0.5 m spawn (velocity tracking 9.81*t exactly),
+# lands on step 6, and is static from step 7 on -- height pinned to 4 decimals, residual speed
+# ~2 mm/s. 12 is that with ~1.7x margin. Unlike the compare_*.py sweeps, which settle once for a
+# whole run, this is paid once PER CHUNK (n/chunk times), so it was ~35% of total ostrich time.
 
 SPAWN_STEP = 0.5  # m, (x, y) lattice pitch
 SPAWN_LIMIT = 2.0  # m, |x|, |y| <= this -- spawns stay within a FIXED 10m x 10m square centered
@@ -291,6 +302,7 @@ def generate(cfg: DictConfig) -> None:
     box_height = float(cfg.get("box_height", DEFAULT_BOX_HEIGHT))
     duration_s = float(cfg.get("duration_s", DEFAULT_DURATION_S))
     chunk = int(cfg.get("chunk", DEFAULT_CHUNK))
+    settle_steps = int(cfg.get("settle_steps", DEFAULT_SETTLE_STEPS))
     spawn_mode = str(cfg.get("spawn_mode", DEFAULT_SPAWN_MODE))
     mu = float(cfg.get("mu", 0.8))
     k_turn = float(cfg.get("k_turn", dynamics.K_TURN))
@@ -330,7 +342,10 @@ def generate(cfg: DictConfig) -> None:
             stacklevel=2,
         )
     print(f"[spawn]    mode={spawn_mode}, {len(np.unique(spawn_pose, axis=0))} distinct poses")
-    print(f"[ostrich]  {n} samples x {T_o} steps @ dt={ostrich_dt}, chunk={chunk}")
+    print(
+        f"[ostrich]  {n} samples x {T_o} steps @ dt={ostrich_dt}, chunk={chunk}, "
+        f"settle={settle_steps} steps/chunk"
+    )
     print(f"[hstack]   {n} samples x {T_h} steps @ dt={hstack_dt}, chunk={chunk}")
 
     ostrich_poses, ostrich_wheel_qds, ostrich_cmds = [], [], []
@@ -360,7 +375,8 @@ def generate(cfg: DictConfig) -> None:
         )  # [T_h, b, 3]
 
         pose, wheel_qd = run_ostrich_batch(
-            sim_config, render_config, engine_config, logging_config, terrain, ostrich_setpoints, mu, spawn_chunk
+            sim_config, render_config, engine_config, logging_config, terrain,
+            ostrich_setpoints, mu, spawn_chunk, settle_steps,
         )
         controlled, derived, clearance, residual, turning, wheel_qd_h = run_hstack_batch(
             hstack_setpoints, terrain, hstack_dt, k_turn, mu, device, spawn_chunk

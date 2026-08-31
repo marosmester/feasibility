@@ -427,14 +427,24 @@ def run_ostrich_batch(
     setpoints: np.ndarray,
     mu: float,
     spawn_pose: tuple[float, float, float] | np.ndarray,
+    settle_steps: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """`spawn_pose` is either one (x, y, yaw) shared by every world (setpoints' W dimension must
-    then be 1) or an [N, 3] array giving each world its own -- see HelhestBatchSimulator."""
+    then be 1) or an [N, 3] array giving each world its own -- see HelhestBatchSimulator.
+
+    `settle_steps` is the pre-roll the robot spends dropping onto the terrain at zero command
+    before recording starts; None keeps _resolve_settle_steps' `max(60, 0.5s/dt)` default. That
+    floor was sized for the dt=5e-4 replay case and badly overshoots at ostrich's dt=3e-2, where
+    it buys 60 steps (1.8 s) of settle -- the chassis is measurably at rest by step 7 (6 steps of
+    free fall from the +0.5 m spawn, impact, then static to 4 decimal places), so the remaining
+    ~53 are uncaptured Python-loop steps that change nothing. Callers that rebuild the simulator
+    per batch (generate_dataset.py) pay that pre-roll once per chunk and should pass an explicit
+    count; the compare_*.py scenarios run it once for a whole sweep and leave it at None."""
     sim = HelhestBatchSimulator(
         sim_config, render_config, engine_config, logging_config,
         k_p=K_P, mu_front=mu, mu_rear=mu, terrain=terrain, spawn_pose=spawn_pose,
     )
-    return sim.replay_graph_batch(setpoints)
+    return sim.replay_graph_batch(setpoints, settle_steps)
 
 
 # --- helhest_stack: natively batched ForwardSimulator -------------------------------------------
