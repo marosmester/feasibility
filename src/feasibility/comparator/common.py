@@ -54,6 +54,17 @@ HALF_TRACK = float(HelhestJuniorConfig.LEFT_WHEEL_POS[1])
 # justifies it (soft enough to isolate ground slip, stiff enough not to be the bottleneck).
 K_P = 15000.0
 
+# newton.CollisionPipeline's own max_triangle_pairs default -- kept as the floor below so a
+# single-world call (every compare_*.py driver forces num_worlds=1) sees identical behavior to
+# an unconfigured pipeline.
+DEFAULT_MAX_TRIANGLE_PAIRS = 1_000_000
+# Observed ~6.4k mesh/heightfield triangle-pair candidates per world at num_worlds=512 against
+# the default centered-box terrain grid (generate_dataset.py +chunk=512 overflowed the 1M-pair
+# default -- BaseSimulator.__init__'s first model.collide() call always builds that default,
+# uncapped-per-world, pipeline). ~2x margin over the observed rate: candidate count depends on
+# how the batch's spawn poses spread over the grid, not purely on world count.
+TRIANGLE_PAIRS_PER_WORLD = 12_000
+
 
 @dataclass(frozen=True)
 class ScenarioSpec:
@@ -272,6 +283,20 @@ class HelhestBatchSimulator(HelhestJuniorReplaySimulator):
 
         model = self.builder.finalize_replicated(num_worlds=num_worlds, global_builder=globals_builder)
         self._apply_spawn_poses(model, num_worlds)
+
+        # Pre-seed the model's collision pipeline cache with worlds-scaled capacity, the same
+        # effect model.collide(state, collision_pipeline=...) has (Model.collide: "if
+        # collision_pipeline is not None: self._collision_pipeline = collision_pipeline") --
+        # done here, before returning, because BaseSimulator.__init__ (this method is called
+        # from inside it) runs its OWN first model.collide() immediately after build_model()
+        # returns, with no state yet available to us to call the public setter ourselves. Left
+        # any later, that first call would already have built (and, at num_worlds this large,
+        # overflowed) newton's uncapped-per-world default pipeline.
+        model._collision_pipeline = newton.CollisionPipeline(
+            model,
+            broad_phase="explicit",
+            max_triangle_pairs=max(DEFAULT_MAX_TRIANGLE_PAIRS, num_worlds * TRIANGLE_PAIRS_PER_WORLD),
+        )
         return model
 
     def _apply_spawn_poses(self, model: newton.Model, num_worlds: int) -> None:

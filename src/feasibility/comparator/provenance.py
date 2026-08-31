@@ -76,51 +76,80 @@ def terrain_fields(
     """entries: (path, terrain) pairs in variant order, `path` the assets/ stem the terrain was
     loaded from (used both as an archival reference and to re-read its yaml sidecar verbatim;
     HeightMapReader itself keeps no raw yaml text -- load() parses it into a local dict and
-    discards it). Returns the per-variant terrain block to splice into the file's `terrain/`
-    group by write_comparison()/write_run().
+    discards it). Returns the terrain block to splice into the file's `terrain/` group by
+    write_comparison()/write_run().
 
     `path` may be None for a terrain that was built in memory rather than loaded from assets/
     (e.g. HeightMapReader.flat() in demos/ostrich_vel_cmd.py) -- yaml/path record "" for that
     variant. The elevation grid itself is embedded either way, so a None path costs only the
-    archival reference, never the ability to replay."""
+    archival reference, never the ability to replay.
+
+    Deduplicated by HeightMapReader identity, not stacked one-per-variant: callers whose terrain
+    is genuinely shared across every variant (generate_dataset.py's one terrain reused for every
+    sample, run_trial_comparison's one terrain shared by every Trial -- both pass the SAME
+    HeightMapReader object n times) previously had terrain_fields() np.stack() n identical
+    copies of H, e.g. ~4GB of duplicate host RAM at n=10000 on the default 16m/0.05m grid, before
+    gzip discarded the redundancy on write. Deduping up front means that RAM spike never happens.
+    A `variant_to_terrain` [n] int index is only written when it's non-trivial (some variants
+    actually share a terrain) -- run_comparison's per-height variants each load() their own
+    HeightMapReader, so nothing is deduped there and the field is omitted; terrain_from_h5()
+    treats a missing index as the old direct-index behavior, so already-written files (which
+    never had this field) still read back correctly."""
     shapes = {(t.ny, t.nx) for _, t in entries}
     if len(shapes) > 1:
         bad = next((p, t) for p, t in entries if (t.ny, t.nx) != next(iter(shapes)))
         raise ValueError(f"terrain grids differ in shape across variants: e.g. {bad[0]} is {(bad[1].ny, bad[1].nx)}")
 
-    return {
+    unique_entries: list[tuple[pathlib.Path | None, HeightMapReader]] = []
+    seen: dict[int, int] = {}  # id(terrain) -> index into unique_entries
+    variant_to_terrain = np.empty(len(entries), dtype=np.int64)
+    for i, (p, t) in enumerate(entries):
+        j = seen.setdefault(id(t), len(unique_entries))
+        if j == len(unique_entries):
+            unique_entries.append((p, t))
+        variant_to_terrain[i] = j
+
+    fields = {
         # H: float32 -- load() already quantizes elevation to 8-bit png levels, so this loses
-        # nothing, and the grid is near-constant across variants so gzip shrinks it to almost
-        # nothing. cell/origin/min_z/max_z stay float64: they're a handful of scalars per
-        # variant (storage cost is noise), and unlike H's 255-level quantization, a value like
-        # cell=0.05 has no exact float32 representation -- downcasting it would make a
-        # round-tripped HeightMapReader.cell silently not bit-match the yaml sidecar's.
-        "H": np.stack([t.H for _, t in entries], axis=0).astype(np.float32),
-        "cell": np.array([t.cell for _, t in entries], dtype=np.float64),
-        "origin": np.array([[t.x0, t.y0] for _, t in entries], dtype=np.float64),
-        "min_z": np.array([t.min_z for _, t in entries], dtype=np.float64),
-        "max_z": np.array([t.max_z for _, t in entries], dtype=np.float64),
+        # nothing, and the grid is near-constant across genuinely-different variants (e.g. a
+        # bump/box series) too, so gzip shrinks it further still. cell/origin/min_z/max_z stay
+        # float64: they're a handful of scalars per unique terrain (storage cost is noise), and
+        # unlike H's 255-level quantization, a value like cell=0.05 has no exact float32
+        # representation -- downcasting it would make a round-tripped HeightMapReader.cell
+        # silently not bit-match the yaml sidecar's.
+        "H": np.stack([t.H for _, t in unique_entries], axis=0).astype(np.float32),
+        "cell": np.array([t.cell for _, t in unique_entries], dtype=np.float64),
+        "origin": np.array([[t.x0, t.y0] for _, t in unique_entries], dtype=np.float64),
+        "min_z": np.array([t.min_z for _, t in unique_entries], dtype=np.float64),
+        "max_z": np.array([t.max_z for _, t in unique_entries], dtype=np.float64),
         "yaml": np.array(
             [
                 "" if p is None else pathlib.Path(p).with_suffix(".yaml").read_text()
-                for p, _ in entries
+                for p, _ in unique_entries
             ]
         ),
-        "path": np.array(["" if p is None else str(p) for p, _ in entries]),
+        "path": np.array(["" if p is None else str(p) for p, _ in unique_entries]),
     }
+    if len(unique_entries) < len(entries):
+        fields["variant_to_terrain"] = variant_to_terrain
+    return fields
 
 
 def terrain_from_h5(f: h5py.File, i: int) -> HeightMapReader:
     """Inverse of terrain_fields(): rebuild variant i's terrain straight from the file, no
-    assets/ files needed."""
+    assets/ files needed. `variant_to_terrain` (see terrain_fields()) indirects i to the
+    underlying unique-terrain row when present; its absence (every file written before
+    deduplication, or a file with nothing to dedupe) means i already IS that row, matching the
+    old direct-index layout."""
     grp = f["terrain"]
-    x0, y0 = grp["origin"][i]
+    j = int(grp["variant_to_terrain"][i]) if "variant_to_terrain" in grp else i
+    x0, y0 = grp["origin"][j]
     return HeightMapReader(
-        grp["H"][i],
+        grp["H"][j],
         (float(x0), float(y0)),
-        float(grp["cell"][i]),
-        min_z=float(grp["min_z"][i]),
-        max_z=float(grp["max_z"][i]),
+        float(grp["cell"][j]),
+        min_z=float(grp["min_z"][j]),
+        max_z=float(grp["max_z"][j]),
     )
 
 
