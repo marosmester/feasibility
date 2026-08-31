@@ -11,7 +11,7 @@ Two design points worth stating up front:
   it's active, so computing the loss AFTER that clamp would silently kill the gradient for any
   prediction currently on the wrong side of it. Model space has no clamp, so every prediction
   always has a usable gradient. inverse()/physical units are used only for the val-loop MAE
-  printout and the optional --plot, never for backward().
+  printout and wandb logging, never for backward().
 * target_transform is fit on TRAIN rows only: make_dataloaders() returns train_subset alongside
   (train_loader, val_loader, ds) precisely so a caller can fit further train-only statistics --
   like this -- without re-deriving the split itself.
@@ -20,7 +20,8 @@ Usage:
     python src/feasibility/learning/train.py
     python src/feasibility/learning/train.py --dataset outputs/dataset_box_h070cm_n256.h5 --epochs 100
     python src/feasibility/learning/train.py --yaw-encoding sincos --patience 20
-    python src/feasibility/learning/train.py --plot outputs/train_loss.png
+    python src/feasibility/learning/train.py --wandb-mode offline
+    python src/feasibility/learning/train.py --wandb-mode disabled  # no network calls at all
     python -c "
     import torch
     from feasibility.learning.train import load_checkpoint
@@ -33,17 +34,15 @@ from __future__ import annotations
 import argparse
 import pathlib
 
-import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
+import wandb
 
 from feasibility.comparator.common import OUT_DIR
 from feasibility.comparator.provenance import git_provenance
 from feasibility.learning.custom_dataset import make_dataloaders
 from feasibility.learning.custom_dataset import Normalizer
 from feasibility.learning.custom_dataset import PoseErrorDataset
-from feasibility.learning.error_visual import E_POS_COLOR
-from feasibility.learning.error_visual import E_ROT_COLOR
 from feasibility.learning.model import DEFAULT_DEPTH
 from feasibility.learning.model import DEFAULT_HIDDEN
 from feasibility.learning.model import PoseErrorMLP
@@ -115,44 +114,7 @@ def load_checkpoint(
     return model, x_normalizer, ckpt
 
 
-def plot_history(history: list[dict[str, float]], out_path: pathlib.Path) -> None:
-    """Two-panel loss curve: top = model-space MSE (train vs val, same units, one axis) so
-    over/underfitting is directly readable; bottom = physical-unit val MAE per target head, one
-    axis each like error_visual.py's e_pos/e_rot split -- reuses its exact colors so a reader
-    who's seen that plot recognizes this one."""
-    epochs = [row["epoch"] for row in history]
-
-    fig, (ax_loss, ax_mae) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
-
-    ax_loss.plot(epochs, [row["train_loss"] for row in history], label="train (model space)")
-    ax_loss.plot(epochs, [row["val_loss"] for row in history], label="val (model space)")
-    ax_loss.set_ylabel("MSE (model space)")
-    ax_loss.set_title("training loss")
-    ax_loss.legend(loc="upper right")
-
-    ax_mae.plot(
-        epochs, [row["val_mae_e_pos"] for row in history], color=E_POS_COLOR, label="val e_pos MAE (m)"
-    )
-    ax_mae.set_xlabel("epoch")
-    ax_mae.set_ylabel("e_pos MAE (m)", color=E_POS_COLOR)
-    ax_mae.tick_params(axis="y", labelcolor=E_POS_COLOR)
-
-    ax_rot = ax_mae.twinx()
-    ax_rot.plot(
-        epochs, [row["val_mae_e_rot"] for row in history], color=E_ROT_COLOR, label="val e_rot MAE (rad)"
-    )
-    ax_rot.set_ylabel("e_rot MAE (rad)", color=E_ROT_COLOR)
-    ax_rot.tick_params(axis="y", labelcolor=E_ROT_COLOR)
-
-    lines = ax_mae.get_lines() + ax_rot.get_lines()
-    ax_mae.legend(lines, [line.get_label() for line in lines], loc="upper right")
-
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    print(f"saved loss curve to {out_path}")
-
-
-def train(args: argparse.Namespace) -> None:
+def train(args: argparse.Namespace, run: wandb.sdk.wandb_run.Run) -> None:
     device = torch.device(args.device)
     torch.manual_seed(args.seed)
 
@@ -181,7 +143,6 @@ def train(args: argparse.Namespace) -> None:
     )
     print(f"[model] in_dim={len(ds.FEATURE_NAMES)}, hidden={args.hidden}, depth={args.depth}, device={device}")
 
-    history: list[dict[str, float]] = []
     best_val_loss = float("inf")
     best_epoch = -1
     epochs_since_improve = 0
@@ -213,16 +174,6 @@ def train(args: argparse.Namespace) -> None:
         val_loss = val_loss_sum / val_n
         val_mae_e_pos, val_mae_e_rot = (val_mae_sum / val_n).tolist()
 
-        history.append(
-            dict(
-                epoch=epoch,
-                train_loss=train_loss,
-                val_loss=val_loss,
-                val_mae_e_pos=val_mae_e_pos,
-                val_mae_e_rot=val_mae_e_rot,
-            )
-        )
-
         improved = val_loss < best_val_loss
         if improved:
             best_val_loss, best_epoch = val_loss, epoch
@@ -230,6 +181,16 @@ def train(args: argparse.Namespace) -> None:
             torch.save(build_checkpoint(model, optimizer, epoch, val_loss, ds, args), checkpoint_path)
         else:
             epochs_since_improve += 1
+
+        run.log(
+            dict(
+                train_loss=train_loss,
+                val_loss=val_loss,
+                val_mae_e_pos=val_mae_e_pos,
+                val_mae_e_rot=val_mae_e_rot,
+            ),
+            step=epoch,
+        )
 
         if epoch % args.log_every == 0 or epoch == args.epochs or improved:
             marker = " *" if improved else ""
@@ -244,8 +205,9 @@ def train(args: argparse.Namespace) -> None:
 
     print(f"[done]  best val_loss={best_val_loss:.4f} @ epoch {best_epoch}, checkpoint={checkpoint_path}")
 
-    if args.plot is not None:
-        plot_history(history, args.plot)
+    run.summary["best_val_loss"] = best_val_loss
+    run.summary["best_epoch"] = best_epoch
+    run.save(str(checkpoint_path), base_path=str(checkpoint_path.parent), policy="now")
 
 
 def main() -> None:
@@ -263,11 +225,24 @@ def main() -> None:
     parser.add_argument("--patience", type=int, default=0, help="epochs of no val_loss improvement before early stop; 0 disables (default: 0)")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="torch device (default: cuda if available else cpu)")
     parser.add_argument("--checkpoint", type=pathlib.Path, default=None, help="save path (default: outputs/checkpoints/<dataset stem>.pt)")
-    parser.add_argument("--plot", type=pathlib.Path, default=None, help="save a loss-curve PNG here (default: no plot)")
     parser.add_argument("--log-every", type=int, default=10, help="epochs between stdout progress lines (default: 10)")
+    parser.add_argument("--wandb-project", type=str, default="feasibility-pose-error-mlp")
+    parser.add_argument("--wandb-entity", type=str, default=None)
+    parser.add_argument("--wandb-mode", type=str, default="online", choices=["online", "offline", "disabled"])
+    parser.add_argument("--wandb-name", type=str, default=None)
     args = parser.parse_args()
 
-    train(args)
+    run = wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        name=args.wandb_name,
+        mode=args.wandb_mode,
+        config=vars(args),
+    )
+    try:
+        train(args, run)
+    finally:
+        run.finish()
 
 
 if __name__ == "__main__":

@@ -31,6 +31,8 @@ dependencies = [
   # logging convention) -- was previously only a transitive dep via ostrich[sim] /
   # helhest-stack[data], now a direct one since feasibility imports h5py itself.
   "h5py>=3.14",
+  # src/feasibility/learning/train.py logs runs to Weights & Biases.
+  "wandb>=0.18",
 ]
 
 [tool.uv]
