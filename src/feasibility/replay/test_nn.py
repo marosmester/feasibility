@@ -7,9 +7,21 @@ computed directly from the file's ostrich/pose[-1] vs hstack/pose[-1], the exact
 learning.pose_error.se3_error math -- and the network's PREDICTED (e_pos, e_rot) to the terminal,
 so the two can be compared by eye.
 
-The network only ever sees (v_drive, wz_drive, spawn_x, spawn_y, spawn_yaw) -- never terrain --
-so --file need not match --nn-checkpoint's training terrain for inference to run, but the
-"real" error will only be in-distribution for the checkpoint if it does.
+What the network sees is whatever its checkpoint says it was trained on, rebuilt here by
+build_feature_row(): either the pose-only (v_drive, wz_drive, spawn_x, spawn_y, spawn_yaw), or --
+for a checkpoint trained with train.py --patch -- (v_drive, wz_drive) plus a body-frame terrain
+patch sampled from THIS file's embedded terrain at this variant's spawn pose (see
+learning/terrain_patch.py). Either way --file need not match the checkpoint's training terrain
+for inference to run, but a pose-only checkpoint is meaningless off its own terrain, whereas a
+patch checkpoint is exactly the thing that is supposed to survive the swap -- which makes
+running one against a different --file the interesting experiment rather than a mistake.
+
+For a --patch checkpoint, the viewer also draws the patch's body-frame footprint as a bright
+line-outline rectangle on the terrain, at the spawn pose it was actually sampled at (see
+patch_rectangle_world). It's an outline rather than a filled translucent quad because ViewerGL's
+solid-shape pipeline has no alpha channel to blend with; the line pipeline does support blending,
+so this is the closest thing to a translucent overlay the renderer can actually do. Nothing is
+drawn for a pose-only checkpoint.
 
 CLI parameters:
     --file PATH             comparator/generate_dataset output .h5 (required)
@@ -41,9 +53,13 @@ import torch
 import warp as wp
 
 from feasibility.comparator.provenance import terrain_from_h5
-from feasibility.learning.custom_dataset import FEATURE_NAMES_SINCOS
+from feasibility.heightmap import HeightMapReader
+from feasibility.learning.custom_dataset import build_input
+from feasibility.learning.custom_dataset import Normalizer
 from feasibility.learning.pose_error import pose_to_se3
 from feasibility.learning.pose_error import se3_error
+from feasibility.learning.terrain_patch import PatchSpec
+from feasibility.learning.terrain_patch import sample_patches
 from feasibility.learning.train import load_checkpoint
 from feasibility.replay.gl_replay import CAMERA_PITCH
 from feasibility.replay.gl_replay import CAMERA_YAW
@@ -56,16 +72,82 @@ from feasibility.replay.gl_replay import interp_pose
 from feasibility.replay.gl_replay import interp_series
 
 
-def build_feature_row(ckpt: dict[str, object], v_drive: float, wz_drive: float, x: float, y: float, yaw: float) -> torch.Tensor:
-    """Assembles the [1, in_dim] raw feature row a checkpoint expects, keyed off its own
-    ckpt["feature_names"] rather than assuming raw yaw -- a checkpoint trained with
-    --yaw-encoding sincos (custom_dataset.FEATURE_NAMES_SINCOS) needs (cos_yaw, sin_yaw) instead
-    of yaw, same as PoseErrorDataset.__init__ builds it."""
-    if tuple(ckpt["feature_names"]) == FEATURE_NAMES_SINCOS:
-        row = [v_drive, wz_drive, x, y, np.cos(yaw), np.sin(yaw)]
-    else:
-        row = [v_drive, wz_drive, x, y, yaw]
-    return torch.tensor([row], dtype=torch.float32)
+def patch_rectangle_world(
+    spec: PatchSpec, terrain: HeightMapReader, x: float, y: float, yaw: float, z_offset: float = 0.03
+) -> np.ndarray:
+    """[4, 3] world-frame corners of the patch's body-frame bounding rectangle, in order, at the
+    pose the patch was actually sampled at (spawn pose -- see build_feature_row/main). Each
+    corner is lifted `z_offset` m above the terrain height directly under it so the outline
+    doesn't z-fight with the terrain mesh; the corners therefore follow the ground rather than
+    sitting on one flat plane, which matters on the sloped/box terrains this patch is sampled on.
+
+    Same body->world rotation as terrain_patch._body_to_world, kept as a local copy rather than
+    imported: that function is underscore-private to terrain_patch (a sampling detail), while this
+    one only exists to feed a debug-line overlay."""
+    c, s = np.cos(yaw), np.sin(yaw)
+    corners_body = np.array(
+        [
+            [spec.x_min, spec.y_min],
+            [spec.x_max, spec.y_min],
+            [spec.x_max, spec.y_max],
+            [spec.x_min, spec.y_max],
+        ]
+    )
+    wx = x + c * corners_body[:, 0] - s * corners_body[:, 1]
+    wy = y + s * corners_body[:, 0] + c * corners_body[:, 1]
+    wz = np.asarray(terrain.sample(wx, wy), dtype=np.float64) + z_offset
+    return np.stack([wx, wy, wz], axis=1).astype(np.float32)
+
+
+def build_feature_row(
+    ckpt: dict[str, object],
+    x_normalizer: Normalizer,
+    terrain: HeightMapReader,
+    v_drive: float,
+    wz_drive: float,
+    x: float,
+    y: float,
+    yaw: float,
+) -> torch.Tensor:
+    """Assembles the [1, in_dim] MODEL-READY feature row a checkpoint expects -- normalized and
+    concatenated, ready to hand straight to model.predict().
+
+    Keyed off the checkpoint's own metadata rather than assuming a layout, because there are now
+    three of them: pose with raw yaw, pose with (cos_yaw, sin_yaw) (--yaw-encoding sincos), and
+    (v, wz) + a flattened terrain patch (--patch). ckpt["n_scalar_features"] splits the scalar
+    block x_normalizer applies to from the patch block it must NOT touch, and
+    ckpt["patch_spec"] carries the exact sampling geometry -- both absent on checkpoints written
+    before patch mode existed, whose every column is a scalar, which is what the fallbacks mean.
+
+    Returns the row through custom_dataset.build_input() rather than assembling it here, so
+    inference and PoseErrorDataset.__getitem__ cannot drift apart."""
+    names = tuple(ckpt["feature_names"])
+    n_scalar = int(ckpt.get("n_scalar_features", len(names)))
+    scalar_names = names[:n_scalar]
+
+    row = [v_drive, wz_drive]
+    if "cos_yaw" in scalar_names:
+        row += [x, y, np.cos(yaw), np.sin(yaw)]
+    elif "yaw" in scalar_names:
+        row += [x, y, yaw]
+    if len(row) != n_scalar:
+        raise SystemExit(
+            f"checkpoint's scalar features {scalar_names} don't match anything this script can "
+            f"build (got {len(row)} values for {n_scalar} columns)"
+        )
+    # load_checkpoint() put x_normalizer's statistics on the model's device, so the row has to
+    # be there before it is normalized, not after.
+    device = x_normalizer.mean.device
+    scalars = torch.tensor([row], dtype=torch.float32, device=device)
+
+    patch_spec = ckpt.get("patch_spec")
+    patch = None
+    if patch_spec is not None:
+        spec = PatchSpec.from_dict(patch_spec)
+        patch = torch.from_numpy(
+            sample_patches(terrain, np.array([[x, y, yaw]]), spec).reshape(1, spec.size)
+        ).to(device)
+    return build_input(scalars, patch, x_normalizer)
 
 
 def main() -> None:
@@ -109,8 +191,10 @@ def main() -> None:
     device = torch.device(args.device)
     model, x_normalizer, ckpt = load_checkpoint(args.nn_checkpoint, device)
     model.eval()
-    x_raw = build_feature_row(ckpt, v_drive, wz_drive, spawn_x, spawn_y, spawn_yaw).to(device)
-    pred_e_pos, pred_e_rot = model.predict(x_normalizer(x_raw))[0].tolist()
+    x_in = build_feature_row(
+        ckpt, x_normalizer, terrain, v_drive, wz_drive, spawn_x, spawn_y, spawn_yaw
+    )
+    pred_e_pos, pred_e_rot = model.predict(x_in)[0].tolist()
 
     camera_pos = wp.vec3(obstacle_x, CAMERA_Y_OFFSET, CAMERA_Z)
     t_end = max(float(t[-1]) for t, _, _ in tracks.values())
@@ -121,6 +205,22 @@ def main() -> None:
     viewer.set_model(model_)
     viewer.set_camera(pos=camera_pos, pitch=CAMERA_PITCH, yaw=CAMERA_YAW)
     state = model_.state()
+
+    # Draw the patch footprint iff this checkpoint's input includes one -- ckpt["patch_spec"] is
+    # only non-None for a train.py --patch checkpoint (see load_checkpoint/build_feature_row).
+    # A filled translucent quad isn't achievable here: ViewerGL's solid-shape pipeline never
+    # enables GL_BLEND and its per-instance colors are vec3 (no alpha channel) -- see
+    # newton's viewer_gl.py _render_scene / gl/opengl.py. log_lines DOES blend, so a bright
+    # outline is the closest supported stand-in -- static (spawn pose, once), since that's the
+    # one pose the patch was actually sampled at, not something that tracks the robot per frame.
+    ckpt_patch_spec = ckpt.get("patch_spec")
+    if ckpt_patch_spec is not None:
+        corners = patch_rectangle_world(
+            PatchSpec.from_dict(ckpt_patch_spec), terrain, spawn_x, spawn_y, spawn_yaw
+        )
+        starts = wp.array(corners, dtype=wp.vec3, device=model_.device)
+        ends = wp.array(np.roll(corners, -1, axis=0), dtype=wp.vec3, device=model_.device)
+        viewer.log_lines("/patch_footprint", starts, ends, colors=(0.2, 0.9, 1.0))
 
     q_start = model_.joint_q_start.numpy()
     joint_q = model_.joint_q.numpy().copy()

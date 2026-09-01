@@ -20,6 +20,34 @@ smoke-testing since those files already exist under outputs/.
     xb, yb = next(iter(train))
     print(xb.shape, yb.shape)
     "
+
+TERRAIN PATCH MODE (`patch_spec=`) swaps the spawn pose for the terrain itself:
+
+    x = (v_drive, wz_drive) + flattened body-frame patch      [n, 2 + ny*nx]
+
+See terrain_patch.py for what the patch is and why (body-aligned, height relative to the wheel
+contacts, scaled by WHEEL_RADIUS, forward-biased). Two consequences here:
+
+* `include_pose` defaults to False in this mode, i.e. (x, y, yaw) are DROPPED. That is the
+  point: the patch already says where the robot is relative to the terrain, in a form that
+  transfers to terrain the model never saw, while absolute coordinates only mean anything on the
+  one heightmap they were fitted to. Pass include_pose=True to keep both and ablate.
+* The patch block is NOT run through x_normalizer. It is one physical field already in sane
+  units, and per-column standardization would divide the float-noise std of the always-flat
+  cells (most of the patch, on this terrain) up into O(1) noise. x_normalizer therefore covers
+  only the leading SCALAR_FEATURE_NAMES columns -- build_input() is the single place that knows
+  this, and both __getitem__ and inference (replay/test_nn.py) go through it.
+
+The terrain comes from the file's own embedded `terrain/` group (comparator/provenance.py), not
+from assets/, so patch mode works on datasets that were already generated -- nothing needs
+re-running.
+
+    python -c "
+    from feasibility.learning.custom_dataset import PoseErrorDataset
+    from feasibility.learning.terrain_patch import PatchSpec
+    ds = PoseErrorDataset('outputs/dataset_box_h070cm_n128_cont.h5', patch_spec=PatchSpec())
+    print(ds.x.shape, ds.patch.shape, len(ds.FEATURE_NAMES))
+    "
 """
 from __future__ import annotations
 
@@ -34,11 +62,19 @@ from torch.utils.data import Dataset
 from torch.utils.data import Subset
 from torch.utils.data import random_split
 
+from feasibility.comparator.provenance import unique_terrains_from_h5
 from feasibility.learning.pose_error import pose_to_se3
 from feasibility.learning.pose_error import se3_error
+from feasibility.learning.terrain_patch import patch_feature_names
+from feasibility.learning.terrain_patch import PatchSpec
+from feasibility.learning.terrain_patch import sample_patches
 
-FEATURE_NAMES_RAW = ("v", "wz", "x", "y", "yaw")
-FEATURE_NAMES_SINCOS = ("v", "wz", "x", "y", "cos_yaw", "sin_yaw")
+FEATURE_NAMES_TWIST = ("v", "wz")  # always present -- the commanded twist is a causal input, not
+# a stand-in for terrain the way the spawn pose is
+FEATURE_NAMES_POSE_RAW = ("x", "y", "yaw")
+FEATURE_NAMES_POSE_SINCOS = ("x", "y", "cos_yaw", "sin_yaw")
+FEATURE_NAMES_RAW = FEATURE_NAMES_TWIST + FEATURE_NAMES_POSE_RAW
+FEATURE_NAMES_SINCOS = FEATURE_NAMES_TWIST + FEATURE_NAMES_POSE_SINCOS
 TARGET_NAMES = ("e_pos", "e_rot")
 
 
@@ -78,13 +114,31 @@ class Normalizer:
         return x * self.std + self.mean
 
 
+def build_input(
+    scalars: torch.Tensor, patch: torch.Tensor | None, x_normalizer: Normalizer | None
+) -> torch.Tensor:
+    """Assemble the model-ready feature row(s): normalize the scalar block, then concatenate the
+    (already-scaled, deliberately un-normalized) patch block -- see the module docstring on why
+    the patch is excluded from x_normalizer.
+
+    The single source of truth for that layout, shared by __getitem__ and by inference-time
+    callers (replay/test_nn.py), so a checkpoint can never be fed a row assembled a different
+    way than the rows it was trained on. Shapes broadcast: [..., n_scalar] and [..., n_patch]."""
+    x = scalars if x_normalizer is None else x_normalizer(scalars)
+    return x if patch is None else torch.cat([x, patch], dim=-1)
+
+
 class PoseErrorDataset(Dataset):
-    """One sample per row of a comparator output HDF5: x = (v, wz, x, y, yaw) commanded twist
-    + spawn pose, y = (e_pos, e_rot) final-pose SE(3) error between ostrich and hstack.
+    """One sample per row of a comparator output HDF5: x = (v, wz) commanded twist plus either
+    the spawn pose (x, y, yaw) or a body-frame terrain patch (see `patch_spec`, and the module
+    docstring on why they're alternatives rather than both by default), y = (e_pos, e_rot)
+    final-pose SE(3) error between ostrich and hstack.
 
     Reads the whole file into numpy eagerly in __init__ (n is tiny -- a handful to a few
     thousand rows -- and h5py file handles aren't fork-safe, so this sidesteps DataLoader
-    num_workers>0 issues entirely rather than working around them).
+    num_workers>0 issues entirely rather than working around them). The patch is sampled once
+    here too, for the same reason: it is a pure function of (terrain, spawn_pose), so
+    re-deriving it per __getitem__ would repeat identical work every epoch.
 
     x_normalizer/y_normalizer are plain attributes, not baked into the stored tensors, so a
     train/val split can fit them on train rows only and then attach them to this shared
@@ -98,12 +152,21 @@ class PoseErrorDataset(Dataset):
         x_normalizer: Normalizer | None = None,
         y_normalizer: Normalizer | None = None,
         yaw_encoding: str = "raw",
+        patch_spec: PatchSpec | None = None,
+        include_pose: bool | None = None,
     ) -> None:
         if yaw_encoding not in ("raw", "sincos"):
             raise ValueError(f"yaw_encoding must be 'raw' or 'sincos', got {yaw_encoding!r}")
+        # Defaulting rather than forcing: with a patch the pose is redundant AND terrain-specific
+        # (module docstring), so dropping it is the right default -- but keeping both is the
+        # ablation that says whether the patch actually carries the pose's information.
+        if include_pose is None:
+            include_pose = patch_spec is None
 
         self.source = pathlib.Path(path)
         self.yaw_encoding = yaw_encoding
+        self.patch_spec = patch_spec
+        self.include_pose = include_pose
         self.x_normalizer = x_normalizer
         self.y_normalizer = y_normalizer
 
@@ -117,14 +180,27 @@ class PoseErrorDataset(Dataset):
             ]
             self.attrs = dict(f.attrs)
             self.git = dict(f["git"].attrs) if "git" in f else {}
+            patch_arr = (
+                None
+                if patch_spec is None
+                else _sample_row_patches(f, spawn_pose, patch_spec)
+            )
 
         x, y, yaw = spawn_pose[:, 0], spawn_pose[:, 1], spawn_pose[:, 2]
-        if yaw_encoding == "sincos":
-            cols = [v_drive, wz_drive, x, y, np.cos(yaw), np.sin(yaw)]
-            self.FEATURE_NAMES = FEATURE_NAMES_SINCOS
-        else:
-            cols = [v_drive, wz_drive, x, y, yaw]
-            self.FEATURE_NAMES = FEATURE_NAMES_RAW
+        cols = [v_drive, wz_drive]
+        scalar_names = FEATURE_NAMES_TWIST
+        if include_pose:
+            if yaw_encoding == "sincos":
+                cols += [x, y, np.cos(yaw), np.sin(yaw)]
+                scalar_names += FEATURE_NAMES_POSE_SINCOS
+            else:
+                cols += [x, y, yaw]
+                scalar_names += FEATURE_NAMES_POSE_RAW
+
+        self.SCALAR_FEATURE_NAMES = scalar_names
+        self.FEATURE_NAMES = scalar_names + (
+            () if patch_spec is None else patch_feature_names(patch_spec)
+        )
         self.TARGET_NAMES = TARGET_NAMES
 
         x_arr = np.stack(cols, axis=1)
@@ -136,6 +212,8 @@ class PoseErrorDataset(Dataset):
         # fix that for stats we compute ourselves, not the loss on the row itself, and the row's
         # target is simply invalid) -- so drop it here, once, before anything else touches y.
         finite = np.isfinite(x_arr).all(axis=1) & np.isfinite(y_arr).all(axis=1)
+        if patch_arr is not None:
+            finite &= np.isfinite(patch_arr).all(axis=1)
         n_dropped = int((~finite).sum())
         if n_dropped:
             dropped_idx = np.flatnonzero(~finite).tolist()
@@ -144,21 +222,46 @@ class PoseErrorDataset(Dataset):
                 f"non-finite x/y (indices {dropped_idx})"
             )
             x_arr, y_arr = x_arr[finite], y_arr[finite]
+            if patch_arr is not None:
+                patch_arr = patch_arr[finite]
             self.labels = [label for label, keep in zip(self.labels, finite) if keep]
 
         self.x = torch.from_numpy(x_arr)
         self.y = torch.from_numpy(y_arr)
+        self.patch = None if patch_arr is None else torch.from_numpy(patch_arr)
 
     def __len__(self) -> int:
         return self.x.shape[0]
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        x, y = self.x[idx], self.y[idx]
-        if self.x_normalizer is not None:
-            x = self.x_normalizer(x)
+        patch = None if self.patch is None else self.patch[idx]
+        x = build_input(self.x[idx], patch, self.x_normalizer)
+        y = self.y[idx]
         if self.y_normalizer is not None:
             y = self.y_normalizer(y)
         return x, y
+
+
+def _sample_row_patches(
+    f: h5py.File, spawn_pose: np.ndarray, patch_spec: PatchSpec
+) -> np.ndarray:
+    """[n, ny*nx] float32 flattened body-frame patches, one per row of `spawn_pose`, read from
+    the file's own embedded `terrain/` group rather than from assets/ (so a dataset stays
+    self-describing -- see comparator/provenance.py's module docstring).
+
+    Grouped by unique terrain and sampled one vectorized call per group: generate_dataset.py's
+    files share a single terrain across every row, so this is one call for the whole dataset,
+    while a future per-row-terrain file still costs only one call per distinct terrain."""
+    n = spawn_pose.shape[0]
+    terrains, index = unique_terrains_from_h5(f, n)
+    patches = np.empty((n, patch_spec.size), dtype=np.float32)
+    for j, terrain in enumerate(terrains):
+        rows = np.flatnonzero(index[:n] == j)
+        if rows.size:
+            patches[rows] = sample_patches(terrain, spawn_pose[rows], patch_spec).reshape(
+                rows.size, -1
+            )
+    return patches
 
 
 def split_dataset(
@@ -184,6 +287,11 @@ def make_dataloaders(
     """Build a PoseErrorDataset over `path`, split it, fit x/y Normalizers on the TRAIN rows
     only (fitting on all rows would leak val statistics into training), attach them to the
     (shared) underlying dataset, and return (train_loader, val_loader, dataset, train_subset).
+
+    `ds_kwargs` forwards to PoseErrorDataset -- `yaw_encoding`, and `patch_spec`/`include_pose`
+    for terrain-patch mode. x_normalizer is fitted on `ds.x`, which in patch mode holds the
+    SCALAR block alone; the patch block carries its own fixed scaling and is never standardized
+    (see the module docstring and build_input()).
 
     train_subset is returned (not just consumed internally) so a caller can fit further
     TRAIN-only statistics of its own -- e.g. model.TargetTransform.fit(ds.y[train_subset.indices])

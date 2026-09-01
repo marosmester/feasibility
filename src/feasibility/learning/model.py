@@ -6,6 +6,14 @@ FEATURE_NAMES_RAW = (v, wz, x, y, yaw) in, TARGET_NAMES = (e_pos, e_rot) out:
 
     x [B, 5] --> Linear/LayerNorm/SiLU x3 @ 256 --> {head_e_pos, head_e_rot} --> y [B, 2]
 
+`in_dim` is a constructor argument precisely because that 5 is not fixed: 6 under
+yaw_encoding="sincos", and 578 in terrain-patch mode ((v, wz) plus a flattened 24x24 body-frame
+patch -- see custom_dataset's module docstring and learning/terrain_patch.py). Pass
+len(ds.FEATURE_NAMES) and the width is right in every case. At 578 inputs the first Linear
+alone is 148k params against a few thousand training rows, so expect the patch configuration to
+want --weight-decay / --patience where the 5-input one did not; a flattened patch through a
+plain MLP is the deliberately simplest terrain encoding, not the most sample-efficient one.
+
 Two design points worth stating, both measured on the outputs/dataset_box_*.h5 files:
 
 * ONE trunk, TWO heads rather than two networks. e_pos and e_rot correlate 0.72-0.83 across
@@ -101,8 +109,9 @@ class TargetTransform:
 class PoseErrorMLP(nn.Module):
     """(v, wz, x, y, yaw) -> (e_pos, e_rot), in standardized log1p space -- see TargetTransform.
 
-    `in_dim` is a parameter rather than a hardcoded 5 because custom_dataset yields 6 columns
-    under yaw_encoding="sincos"; pass len(ds.FEATURE_NAMES) and it is right either way.
+    `in_dim` is a parameter rather than a hardcoded 5 because custom_dataset also yields 6
+    columns under yaw_encoding="sincos" and 2 + ny*nx under patch_spec=; pass
+    len(ds.FEATURE_NAMES) and it is right in every case.
 
     LayerNorm (not BatchNorm) between trunk layers: it behaves identically at train and eval
     time and doesn't depend on batch statistics, which matters when the last batch of a few

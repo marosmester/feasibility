@@ -21,7 +21,17 @@ CLI parameters:
                                              schema) (default: outputs/dataset_box_h070cm_n128_cont.h5)
     --val-frac FLOAT                        fraction of rows held out for validation (default: 0.2)
     --seed INT                              seeds the train/val split and model init (default: 0)
-    --yaw-encoding {raw,sincos}             spawn yaw feature encoding (default: raw)
+    --yaw-encoding {raw,sincos}             spawn yaw feature encoding (default: raw); ignored
+                                             with --patch unless --include-pose
+    --patch                                 replace the spawn pose with a body-frame terrain
+                                             patch (see learning/terrain_patch.py)
+    --patch-cell FLOAT                      patch resolution in meters (default: 0.25)
+    --patch-x MIN MAX                       patch body-frame X extent (default: -1.5 4.5)
+    --patch-y MIN MAX                       patch body-frame Y extent (default: -3.0 3.0)
+    --patch-reference {wheels,center,none}  what patch heights are measured against
+                                             (default: wheels)
+    --include-pose                          keep (x, y, yaw) ALONGSIDE --patch, as an ablation;
+                                             without --patch the pose is always included
     --batch-size INT                        default: 32
     --epochs INT                            default: 200
     --lr FLOAT                              Adam learning rate (default: 1e-3)
@@ -42,6 +52,9 @@ Usage:
     python src/feasibility/learning/train.py
     python src/feasibility/learning/train.py --dataset outputs/dataset_box_h070cm_n256.h5 --epochs 100
     python src/feasibility/learning/train.py --yaw-encoding sincos --patience 20
+    python src/feasibility/learning/train.py --patch                  # terrain patch, no pose
+    python src/feasibility/learning/train.py --patch --patch-cell 0.5 --weight-decay 1e-4
+    python src/feasibility/learning/train.py --patch --include-pose   # ablation: patch AND pose
     python src/feasibility/learning/train.py --wandb-mode offline
     python src/feasibility/learning/train.py --wandb-mode disabled  # no network calls at all
     python -c "
@@ -69,6 +82,12 @@ from feasibility.learning.model import DEFAULT_DEPTH
 from feasibility.learning.model import DEFAULT_HIDDEN
 from feasibility.learning.model import PoseErrorMLP
 from feasibility.learning.model import TargetTransform
+from feasibility.learning.terrain_patch import DEFAULT_CELL
+from feasibility.learning.terrain_patch import DEFAULT_REFERENCE
+from feasibility.learning.terrain_patch import DEFAULT_X_RANGE
+from feasibility.learning.terrain_patch import DEFAULT_Y_RANGE
+from feasibility.learning.terrain_patch import PatchSpec
+from feasibility.learning.terrain_patch import REFERENCES
 
 DEFAULT_DATASET = OUT_DIR / "dataset_box_h070cm_n128_cont.h5"  # continuous spawn mode preferred
 # for learning -- see generate_dataset.py's module docstring on why "lattice" makes the spawn
@@ -101,6 +120,13 @@ def build_checkpoint(
         depth=args.depth,
         feature_names=ds.FEATURE_NAMES,
         target_names=ds.TARGET_NAMES,
+        # Enough to rebuild an inference-time feature row exactly: which leading columns
+        # x_normalizer applies to (the patch block is excluded -- see custom_dataset.build_input)
+        # and the patch geometry the rest of the row was sampled with. A model handed a
+        # differently-shaped or differently-referenced patch is silently wrong, not broken.
+        n_scalar_features=len(ds.SCALAR_FEATURE_NAMES),
+        patch_spec=None if ds.patch_spec is None else ds.patch_spec.to_dict(),
+        include_pose=ds.include_pose,
         x_normalizer_mean=ds.x_normalizer.mean,
         x_normalizer_std=ds.x_normalizer.std,
         target_transform_mean=target_transform.normalizer.mean,
@@ -119,7 +145,11 @@ def load_checkpoint(
     counterpart to balance_ppo/train.py's load_policy(). Callers must apply x_normalizer to raw
     (v, wz, x, y, yaw[, ...]) inputs before calling model.predict() -- the model itself has no
     idea its inputs need normalizing, exactly like PoseErrorDataset.__getitem__ applies
-    ds.x_normalizer, not the model, today."""
+    ds.x_normalizer, not the model, today.
+
+    For a patch checkpoint (ckpt["patch_spec"] is not None) x_normalizer covers only the leading
+    ckpt["n_scalar_features"] columns; assemble the full row with custom_dataset.build_input()
+    rather than normalizing it wholesale -- replay/test_nn.py is the worked example."""
     ckpt = torch.load(path, map_location=device, weights_only=False)
     target_transform = TargetTransform(
         normalizer=Normalizer(
@@ -136,9 +166,42 @@ def load_checkpoint(
     return model, x_normalizer, ckpt
 
 
+def describe_input_structure(ds: PoseErrorDataset) -> str:
+    """Human-readable layout of the model's input vector x: the scalar columns by name (always,
+    since even the patch block is `[v, wz]` + at least those two), followed by a summary of the
+    flattened patch block when one is attached. The patch is summarized rather than named
+    cell-by-cell -- terrain_patch.patch_feature_names() returns one name per cell (576 at the
+    default 24x24 resolution), which is exact but unreadable as a print line."""
+    n_scalar = len(ds.SCALAR_FEATURE_NAMES)
+    n_total = len(ds.FEATURE_NAMES)
+    lines = [f"[input] in_dim={n_total}"]
+    lines.append(f"  [0:{n_scalar}] scalar ({n_scalar}): {', '.join(ds.SCALAR_FEATURE_NAMES)}")
+    if ds.patch_spec is not None:
+        spec = ds.patch_spec
+        lines.append(
+            f"  [{n_scalar}:{n_total}] patch ({spec.size}): {spec.ny}x{spec.nx} cells @ "
+            f"{spec.cell} m, body-frame x=[{spec.x_min}, {spec.x_max}], "
+            f"y=[{spec.y_min}, {spec.y_max}], ref={spec.reference}, row-major h_r<i>c<j>"
+        )
+    return "\n".join(lines)
+
+
 def train(args: argparse.Namespace, run: wandb.sdk.wandb_run.Run) -> None:
     device = torch.device(args.device)
     torch.manual_seed(args.seed)
+
+    patch_spec = (
+        PatchSpec(
+            x_min=args.patch_x[0],
+            x_max=args.patch_x[1],
+            y_min=args.patch_y[0],
+            y_max=args.patch_y[1],
+            cell=args.patch_cell,
+            reference=args.patch_reference,
+        )
+        if args.patch
+        else None
+    )
 
     train_loader, val_loader, ds, train_subset = make_dataloaders(
         args.dataset,
@@ -148,10 +211,18 @@ def train(args: argparse.Namespace, run: wandb.sdk.wandb_run.Run) -> None:
         normalize_targets=False,  # TargetTransform (log1p + standardize) is the only y-transform
         # -- a second normalization here would double-standardize the targets.
         yaw_encoding=args.yaw_encoding,
+        patch_spec=patch_spec,
+        # Without --patch the pose is the only spatial input there is, so it is always kept;
+        # with --patch it is dropped unless explicitly asked for (see custom_dataset).
+        include_pose=args.include_pose or not args.patch,
     )
     target_transform = TargetTransform.fit(ds.y[train_subset.indices])
 
-    checkpoint_path = args.checkpoint or OUT_DIR / "checkpoints" / f"{ds.source.stem}.pt"
+    # "_patch" tag so a --patch run can't silently overwrite the pose-baseline checkpoint of the
+    # same dataset -- the two are the comparison, and they differ only in how x was built. Same
+    # reasoning as generate_dataset.SPAWN_MODE_TAGS; the untagged name stays the baseline's.
+    tag = "_patch" if patch_spec is not None else ""
+    checkpoint_path = args.checkpoint or OUT_DIR / "checkpoints" / f"{ds.source.stem}{tag}.pt"
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
 
     model = PoseErrorMLP(
@@ -163,6 +234,9 @@ def train(args: argparse.Namespace, run: wandb.sdk.wandb_run.Run) -> None:
         f"[data]  {ds.source.name}: {len(ds)} rows, {len(train_loader.dataset)} train / "
         f"{len(val_loader.dataset)} val, yaw_encoding={args.yaw_encoding}"
     )
+    if patch_spec is not None:
+        print(f"[patch] pose={'kept' if ds.include_pose else 'dropped'}")
+    print(describe_input_structure(ds))
     print(f"[model] in_dim={len(ds.FEATURE_NAMES)}, hidden={args.hidden}, depth={args.depth}, device={device}")
 
     best_val_loss = float("inf")
@@ -238,6 +312,12 @@ def main() -> None:
     parser.add_argument("--val-frac", type=float, default=0.2, help="fraction of rows held out for validation (default: 0.2)")
     parser.add_argument("--seed", type=int, default=0, help="seeds the train/val split and model init (default: 0)")
     parser.add_argument("--yaw-encoding", choices=("raw", "sincos"), default="raw", help="spawn yaw feature encoding (default: raw)")
+    parser.add_argument("--patch", action="store_true", help="replace the spawn pose with a body-frame terrain patch (see learning/terrain_patch.py)")
+    parser.add_argument("--patch-cell", type=float, default=DEFAULT_CELL, help=f"patch resolution in meters (default: {DEFAULT_CELL})")
+    parser.add_argument("--patch-x", type=float, nargs=2, default=list(DEFAULT_X_RANGE), metavar=("MIN", "MAX"), help=f"patch body-frame X extent (default: {DEFAULT_X_RANGE[0]} {DEFAULT_X_RANGE[1]})")
+    parser.add_argument("--patch-y", type=float, nargs=2, default=list(DEFAULT_Y_RANGE), metavar=("MIN", "MAX"), help=f"patch body-frame Y extent (default: {DEFAULT_Y_RANGE[0]} {DEFAULT_Y_RANGE[1]})")
+    parser.add_argument("--patch-reference", choices=REFERENCES, default=DEFAULT_REFERENCE, help=f"what patch heights are measured against (default: {DEFAULT_REFERENCE})")
+    parser.add_argument("--include-pose", action="store_true", help="keep (x, y, yaw) alongside --patch, as an ablation; without --patch the pose is always included")
     parser.add_argument("--batch-size", type=int, default=32, help="default: 32")
     parser.add_argument("--epochs", type=int, default=200, help="default: 200")
     parser.add_argument("--lr", type=float, default=1e-3, help="Adam learning rate (default: 1e-3)")

@@ -135,14 +135,10 @@ def terrain_fields(
     return fields
 
 
-def terrain_from_h5(f: h5py.File, i: int) -> HeightMapReader:
-    """Inverse of terrain_fields(): rebuild variant i's terrain straight from the file, no
-    assets/ files needed. `variant_to_terrain` (see terrain_fields()) indirects i to the
-    underlying unique-terrain row when present; its absence (every file written before
-    deduplication, or a file with nothing to dedupe) means i already IS that row, matching the
-    old direct-index layout."""
-    grp = f["terrain"]
-    j = int(grp["variant_to_terrain"][i]) if "variant_to_terrain" in grp else i
+def _terrain_row(grp: h5py.Group, j: int) -> HeightMapReader:
+    """Build the HeightMapReader for unique-terrain row `j` of an already-opened `terrain/`
+    group -- the shared body of terrain_from_h5()/unique_terrains_from_h5(), kept in one place
+    so a schema change to the terrain/ group only has to be applied once."""
     x0, y0 = grp["origin"][j]
     return HeightMapReader(
         grp["H"][j],
@@ -151,6 +147,39 @@ def terrain_from_h5(f: h5py.File, i: int) -> HeightMapReader:
         min_z=float(grp["min_z"][j]),
         max_z=float(grp["max_z"][j]),
     )
+
+
+def terrain_from_h5(f: h5py.File, i: int) -> HeightMapReader:
+    """Inverse of terrain_fields(): rebuild variant i's terrain straight from the file, no
+    assets/ files needed. `variant_to_terrain` (see terrain_fields()) indirects i to the
+    underlying unique-terrain row when present; its absence (every file written before
+    deduplication, or a file with nothing to dedupe) means i already IS that row, matching the
+    old direct-index layout."""
+    grp = f["terrain"]
+    j = int(grp["variant_to_terrain"][i]) if "variant_to_terrain" in grp else i
+    return _terrain_row(grp, j)
+
+
+def unique_terrains_from_h5(f: h5py.File, n: int) -> tuple[list[HeightMapReader], np.ndarray]:
+    """Bulk counterpart to terrain_from_h5(), for a reader that needs EVERY variant's terrain at
+    once: the deduplicated terrain list plus the [n] variant -> terrain index into it.
+
+    terrain_from_h5(f, i) in a loop would re-materialize the same shared grid n times -- for
+    generate_dataset.py's files, where all n variants point at one terrain (see terrain_fields()
+    on deduplication), that is n copies of a 321x321 grid to read one. Returning the unique set
+    plus the index lets a caller do its per-terrain work once and scatter the result, which is
+    what learning/custom_dataset.py's patch sampling does.
+
+    `variant_to_terrain`'s absence means nothing was deduped, i.e. variant i IS terrain row i --
+    the same convention terrain_from_h5() applies, kept in step with it here."""
+    grp = f["terrain"]
+    index = (
+        np.asarray(grp["variant_to_terrain"][()], dtype=np.int64)
+        if "variant_to_terrain" in grp
+        else np.arange(n, dtype=np.int64)
+    )
+    terrains = [_terrain_row(grp, j) for j in range(grp["H"].shape[0])]
+    return terrains, index
 
 
 def _write_group(grp: h5py.Group, fields: dict[str, np.ndarray]) -> None:
