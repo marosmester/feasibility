@@ -159,6 +159,30 @@ class PatchSpec:
         return cls(**d)  # type: ignore[arg-type]
 
 
+PATCH_ATTR_PREFIX = "patch_"  # see patch_spec_to_attrs()/patch_spec_from_attrs()
+
+
+def patch_spec_to_attrs(spec: PatchSpec) -> dict[str, float | str]:
+    """to_dict(), flattened with a `patch_` prefix so it splices straight into a comparator
+    HDF5's flat root attrs (comparator.provenance.write_comparison's `root=` dict, alongside
+    scalars like mu/k_turn/spawn_mode) instead of needing its own nested group -- written by
+    generate_dataset_body_centered_patch.py so the file records the exact geometry its `patch`
+    dataset was sampled with. Inverse of patch_spec_from_attrs()."""
+    return {f"{PATCH_ATTR_PREFIX}{k}": v for k, v in spec.to_dict().items()}
+
+
+def patch_spec_from_attrs(attrs: dict[str, object]) -> PatchSpec:
+    """Inverse of patch_spec_to_attrs(): rebuilds a PatchSpec from a comparator HDF5's root attrs
+    (h5py.File(...).attrs, already materialized to a plain dict). Raises KeyError if `attrs` has
+    no patch_* entries, i.e. the file wasn't written by generate_dataset_body_centered_patch.py."""
+    keys = ("x_min", "x_max", "y_min", "y_max", "cell", "reference")
+    kwargs: dict[str, float | str] = {
+        k: (str(attrs[f"{PATCH_ATTR_PREFIX}{k}"]) if k == "reference" else float(attrs[f"{PATCH_ATTR_PREFIX}{k}"]))
+        for k in keys
+    }
+    return PatchSpec(**kwargs)  # type: ignore[arg-type]
+
+
 def patch_feature_names(spec: PatchSpec) -> tuple[str, ...]:
     """One name per flattened patch cell, row-major (row = body +Y, col = body +X), matching
     sample_patches()'s [ny, nx] layout and its reshape order. Exists so

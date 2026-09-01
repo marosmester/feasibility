@@ -8,8 +8,10 @@ e_rot) mapping this dataset exposes:
     x = (v_drive, wz_drive, spawn_x, spawn_y, spawn_yaw)          [n, 5]
     y = (e_pos, e_rot)  -- final-pose SE(3) error, see pose_error [n, 2]
 
-feasibility.learning.generate_dataset generates exactly this: N randomized (spawn pose, constant
-body twist) trials on one fixed centered-box heightmap. This module also loads fine against a
+feasibility.learning.generate_init_pose_dataset generates exactly this: N randomized (spawn pose,
+constant body twist) trials on one fixed centered-box heightmap (its sibling,
+generate_dataset_body_centered_patch, writes the same schema plus a baked-in `patch` dataset --
+see TERRAIN PATCH MODE below). This module also loads fine against a
 *sweep*-style file (compare_speed_bumps.py/compare_box_obstacles.py), where
 spawn_pose/v_drive/wz_drive happen to be constant across rows instead of terrain -- useful for
 smoke-testing since those files already exist under outputs/.
@@ -21,11 +23,13 @@ smoke-testing since those files already exist under outputs/.
     print(xb.shape, yb.shape)
     "
 
-TERRAIN PATCH MODE (`patch_spec=`) swaps the spawn pose for the terrain itself:
+TERRAIN PATCH MODE (`use_patch=True`) swaps the spawn pose for the terrain itself:
 
     x = (v_drive, wz_drive) + flattened body-frame patch      [n, 2 + ny*nx]
 
-See terrain_patch.py for what the patch is and why (body-aligned, height relative to the wheel
+The patch is read straight from the file's own `patch` dataset -- a feature of the FILE, baked in
+once by feasibility.learning.generate_dataset_body_centered_patch.py, not recomputed here. See
+terrain_patch.py for what the patch is and why (body-aligned, height relative to the wheel
 contacts, scaled by WHEEL_RADIUS, forward-biased). Two consequences here:
 
 * `include_pose` defaults to False in this mode, i.e. (x, y, yaw) are DROPPED. That is the
@@ -38,14 +42,13 @@ contacts, scaled by WHEEL_RADIUS, forward-biased). Two consequences here:
   only the leading SCALAR_FEATURE_NAMES columns -- build_input() is the single place that knows
   this, and both __getitem__ and inference (replay/test_nn.py) go through it.
 
-The terrain comes from the file's own embedded `terrain/` group (comparator/provenance.py), not
-from assets/, so patch mode works on datasets that were already generated -- nothing needs
-re-running.
+use_patch=True on a file with no `patch` dataset (e.g. one written by
+generate_init_pose_dataset.py) raises ValueError -- regenerate it with
+generate_dataset_body_centered_patch.py instead.
 
     python -c "
     from feasibility.learning.custom_dataset import PoseErrorDataset
-    from feasibility.learning.terrain_patch import PatchSpec
-    ds = PoseErrorDataset('outputs/dataset_box_h070cm_n128_cont.h5', patch_spec=PatchSpec())
+    ds = PoseErrorDataset('outputs/dataset_patch_box_h070cm_n128_cont.h5', use_patch=True)
     print(ds.x.shape, ds.patch.shape, len(ds.FEATURE_NAMES))
     "
 """
@@ -62,12 +65,10 @@ from torch.utils.data import Dataset
 from torch.utils.data import Subset
 from torch.utils.data import random_split
 
-from feasibility.comparator.provenance import unique_terrains_from_h5
 from feasibility.learning.pose_error import pose_to_se3
 from feasibility.learning.pose_error import se3_error
 from feasibility.learning.terrain_patch import patch_feature_names
-from feasibility.learning.terrain_patch import PatchSpec
-from feasibility.learning.terrain_patch import sample_patches
+from feasibility.learning.terrain_patch import patch_spec_from_attrs
 
 FEATURE_NAMES_TWIST = ("v", "wz")  # always present -- the commanded twist is a causal input, not
 # a stand-in for terrain the way the spawn pose is
@@ -130,15 +131,16 @@ def build_input(
 
 class PoseErrorDataset(Dataset):
     """One sample per row of a comparator output HDF5: x = (v, wz) commanded twist plus either
-    the spawn pose (x, y, yaw) or a body-frame terrain patch (see `patch_spec`, and the module
+    the spawn pose (x, y, yaw) or a body-frame terrain patch (see `use_patch`, and the module
     docstring on why they're alternatives rather than both by default), y = (e_pos, e_rot)
     final-pose SE(3) error between ostrich and hstack.
 
     Reads the whole file into numpy eagerly in __init__ (n is tiny -- a handful to a few
     thousand rows -- and h5py file handles aren't fork-safe, so this sidesteps DataLoader
-    num_workers>0 issues entirely rather than working around them). The patch is sampled once
-    here too, for the same reason: it is a pure function of (terrain, spawn_pose), so
-    re-deriving it per __getitem__ would repeat identical work every epoch.
+    num_workers>0 issues entirely rather than working around them). With use_patch=True the
+    file's own `patch` dataset is read here too, once, rather than per __getitem__ -- it was
+    already baked in at generation time (generate_dataset_body_centered_patch.py), so there is no
+    per-load computation left to repeat.
 
     x_normalizer/y_normalizer are plain attributes, not baked into the stored tensors, so a
     train/val split can fit them on train rows only and then attach them to this shared
@@ -152,7 +154,7 @@ class PoseErrorDataset(Dataset):
         x_normalizer: Normalizer | None = None,
         y_normalizer: Normalizer | None = None,
         yaw_encoding: str = "raw",
-        patch_spec: PatchSpec | None = None,
+        use_patch: bool = False,
         include_pose: bool | None = None,
     ) -> None:
         if yaw_encoding not in ("raw", "sincos"):
@@ -161,11 +163,10 @@ class PoseErrorDataset(Dataset):
         # (module docstring), so dropping it is the right default -- but keeping both is the
         # ablation that says whether the patch actually carries the pose's information.
         if include_pose is None:
-            include_pose = patch_spec is None
+            include_pose = not use_patch
 
         self.source = pathlib.Path(path)
         self.yaw_encoding = yaw_encoding
-        self.patch_spec = patch_spec
         self.include_pose = include_pose
         self.x_normalizer = x_normalizer
         self.y_normalizer = y_normalizer
@@ -180,11 +181,18 @@ class PoseErrorDataset(Dataset):
             ]
             self.attrs = dict(f.attrs)
             self.git = dict(f["git"].attrs) if "git" in f else {}
-            patch_arr = (
-                None
-                if patch_spec is None
-                else _sample_row_patches(f, spawn_pose, patch_spec)
-            )
+            if use_patch:
+                if "patch" not in f:
+                    raise ValueError(
+                        f"{self.source} has no baked-in `patch` dataset -- generate it with "
+                        f"generate_dataset_body_centered_patch.py, or pass use_patch=False to "
+                        f"train on the spawn pose instead"
+                    )
+                patch_arr = f["patch"][()].astype(np.float32)  # [n, ny*nx], already flattened
+                self.patch_spec = patch_spec_from_attrs(self.attrs)
+            else:
+                patch_arr = None
+                self.patch_spec = None
 
         x, y, yaw = spawn_pose[:, 0], spawn_pose[:, 1], spawn_pose[:, 2]
         cols = [v_drive, wz_drive]
@@ -199,7 +207,7 @@ class PoseErrorDataset(Dataset):
 
         self.SCALAR_FEATURE_NAMES = scalar_names
         self.FEATURE_NAMES = scalar_names + (
-            () if patch_spec is None else patch_feature_names(patch_spec)
+            () if self.patch_spec is None else patch_feature_names(self.patch_spec)
         )
         self.TARGET_NAMES = TARGET_NAMES
 
@@ -242,28 +250,6 @@ class PoseErrorDataset(Dataset):
         return x, y
 
 
-def _sample_row_patches(
-    f: h5py.File, spawn_pose: np.ndarray, patch_spec: PatchSpec
-) -> np.ndarray:
-    """[n, ny*nx] float32 flattened body-frame patches, one per row of `spawn_pose`, read from
-    the file's own embedded `terrain/` group rather than from assets/ (so a dataset stays
-    self-describing -- see comparator/provenance.py's module docstring).
-
-    Grouped by unique terrain and sampled one vectorized call per group: generate_dataset.py's
-    files share a single terrain across every row, so this is one call for the whole dataset,
-    while a future per-row-terrain file still costs only one call per distinct terrain."""
-    n = spawn_pose.shape[0]
-    terrains, index = unique_terrains_from_h5(f, n)
-    patches = np.empty((n, patch_spec.size), dtype=np.float32)
-    for j, terrain in enumerate(terrains):
-        rows = np.flatnonzero(index[:n] == j)
-        if rows.size:
-            patches[rows] = sample_patches(terrain, spawn_pose[rows], patch_spec).reshape(
-                rows.size, -1
-            )
-    return patches
-
-
 def split_dataset(
     ds: PoseErrorDataset, val_frac: float = 0.2, seed: int = 0
 ) -> tuple[Subset, Subset]:
@@ -288,7 +274,7 @@ def make_dataloaders(
     only (fitting on all rows would leak val statistics into training), attach them to the
     (shared) underlying dataset, and return (train_loader, val_loader, dataset, train_subset).
 
-    `ds_kwargs` forwards to PoseErrorDataset -- `yaw_encoding`, and `patch_spec`/`include_pose`
+    `ds_kwargs` forwards to PoseErrorDataset -- `yaw_encoding`, and `use_patch`/`include_pose`
     for terrain-patch mode. x_normalizer is fitted on `ds.x`, which in patch mode holds the
     SCALAR block alone; the patch block carries its own fixed scaling and is never standardized
     (see the module docstring and build_input()).
