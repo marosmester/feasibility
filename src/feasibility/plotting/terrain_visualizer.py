@@ -14,10 +14,10 @@ CLI parameters:
     --no-robot    skip placing the Helhest Junior model, terrain only
 
 Usage:
-    python src/feasibility/heightmap/terrain_visualizer.py
-    python src/feasibility/heightmap/terrain_visualizer.py --file assets/rough/rough_seed0007
-    python src/feasibility/heightmap/terrain_visualizer.py --file assets/surface/surface
-    python src/feasibility/heightmap/terrain_visualizer.py --no-robot
+    python src/feasibility/plotting/terrain_visualizer.py
+    python src/feasibility/plotting/terrain_visualizer.py --file assets/rough/rough_seed0007
+    python src/feasibility/plotting/terrain_visualizer.py --file assets/surface/surface
+    python src/feasibility/plotting/terrain_visualizer.py --no-robot
 """
 from __future__ import annotations
 
