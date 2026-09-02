@@ -22,8 +22,8 @@ generate_init_pose_dataset.py, since both scripts run the exact same simulator; 
 in what non-simulator feature array ends up in the output file.
 
 CLI parameters: everything generate_dataset_utils.py's module docstring documents (+n_samples=,
-+seed=, +box_height=, +duration_s=, +chunk=, +settle_steps=, +spawn_mode=, +mu=, +k_turn=,
-+device=), plus the patch geometry (see terrain_patch.py's PatchSpec for what each means):
++seed=, +map=, +duration_s=, +chunk=, +settle_steps=, +spawn_mode=, +mu=, +k_turn=, +device=),
+plus the patch geometry (see terrain_patch.py's PatchSpec for what each means):
     +patch_cell=FLOAT        patch resolution in meters (default: terrain_patch.DEFAULT_CELL)
     +patch_x_min=FLOAT       patch body-frame X min, meters (default: terrain_patch.DEFAULT_X_RANGE[0])
     +patch_x_max=FLOAT       patch body-frame X max, meters (default: terrain_patch.DEFAULT_X_RANGE[1])
@@ -34,7 +34,7 @@ CLI parameters: everything generate_dataset_utils.py's module docstring document
 Usage:
     python src/feasibility/learning/generate_dataset_body_centered_patch.py                       # DEFAULT_N, lattice
     python src/feasibility/learning/generate_dataset_body_centered_patch.py +n_samples=2000 +seed=1
-    python src/feasibility/learning/generate_dataset_body_centered_patch.py +box_height=0.5 +chunk=64
+    python src/feasibility/learning/generate_dataset_body_centered_patch.py +map=assets/speed_bumps/speed_bump_h010cm +chunk=64
     python src/feasibility/learning/generate_dataset_body_centered_patch.py +spawn_mode=continuous +n_samples=5000
     python src/feasibility/learning/generate_dataset_body_centered_patch.py +patch_cell=0.5
 """
@@ -50,12 +50,12 @@ from feasibility.comparator.common import K_P
 from feasibility.comparator.common import OUT_DIR
 from feasibility.comparator.provenance import write_comparison
 from feasibility.heightmap import HeightMapReader
-from feasibility.heightmap.create_box_obstacles import centered_box_path
-from feasibility.learning.generate_dataset_utils import DEFAULT_BOX_HEIGHT
 from feasibility.learning.generate_dataset_utils import DEFAULT_DURATION_S
+from feasibility.learning.generate_dataset_utils import DEFAULT_MAP
 from feasibility.learning.generate_dataset_utils import DEFAULT_N
 from feasibility.learning.generate_dataset_utils import DEFAULT_SEED
 from feasibility.learning.generate_dataset_utils import DEFAULT_SPAWN_MODE
+from feasibility.learning.generate_dataset_utils import resolve_map_path
 from feasibility.learning.generate_dataset_utils import sample_dataset
 from feasibility.learning.generate_dataset_utils import simulate_dataset_rollout
 from feasibility.learning.generate_dataset_utils import SPAWN_MODE_TAGS
@@ -73,7 +73,6 @@ def generate(cfg: DictConfig) -> None:
 
     n = int(cfg.get("n_samples", DEFAULT_N))
     seed = int(cfg.get("seed", DEFAULT_SEED))
-    box_height = float(cfg.get("box_height", DEFAULT_BOX_HEIGHT))
     spawn_mode = str(cfg.get("spawn_mode", DEFAULT_SPAWN_MODE))
 
     patch_spec = PatchSpec(
@@ -85,10 +84,11 @@ def generate(cfg: DictConfig) -> None:
         reference=str(cfg.get("patch_reference", DEFAULT_REFERENCE)),
     )
 
-    terrain_path = centered_box_path(box_height)
+    terrain_path = resolve_map_path(str(cfg.get("map", DEFAULT_MAP)))
     terrain = HeightMapReader.load(terrain_path)
+    print(f"[terrain]  {terrain_path}")
 
-    spawn_pose, v_drive, wz_drive = sample_dataset(n, seed, box_height, spawn_mode)
+    spawn_pose, v_drive, wz_drive = sample_dataset(n, seed, spawn_mode)
     labels = np.array([f"s{i:05d}" for i in range(n)])
     print(f"[spawn]    mode={spawn_mode}, {len(np.unique(spawn_pose, axis=0))} distinct poses")
 
@@ -104,7 +104,7 @@ def generate(cfg: DictConfig) -> None:
     )
 
     tag = SPAWN_MODE_TAGS[spawn_mode]
-    out_path = OUT_DIR / f"dataset_patch_box_h{round(box_height * 100):03d}cm_n{n}{tag}.h5"
+    out_path = OUT_DIR / f"dataset_patch_{terrain_path.stem}_n{n}{tag}.h5"
     write_comparison(
         out_path,
         root=dict(
@@ -117,6 +117,8 @@ def generate(cfg: DictConfig) -> None:
             k_p=K_P,
             spawn_mode=spawn_mode,  # so a saved file says how its poses were drawn, not just
             # what they were -- see comparator/provenance.py on self-describing runs
+            map=str(terrain_path),  # so a saved file records which heightmap it was generated
+            # on, alongside the terrain data itself in `terrain_entries` below
             **patch_spec_to_attrs(patch_spec),  # so the file records the exact patch geometry
             # its `patch` dataset was sampled with -- see custom_dataset.PoseErrorDataset,
             # which reconstructs a PatchSpec from these attrs rather than taking one as an
