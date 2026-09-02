@@ -7,11 +7,13 @@ Two pieces:
 * Spawn-pose sampling on the loaded heightmap -- the "lattice"/"continuous" spawn modes, and
   sample_dataset(), which draws n (spawn_pose, v_drive, wz_drive) trials. See sample_dataset()'s
   docstring for the full spawn sampling story (spawn modes, the SPAWN_LIMIT square, why
-  V_RANGE/WZ_RANGE are independent of spawn pose). Spawn poses are no longer filtered against a
-  box obstacle's footprint (that SAT test assumed the fixed centered-box series, which a generic
-  `+map=` heightmap can't guarantee) -- every pose in the SPAWN_LIMIT square is legal now, so
-  callers that need obstacle clearance should pick a map/SPAWN_LIMIT combination that keeps the
-  spawn square off any obstacle themselves.
+  V_RANGE/WZ_RANGE are independent of spawn pose). Spawn poses are filtered against obstacles by
+  a map-relative HEIGHT THRESHOLD rather than the old fixed-geometry SAT test (which assumed the
+  one hardcoded centered-box footprint and couldn't survive a generic `+map=`) -- see
+  obstacle_height_threshold()/_footprint_clear(): any pose whose wheel-contact/center footprint
+  samples above the threshold is rejected, so spawning ON or IN a box obstacle is prevented for
+  any map that fits the "flat-ish background + a few much-taller obstacles" assumption, without
+  needing to know the obstacle's exact footprint.
 * resolve_map_path(): turns a `+map=` CLI value into a loadable HeightMapReader path -- absolute
   paths pass through, everything else resolves against REPO_ROOT (so `+map=assets/foo/bar` works
   regardless of the invoking cwd, matching every heightmap/create_*.py generator's own asset
@@ -67,6 +69,7 @@ from feasibility.comparator.common import euler_zyx_to_quat_xyzw
 from feasibility.comparator.common import run_hstack_batch
 from feasibility.comparator.common import run_ostrich_batch
 from feasibility.heightmap import HeightMapReader
+from feasibility.learning.terrain_patch import WHEEL_CONTACTS_LOCAL
 
 # --- hyperparameters (module constants -- override any of them with a Hydra `+key=value`) -------
 
@@ -113,6 +116,19 @@ SPAWN_MODE_TAGS = {"lattice": "", "continuous": "_cont"}  # output-filename suff
 V_RANGE = (0.0, 1.5)  # m/s, forward body velocity command
 WZ_RANGE = (-1.0, 1.0)  # rad/s, yaw-rate command
 
+OBSTACLE_MARGIN_FRACTION = 0.15  # a footprint point counts as "on an obstacle" once its height
+# clears this fraction of the way from the terrain's median height (background, assumed to cover
+# most of the map -- see module docstring) to its max height (the top of the tallest obstacle).
+# Scales with each map's own relief instead of a hardcoded absolute, so it needs no per-map
+# tuning. Deliberately low, not a midpoint: create_box_obstacles.py's ramps are steep (75 deg
+# incline by default, i.e. ramp_width = height/tan(75deg) ~= 0.27*height), so a wheel resting
+# even a third of the way up one (measured near the box's default 0.70 m height, that's ~13 cm
+# into an 18.8 cm ramp) already sits on a near-vertical local slope -- ostrich spawning a robot
+# there interpenetrates the mesh and the contact solver diverges. At 0.15 a footprint point has
+# to clear ~85% of the ramp's horizontal width before it counts as "on the obstacle", which
+# leaves only the shallow apron right at the ramp's outer base as legal -- exactly the "spawn
+# right next to it" case the filter is meant to still allow.
+
 
 def resolve_map_path(map_arg: str) -> pathlib.Path:
     """Turns a `+map=` CLI value into a loadable HeightMapReader path: absolute paths pass
@@ -123,33 +139,96 @@ def resolve_map_path(map_arg: str) -> pathlib.Path:
     return p if p.is_absolute() else REPO_ROOT / p
 
 
-def legal_spawn_poses() -> np.ndarray:
+def obstacle_height_threshold(terrain: HeightMapReader) -> float:
+    """Height above which a footprint point counts as "on an obstacle" rather than background
+    terrain: OBSTACLE_MARGIN_FRACTION of the way from the map's median height (the background is
+    assumed to cover most of the map -- see module docstring) to its max height (the top of the
+    tallest obstacle). Expressed relative to the map's own height range rather than as a
+    hardcoded absolute, so it needs no per-map tuning -- see OBSTACLE_MARGIN_FRACTION's comment
+    for why that fraction is low rather than a midpoint."""
+    baseline = float(np.median(terrain.H))
+    return baseline + OBSTACLE_MARGIN_FRACTION * (terrain.max_z - baseline)
+
+
+def _footprint_clear(terrain: HeightMapReader, poses: np.ndarray, threshold: float) -> np.ndarray:
+    """[n] bool -- True where pose's footprint (the three wheel contacts plus body center, same
+    WHEEL_CONTACTS_LOCAL geometry terrain_patch.py uses) samples entirely below `threshold`, i.e.
+    the pose doesn't spawn on top of / inside an elevated obstacle."""
+    x, y, yaw = poses[:, 0], poses[:, 1], poses[:, 2]
+    c, s = np.cos(yaw), np.sin(yaw)
+    local_x = np.append(WHEEL_CONTACTS_LOCAL[:, 0], 0.0)
+    local_y = np.append(WHEEL_CONTACTS_LOCAL[:, 1], 0.0)
+    wx = x[:, None] + c[:, None] * local_x - s[:, None] * local_y
+    wy = y[:, None] + s[:, None] * local_x + c[:, None] * local_y
+    heights = np.asarray(terrain.sample(wx, wy), dtype=np.float64)
+    return heights.max(axis=1) <= threshold
+
+
+def legal_spawn_poses(terrain: HeightMapReader | None = None) -> np.ndarray:
     """All (x, y, yaw) on the SPAWN_STEP/N_YAW lattice within +-SPAWN_LIMIT -- [M, 3],
     M = (2*SPAWN_LIMIT/SPAWN_STEP + 1)**2 * N_YAW. Drawn from by sample_dataset()'s "lattice"
     mode. Row order matches the nested x -> y -> yaw enumeration it always had, so a given seed
-    keeps drawing the same poses. No longer filtered against a box footprint (see module
-    docstring) -- every pose in the square is legal."""
+    keeps drawing the same poses (modulo the obstacle filter below, which only removes rows).
+    If `terrain` is given, poses whose footprint would land on/in an obstacle (see
+    obstacle_height_threshold()) are dropped."""
     lattice = np.arange(-SPAWN_LIMIT, SPAWN_LIMIT + 1e-9, SPAWN_STEP)
     yaws = np.arange(N_YAW) * (2.0 * np.pi / N_YAW)
     grid_x, grid_y, grid_yaw = np.meshgrid(lattice, lattice, yaws, indexing="ij")
-    return np.stack([grid_x.ravel(), grid_y.ravel(), grid_yaw.ravel()], axis=1)
+    poses = np.stack([grid_x.ravel(), grid_y.ravel(), grid_yaw.ravel()], axis=1)
+    if terrain is not None:
+        threshold = obstacle_height_threshold(terrain)
+        poses = poses[_footprint_clear(terrain, poses, threshold)]
+        if len(poses) == 0:
+            raise ValueError(
+                "legal_spawn_poses: every pose in the SPAWN_LIMIT square was rejected as "
+                "on/in an obstacle -- check the loaded map's elevation range against "
+                "obstacle_height_threshold()."
+            )
+    return poses
 
 
-def continuous_spawn_poses(n: int, rng: np.random.Generator) -> np.ndarray:
+def continuous_spawn_poses(
+    n: int, rng: np.random.Generator, terrain: HeightMapReader | None = None
+) -> np.ndarray:
     """n (x, y, yaw) poses drawn uniformly -- (x, y) ~ U(-SPAWN_LIMIT, SPAWN_LIMIT), yaw ~
-    U(0, 2pi). [n, 3]."""
-    xy = rng.uniform(-SPAWN_LIMIT, SPAWN_LIMIT, size=(n, 2))
-    yaw = rng.uniform(0.0, 2.0 * np.pi, size=n)
-    return np.column_stack([xy, yaw]).astype(np.float64)
+    U(0, 2pi). [n, 3]. If `terrain` is given, rejection-samples around any pose that would land
+    on/in an obstacle (see obstacle_height_threshold()) instead of returning it."""
+    if terrain is None:
+        xy = rng.uniform(-SPAWN_LIMIT, SPAWN_LIMIT, size=(n, 2))
+        yaw = rng.uniform(0.0, 2.0 * np.pi, size=n)
+        return np.column_stack([xy, yaw]).astype(np.float64)
+
+    threshold = obstacle_height_threshold(terrain)
+    accepted = np.empty((0, 3), dtype=np.float64)
+    for _ in range(20):  # bounded retries -- a sane map/threshold clears most of the square, so
+        # this converges in one or two rounds; a pathological map raises below rather than loop.
+        missing = n - len(accepted)
+        if missing <= 0:
+            break
+        xy = rng.uniform(-SPAWN_LIMIT, SPAWN_LIMIT, size=(2 * missing, 2))
+        yaw = rng.uniform(0.0, 2.0 * np.pi, size=2 * missing)
+        candidates = np.column_stack([xy, yaw]).astype(np.float64)
+        accepted = np.concatenate([accepted, candidates[_footprint_clear(terrain, candidates, threshold)]])
+    if len(accepted) < n:
+        raise ValueError(
+            f"continuous_spawn_poses: only found {len(accepted)}/{n} obstacle-clear poses after "
+            "20 rejection-sampling rounds -- check the loaded map's elevation range against "
+            "obstacle_height_threshold()."
+        )
+    return accepted[:n]
 
 
 def sample_dataset(
-    n: int, seed: int, spawn_mode: str = DEFAULT_SPAWN_MODE
+    n: int,
+    seed: int,
+    spawn_mode: str = DEFAULT_SPAWN_MODE,
+    terrain: HeightMapReader | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Draws n (spawn_pose, v_drive, wz_drive) samples. spawn_mode selects how spawn_pose is
     drawn (see module docstring): "lattice" draws WITH replacement from the SPAWN_STEP/N_YAW
     grid (a repeated pose under a different twist is still a useful sample), "continuous" draws
-    uniformly over the spawn square and the full yaw circle.
+    uniformly over the spawn square and the full yaw circle. If `terrain` is given, poses that
+    would spawn the robot on/in an obstacle are excluded (see obstacle_height_threshold()).
 
     v_drive/wz_drive are independent continuous draws, uniform over V_RANGE/WZ_RANGE in either
     mode -- spawn pose and command are not correlated.
@@ -162,10 +241,10 @@ def sample_dataset(
 
     rng = np.random.default_rng(seed)
     if spawn_mode == "lattice":
-        legal = legal_spawn_poses()
+        legal = legal_spawn_poses(terrain)
         spawn_pose = legal[rng.integers(0, len(legal), size=n)]
     else:
-        spawn_pose = continuous_spawn_poses(n, rng)
+        spawn_pose = continuous_spawn_poses(n, rng, terrain)
     v_drive = rng.uniform(*V_RANGE, size=n).astype(np.float32)
     wz_drive = rng.uniform(*WZ_RANGE, size=n).astype(np.float32)
     return spawn_pose, v_drive, wz_drive
@@ -315,3 +394,35 @@ def simulate_dataset_rollout(
         wheel_qd=h_wheel_qd,
     )
     return ostrich_fields, hstack_fields, mu, k_turn
+
+
+if __name__ == "__main__":
+    # Smoke test for the obstacle-clearance filter -- no ostrich/hstack rollout needed. Run on
+    # DEFAULT_MAP (a box footprint centered well inside the SPAWN_LIMIT square), so an unfiltered
+    # sampler would draw poses on/in the box; asserts the filtered samplers never do.
+    _terrain = HeightMapReader.load(resolve_map_path(DEFAULT_MAP))
+    _threshold = obstacle_height_threshold(_terrain)
+    print(f"[terrain] {DEFAULT_MAP}: median={np.median(_terrain.H):.3f}, max={_terrain.max_z:.3f}, "
+          f"obstacle threshold={_threshold:.3f}")
+
+    _legal = legal_spawn_poses(_terrain)
+    assert len(_legal) > 0, "obstacle filter left no legal lattice poses on DEFAULT_MAP"
+    assert np.all(_footprint_clear(_terrain, _legal, _threshold)), \
+        "a filtered lattice pose is on/in the obstacle"
+    print(f"[lattice] {len(_legal)}/{len(legal_spawn_poses())} poses survive the obstacle filter")
+
+    _rng = np.random.default_rng(0)
+    _continuous = continuous_spawn_poses(64, _rng, _terrain)
+    assert _continuous.shape == (64, 3)
+    assert np.all(_footprint_clear(_terrain, _continuous, _threshold)), \
+        "a filtered continuous pose is on/in the obstacle"
+    print("[continuous] 64/64 rejection-sampled poses clear the obstacle")
+
+    # A pose planted dead center on the box must be rejected; one a couple meters clear must not.
+    _on_box = np.array([[0.0, 0.0, 0.0]])
+    _off_box = np.array([[SPAWN_LIMIT, SPAWN_LIMIT, 0.0]])
+    assert not _footprint_clear(_terrain, _on_box, _threshold)[0], \
+        "pose at the box center should be rejected"
+    assert _footprint_clear(_terrain, _off_box, _threshold)[0], \
+        "pose at the spawn-square corner should be accepted"
+    print("[footprint] on-box pose rejected, off-box pose accepted -- OK")

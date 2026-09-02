@@ -88,7 +88,7 @@ def generate(cfg: DictConfig) -> None:
     terrain = HeightMapReader.load(terrain_path)
     print(f"[terrain]  {terrain_path}")
 
-    spawn_pose, v_drive, wz_drive = sample_dataset(n, seed, spawn_mode)
+    spawn_pose, v_drive, wz_drive = sample_dataset(n, seed, spawn_mode, terrain)
     labels = np.array([f"s{i:05d}" for i in range(n)])
     print(f"[spawn]    mode={spawn_mode}, {len(np.unique(spawn_pose, axis=0))} distinct poses")
 
