@@ -218,3 +218,20 @@ tree (or its `examples/`) is almost always the right home for that. `src/feasibi
 sanctioned exception, for glue that belongs to neither submodule (see above); `demos/` remains
 scratch and shouldn't grow further without being folded into `src/feasibility/` or a submodule.
 `*.txt` and `.claude/` are gitignored here, so `context.txt` is local-only.
+
+## File reading and shell commands
+When reading or inspecting files, prefer the dedicated `Read` tool.
+
+When using shell commands for operations that should be analyzable and auto-approvable, use literal path arguments rather than wrapping the operation inside a quoted `-c` script.
+
+Prefer:
+* `Read` for reading files.
+* `cat path/to/file`
+* `python -m py_compile path/to/file.py`
+* Other shell commands with literal file/path arguments.
+
+Avoid unnecessarily wrapping simple file operations in commands such as:
+* `bash -c "cat path/to/file"`
+* `sh -c "python ..."`
+* `python -c "..."` when a direct command can accomplish the same operation.
+The goal is to keep file operations transparent, directly analyzable, and easy for Claude Code's permission/approval system to recognize.

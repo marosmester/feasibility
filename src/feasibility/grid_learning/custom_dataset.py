@@ -144,11 +144,30 @@ def split_dataset(
     learning/custom_dataset.py's split_dataset. Splitting by ROW (map, wz) rather than by lattice
     cell: a row's whole [G, G] field is one sample, and multiple rows can share a map (different
     wz), so this is a row-level split, not a map-level one -- a val row's map may also appear in
-    train under a different commanded wz."""
+    train under a different commanded wz. See split_dataset_by_map for the split train.py
+    actually uses (ARCHITECTURE.md section 6b: this one leaks)."""
     n_val = max(1, round(len(ds) * val_frac))
     n_train = len(ds) - n_val
     generator = torch.Generator().manual_seed(seed)
     return random_split(ds, [n_train, n_val], generator=generator)
+
+
+def split_dataset_by_map(
+    ds: GridPoseErrorDataset, val_frac: float = 0.2, seed: int = 0
+) -> tuple[Subset, Subset]:
+    """Seeded, reproducible train/val split over `ds`'s MAPS, not rows -- ARCHITECTURE.md section
+    6b. split_dataset's row-level split leaks: with e.g. 100 maps x 10 commands a val row's map
+    almost always also appears in train under a different wz, so that val score measures
+    interpolation-in-wz on memorized terrain rather than transfer to unseen terrain. Here every
+    row of a given map goes to the same side, so a val map is never touched during training."""
+    map_ids = ds.map_index.unique()
+    generator = torch.Generator().manual_seed(seed)
+    perm = torch.randperm(map_ids.shape[0], generator=generator)
+    n_val_maps = max(1, round(map_ids.shape[0] * val_frac))
+    val_maps = set(map_ids[perm[:n_val_maps]].tolist())
+    train_indices = [i for i in range(len(ds)) if int(ds.map_index[i]) not in val_maps]
+    val_indices = [i for i in range(len(ds)) if int(ds.map_index[i]) in val_maps]
+    return Subset(ds, train_indices), Subset(ds, val_indices)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -180,20 +199,26 @@ def make_dataloaders(
     val_frac: float = 0.2,
     seed: int = 0,
     num_workers: int = 0,
+    by_map: bool = False,
     **ds_kwargs: object,
-) -> tuple[DataLoader, DataLoader, GridPoseErrorDataset, Subset]:
-    """Build a GridPoseErrorDataset over `path`, split it row-wise, fit a `wz` Normalizer on the
-    TRAIN rows only, and return (train_loader, val_loader, dataset, train_subset) -- mirrors
+) -> tuple[DataLoader, DataLoader, GridPoseErrorDataset, Subset, Subset]:
+    """Build a GridPoseErrorDataset over `path`, split it, fit a `wz` Normalizer on the TRAIN rows
+    only, and return (train_loader, val_loader, dataset, train_subset, val_subset) -- mirrors
     learning/custom_dataset.py's make_dataloaders. The heightmap is NOT normalized here: it is one
     physical field already in sane units (world-frame z, meters), the same reasoning
     learning/custom_dataset.py's build_input applies to its terrain patch block.
+
+    `by_map=False` (default, preserved for this module's own smoke test below) uses the row-level
+    split_dataset; train.py passes `by_map=True` to get split_dataset_by_map instead -- the one
+    ARCHITECTURE.md section 6b actually calls for.
 
     Batch size defaults low (4, not 32): each sample carries a [G_h, G_h] heightmap (e.g.
     100x100 float32 = 40 KB) plus a [G, G, 2] label field, an order of magnitude heavier per row
     than learning/'s scalar-feature rows.
     """
     ds = GridPoseErrorDataset(path, **ds_kwargs)
-    train_subset, val_subset = split_dataset(ds, val_frac=val_frac, seed=seed)
+    split_fn = split_dataset_by_map if by_map else split_dataset
+    train_subset, val_subset = split_fn(ds, val_frac=val_frac, seed=seed)
 
     ds.wz_normalizer = Normalizer.from_tensor(ds.wz[train_subset.indices].unsqueeze(-1))
 
@@ -203,7 +228,11 @@ def make_dataloaders(
     val_loader = DataLoader(
         val_subset, batch_size=batch_size, shuffle=False, num_workers=num_workers
     )
-    return train_loader, val_loader, ds, train_subset
+    # Both Subsets are returned, not just the train one: a caller needs `train_subset.indices` to
+    # fit train-only statistics (the TargetTransform) and `val_subset.indices` to score baselines
+    # over exactly the held-out rows. Handing back val_subset saves every caller from reaching
+    # into `val_loader.dataset` for it.
+    return train_loader, val_loader, ds, train_subset, val_subset
 
 
 if __name__ == "__main__":
@@ -224,7 +253,7 @@ if __name__ == "__main__":
     assert np.allclose(pos_e, 0.0) and np.allclose(rot_e, 0.0), (pos_e, rot_e)
     print("[self-check] zero-pose pair -> (e_pos, e_rot) = (0, 0) ok")
 
-    train_loader, val_loader, ds, train_subset = make_dataloaders(args.path, batch_size=args.batch_size)
+    train_loader, val_loader, ds, train_subset, _ = make_dataloaders(args.path, batch_size=args.batch_size)
     (heightmap, wz), y, mask = next(iter(train_loader))
     print(
         f"{len(ds)} rows ({len(train_subset)} train), heightmap {tuple(heightmap.shape)}, "

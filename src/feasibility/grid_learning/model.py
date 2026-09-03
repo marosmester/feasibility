@@ -16,7 +16,7 @@ Architecture, one line each (see ARCHITECTURE.md for the why):
       replicate padding, receptive field capped at
       35 px = 3.5 m                                    (section 4b/4c)
     F.grid_sample at spawn_xy, on the 25x25 @ 0.40 m
-      feature map                                      (section 4d)
+      feature map, corrected by readout_offset()       (section 4d)
     2x Conv1x1 head (shared across cells)               (section 4d)
 
 Deliberately independent of feasibility.learning, same non-dependence stance as the rest of this
@@ -78,6 +78,29 @@ def receptive_field(plan: tuple[tuple[int, int], ...] = TRUNK_PLAN, kernel: int 
         rf += (kernel - 1) * jump
         jump *= stride
     return rf
+
+
+def readout_offset(extent: float, n_input: int, n_feat: int) -> float:
+    """World-space offset (m) of the trunk's feature lattice from the map centre, which
+    ARCHITECTURE.md section 4d's "spans world x,y in [-5.0, +5.0]" glosses over and `grid_sample`
+    would otherwise get wrong.
+
+    A stride-2 `padding=1` conv centres output cell k on INPUT cell 2k, so after two of them cell
+    k sits on input cell `S*k` (S = 4). On an even 100-cell input those centres run
+    -4.95 .. +4.65 m, not the -4.8 .. +4.8 m that `align_corners=False` assumes for a 25-cell grid
+    spanning +-5.0 m -- a uniform -0.15 m shift on both axes. Left uncorrected it misregisters
+    terrain against the spawn lattice by 1.5 heightmap pixels, and (worse) breaks section 6a's
+    EXACT mirror symmetry: under a y-flip the shift becomes +0.15 m, so the augmentation would be
+    showing the net two copies of the same map 0.30 m out of register and the mirror-equivariance
+    check could never reach numerical noise.
+
+    Derivation: feature centre k is at world `-extent/2 + res*(S*k + 0.5)`, so the lattice centre
+    (k = (n_feat-1)/2) sits at `res * (1 - S) / 2` away from the origin. The pitch is `res*S`, so
+    the lattice's half-width is still exactly `extent/2` -- only the centre moves, which is why
+    the caller can keep dividing by `extent/2` after subtracting this."""
+    resolution = extent / n_input
+    total_stride = n_input // n_feat
+    return resolution * (1 - total_stride) / 2.0
 
 
 def relief(heightmap: torch.Tensor, wheel_radius: float = WHEEL_RADIUS) -> torch.Tensor:
@@ -223,37 +246,51 @@ class GridPoseErrorNet(nn.Module):
             in_channels = out_channels
         self.blocks = nn.ModuleList(blocks)
 
-        head_width = TRUNK_PLAN[-1][0] * base_width
+        # ARCHITECTURE.md section 4a's per-cell head: Conv1x1 96 -> 64 -> 2. Both widths are
+        # expressed in base_width (3x -> 2x) rather than as a fraction of the trunk's output, so
+        # they scale with the one knob section 4e names and can't silently floor for a TRUNK_PLAN
+        # whose last multiplier isn't divisible by 3.
         self.head = nn.Sequential(
-            nn.Conv2d(head_width, head_width * 2 // 3, kernel_size=1), nn.SiLU(),
-            nn.Conv2d(head_width * 2 // 3, OUT_DIM, kernel_size=1),
+            nn.Conv2d(TRUNK_PLAN[-1][0] * base_width, 2 * base_width, kernel_size=1), nn.SiLU(),
+            nn.Conv2d(2 * base_width, OUT_DIM, kernel_size=1),
         )
 
     def conv_trunk(self, x: torch.Tensor, e: torch.Tensor) -> torch.Tensor:
         """[B, 1, H, W] relief, [B, embed_dim] command embedding -> [B, C, H/4, W/4] feature map.
-        Split out from `encode_terrain` so the receptive-field self-check below can probe the
-        conv stack in isolation, without `relief()`'s median-centering (a single per-sample
-        scalar, not a per-position effect -- see that function's docstring) in the loop."""
+        Split out of `forward` so the receptive-field self-check below can probe the conv stack
+        in isolation, without `relief()`'s median-centering (a single per-sample scalar, not a
+        per-position effect -- see that function's docstring) in the loop."""
         for block in self.blocks:
             x = block(x, e)
         return x
 
-    def encode_terrain(self, heightmap: torch.Tensor, wz: torch.Tensor) -> torch.Tensor:
-        """[B, H, W] absolute heightmap, [B] wz -> [B, C, H/4, W/4] feature map -- preprocessing
-        (section 3) + trunk (section 4c), before the per-cell readout."""
-        e = self.command_mlp(command_features(wz))
-        return self.conv_trunk(relief(heightmap, self.wheel_radius), e)
-
     def forward(
         self, heightmap: torch.Tensor, wz: torch.Tensor, spawn_xy: torch.Tensor,
-        extent: float = DEFAULT_EXTENT,
+        extent: float = DEFAULT_EXTENT, blur_terrain: bool = False,
     ) -> torch.Tensor:
         """heightmap [B, H, W], wz [B], spawn_xy [G, G, 2] (world x, y; shared across the batch)
         -> [B, G, G, 2] in TargetTransform space. `extent` must match the heightmap tensor's own
         (utils.heightmap_to_tensor's `extent` at generation time), so the grid_sample readout
-        queries world coordinates against the right normalization -- see ARCHITECTURE.md 4d."""
-        feat = self.encode_terrain(heightmap, wz)  # [B, C, H', W']
-        grid = (spawn_xy / (extent / 2.0)).unsqueeze(0).expand(feat.shape[0], -1, -1, -1)
+        queries world coordinates against the right normalization -- see ARCHITECTURE.md 4d.
+
+        `blur_terrain` is ARCHITECTURE.md section 7's third baseline: flatten the terrain to a
+        single number per sample, keeping the architecture and the command path intact, so a run
+        with it on measures what the net can do WITHOUT terrain structure. It is applied to the
+        RELIEF, not to the raw heightmap: relief() re-centres each map on its own median, so
+        blurring first would leave exactly zero (verified -- a constant map has zero relief by
+        construction) and would take the "is there a box somewhere at all" scalar down with it,
+        collapsing this baseline into the per-wz mean field rather than sitting above it. Blurring
+        after relief() keeps precisely that scalar -- the map's mean height above background, in
+        wheel radii -- and destroys only WHERE the height is, which is the comparison section 7
+        asks for."""
+        e = self.command_mlp(command_features(wz))
+        x = relief(heightmap, self.wheel_radius)
+        if blur_terrain:
+            x = x.mean(dim=(-2, -1), keepdim=True).expand_as(x)
+        feat = self.conv_trunk(x, e)  # [B, C, H', W']
+
+        offset = readout_offset(extent, heightmap.shape[-1], feat.shape[-1])
+        grid = ((spawn_xy - offset) / (extent / 2.0)).unsqueeze(0).expand(feat.shape[0], -1, -1, -1)
         sampled = F.grid_sample(
             feat, grid, mode="bilinear", padding_mode="border", align_corners=False,
         )  # [B, C, G, G]
@@ -262,7 +299,7 @@ class GridPoseErrorNet(nn.Module):
     @torch.no_grad()
     def predict(
         self, heightmap: torch.Tensor, wz: torch.Tensor, spawn_xy: torch.Tensor,
-        extent: float = DEFAULT_EXTENT,
+        extent: float = DEFAULT_EXTENT, blur_terrain: bool = False,
     ) -> torch.Tensor:
         """Same signature as forward(), returning physical (e_pos m, e_rot rad) instead of model
         space. Inference only -- needs a target_transform, exactly like PoseErrorMLP.predict()."""
@@ -272,7 +309,9 @@ class GridPoseErrorNet(nn.Module):
                 "trained in -- pass one to __init__ or assign .target_transform. Use forward() "
                 "if you want the raw model-space output."
             )
-        return self.target_transform.inverse(self(heightmap, wz, spawn_xy, extent))
+        return self.target_transform.inverse(
+            self(heightmap, wz, spawn_xy, extent, blur_terrain=blur_terrain)
+        )
 
 
 if __name__ == "__main__":
@@ -304,6 +343,19 @@ if __name__ == "__main__":
     assert measured == rf, f"measured RF {measured} px != formula RF {rf} px"
     print(f"[receptive field] autograd probe: {measured} px -- matches formula")
 
+    # --- readout-geometry self-check: readout_offset() must equal where the trunk's feature
+    # cells ACTUALLY sit, probed the same way as the RF above. Feature cell k draws on input
+    # pixels centred at 4k, i.e. world -extent/2 + res*(4k + 0.5); the offset is how far the
+    # lattice centre is from the map centre. --------------------------------------------------
+    n_feat = feat.shape[-1]
+    offset = readout_offset(args.extent, H, n_feat)
+    resolution = args.extent / H
+    probed = -args.extent / 2.0 + resolution * ((nonzero[:, 1].min() + nonzero[:, 1].max()) / 2.0 + 0.5)
+    expected = offset + resolution * (H // n_feat) * (center[1] - (n_feat - 1) / 2.0)
+    assert abs(float(probed) - expected) < 1e-6, (float(probed), expected)
+    print(f"[readout] feature lattice offset: {offset:+.3f} m -- matches autograd probe "
+          f"(cell {center[1]} at {float(probed):+.3f} m)")
+
     # --- flat-ground self-check: relief() of a constant heightmap must be exactly zero ---------
     flat = torch.full((2, H, H), 3.7)  # arbitrary constant elevation, any value should reduce to 0
     assert torch.allclose(relief(flat), torch.zeros(2, 1, H, H)), "flat ground must give zero relief"
@@ -320,6 +372,21 @@ if __name__ == "__main__":
     y_hat = net(heightmap, wz, spawn_xy, extent=args.extent)
     assert y_hat.shape == (B, G, G, OUT_DIM), y_hat.shape
     print(f"[forward] heightmap {tuple(heightmap.shape)}, wz {tuple(wz.shape)} -> y_hat {tuple(y_hat.shape)}")
+
+    # --- blur baseline self-check: blurring the RELIEF must keep the "is there a box" scalar
+    # (ARCHITECTURE.md section 7), where blurring the raw heightmap would zero it out. ----------
+    boxed = torch.zeros(1, H, H)
+    boxed[0, 40:60, 40:60] = 0.7  # one 2 m box on flat ground
+    blurred_relief = relief(boxed).mean(dim=(-2, -1))
+    blurred_input = relief(boxed.mean(dim=(-2, -1), keepdim=True).expand_as(boxed).contiguous())
+    assert blurred_relief.abs().item() > 1e-3, "relief-space blur lost the box-presence scalar"
+    assert blurred_input.abs().max().item() == 0.0, "raw-input blur was expected to zero out"
+    print(f"[blur] relief-space blur keeps box scalar {blurred_relief.item():.4f} wheel radii "
+          f"(blurring the raw heightmap instead gives exactly 0)")
+    assert not torch.allclose(
+        net(heightmap, wz, spawn_xy, extent=args.extent, blur_terrain=True),
+        net(heightmap, wz, spawn_xy, extent=args.extent),
+    ), "blur_terrain=True changed nothing"
 
     y_phys = torch.rand(64, OUT_DIM) * 3.0  # stand-in physical (e_pos, e_rot), non-negative
     transform = TargetTransform.fit(y_phys)
