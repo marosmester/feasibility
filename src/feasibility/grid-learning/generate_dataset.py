@@ -42,10 +42,10 @@ chunk freely mixes lattice cells AND yaw rates, since `setpoints` is per-world [
 CLI parameters (Hydra overrides; `+` prefix required since none exist in the base "helhest"
 config):
     +n_maps=INT        maps drawn (without replacement) from maps_dir  (default: 10)
-    +n_commands=INT    wz draws per map                                (default: 10)
+    +n_commands=INT    wz commands per map, equidistant across WZ_RANGE (default: 10)
     +maps_dir=STR      repo-root-relative or absolute map directory    (default: assets/box_random)
     +map_glob=STR      filename pattern selecting the series in it     (default: box_random_*_h*.png)
-    +seed=INT          RNG seed for map selection and wz draws         (default: 0)
+    +seed=INT          RNG seed for map selection                     (default: 0)
     +duration_s=FLOAT  command hold time                               (default: 2.4)
     +chunk=INT         worlds per ostrich model build                  (default: 128)
     +settle_steps=INT  ostrich settle steps, paid once per chunk       (default: 12)
@@ -148,8 +148,15 @@ OBSTACLE_MARGIN_FRACTION = 0.15  # a footprint point counts as "on an obstacle" 
 # so a wheel resting even a third of the way up one already sits on a near-vertical local slope --
 # ostrich spawning a robot there interpenetrates the mesh and the contact solver diverges.
 
-MAX_ABS_POS = 50.0  # m -- a final pose further than this from the origin on any axis is a
-# diverged solve, not a physical result (the whole map is 10 m across), so mask the cell out
+POS_MARGIN = 3.0  # m -- how far a final pose may legitimately land beyond the terrain's own
+# footprint (x, y) or elevation band (z) before it's treated as a diverged, non-physical solve
+# rather than a real but large collision displacement. Per-map bounds (see plausible_bounds())
+# replace a flat "distance from the origin" cutoff, which -- set loose enough to admit every real
+# result -- was loose enough to also admit genuine explosions: a rear wheel catching a box's ramp
+# mid-turn flung to z=-23 m still read as "valid" under a symmetric +-50 m check on every axis.
+# 3 m covers real cases with room to spare (the worst observed real collision divergence, i.e. the
+# gap between the two sims' final poses on an otherwise-sane trial, was ~7 m -- see the
+# grid-learning viewer's cell (10,12) investigation for the exploded case this replaces).
 
 WHEEL_CONTACTS_LOCAL = np.array(
     [
@@ -225,6 +232,24 @@ def footprint_clear(terrain: HeightMapReader, xy: np.ndarray) -> np.ndarray:
     return heights.max(axis=-1) <= threshold
 
 
+def plausible_bounds(terrain: HeightMapReader) -> np.ndarray:
+    """[3, 2] per-axis (lo, hi) a final pose may plausibly occupy on `terrain`: x/y bounded by the
+    map's own footprint (terrain.x0/y0 + nx/ny*cell -- its REAL extent, not the fixed-resolution
+    tensor `extent` used elsewhere for the CNN input) padded by POS_MARGIN, z bounded by the
+    terrain's own elevation band (min_z, max_z) padded the same way. Grounded in
+    HeightMapReader.sample's documented behavior: querying outside these x/y bounds doesn't raise,
+    it silently clamps to the nearest edge cell and fabricates flat ground -- so a physically real
+    result can never legitimately land far outside them either."""
+    x_lo, x_hi = terrain.x0, terrain.x0 + terrain.nx * terrain.cell
+    y_lo, y_hi = terrain.y0, terrain.y0 + terrain.ny * terrain.cell
+    z_lo, z_hi = terrain.min_z, terrain.max_z
+    return np.array(
+        [[x_lo - POS_MARGIN, x_hi + POS_MARGIN],
+         [y_lo - POS_MARGIN, y_hi + POS_MARGIN],
+         [z_lo - POS_MARGIN, z_hi + POS_MARGIN]]
+    )
+
+
 def simulate_map(
     terrain: HeightMapReader,
     lattice: np.ndarray,
@@ -257,6 +282,7 @@ def simulate_map(
     comparator's HDF5 schema stores would be ~80x this dataset's size for ~22k worlds and are not
     what a divergence-field model consumes."""
     L, G = len(wz_values), lattice.shape[0]
+    bounds = plausible_bounds(terrain)  # [3, 2] (x, y, z) lo/hi -- see plausible_bounds' docstring
 
     cell_i, cell_j = np.nonzero(clear)  # [P] lattice cells actually worth simulating
     n_cells = cell_i.size
@@ -307,8 +333,10 @@ def simulate_map(
 
         both = np.concatenate([o_final, h_final], axis=1)  # [b, 14]
         ok = np.isfinite(both).all(axis=1)
-        ok &= np.abs(o_final[:, :3]).max(axis=1) <= MAX_ABS_POS
-        ok &= np.abs(h_final[:, :3]).max(axis=1) <= MAX_ABS_POS
+        for final in (o_final, h_final):  # both sims' final pose must independently land inside
+            # the terrain's own plausible x/y/z bounds -- see plausible_bounds()
+            ok &= (final[:, :3] >= bounds[:, 0]).all(axis=1)
+            ok &= (final[:, :3] <= bounds[:, 1]).all(axis=1)
 
         sl = slice(start, end)
         y[trial_l[sl], trial_i[sl], trial_j[sl]] = both
@@ -382,11 +410,18 @@ def generate(cfg: DictConfig) -> None:
     extent = float(cfg.get("extent", DEFAULT_EXTENT))
     dry_run = bool(cfg.get("dry_run", False))
 
-    # RNG consumption order is map selection -> per-map wz draws, in map order: a given seed keeps
-    # picking the same maps and the same commands as long as n_maps/n_commands are unchanged.
+    # RNG consumption is map selection only: wz commands are an equidistant grid across WZ_RANGE
+    # (below), not drawn, so `seed` no longer affects them and every map gets the identical
+    # n_commands-length command set -- results stay directly comparable across maps/seeds and a
+    # regeneration at the same n_commands reproduces the same commands even with a different seed.
     rng = np.random.default_rng(seed)
     map_paths = select_maps(maps_dir, n_maps, rng, map_glob)
-    wz_per_map = rng.uniform(*WZ_RANGE, size=(n_maps, n_commands)).astype(np.float32)
+
+    wz_values = np.linspace(*WZ_RANGE, n_commands, dtype=np.float32)  # e.g. n_commands=5 ->
+    # [-1, -0.5, 0, 0.5, 1] -- equidistant coverage of the command range rather than a random
+    # sample of it, so the lattice-of-poses x command-sweep together tile the (position, wz) input
+    # space evenly instead of leaving gaps some regenerations would happen to miss
+    wz_per_map = np.tile(wz_values, (n_maps, 1))
 
     lattice = spawn_lattice()
     G = lattice.shape[0]
@@ -499,12 +534,12 @@ def generate(cfg: DictConfig) -> None:
     n_valid = int(mask.sum())
     n_total = mask.size
     n_diverged = n_total - n_blocked - n_valid  # footprint-clear (simulated) but failed the
-    # finite/MAX_ABS_POS check in simulate_map -- see that function's `ok` computation
+    # finite/plausible-bounds check in simulate_map -- see that function's `ok` computation
     print("=" * 60)
     print(f"[summary]  {n_total} lattice cells across {len(y)} rows ({n_maps} maps x {n_commands} commands)")
     print(f"  valid     {n_valid:>7d}  ({100 * n_valid / n_total:5.1f}%)")
     print(f"  blocked   {n_blocked:>7d}  ({100 * n_blocked / n_total:5.1f}%)  -- obstacle footprint, never simulated")
-    print(f"  diverged  {n_diverged:>7d}  ({100 * n_diverged / n_total:5.1f}%)  -- simulated but failed the finite/MAX_ABS_POS check")
+    print(f"  diverged  {n_diverged:>7d}  ({100 * n_diverged / n_total:5.1f}%)  -- simulated but failed the finite/plausible-bounds check")
     print("=" * 60)
 
 
