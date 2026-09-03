@@ -57,6 +57,28 @@ patterns never collide). Since each map carries only one height, its position's 
 region is sized for THAT height's own ramp width, not the whole series' worst case -- larger and
 less conservative than the default mode's shared-position bound.
 
+--n-boxes puts MORE THAN ONE box on each --batch map, at independently sampled positions. A
+single box occupies only a few percent of a 10x10 m grid, so a dataset whose label is a field
+over the whole map (src/feasibility/grid-learning/) gets most of its cells from open flat ground
+and only a thin ring of cells around the one obstacle where the two simulators actually diverge
+-- measured at ~6% of the map for one box. K boxes multiply that signal roughly K-fold while
+making the map CHEAPER to simulate (cells whose spawn footprint lands on an obstacle are skipped
+outright), so it is close to free. Positions are rejection-sampled to keep a --min-gap clearance
+between obstacle footprints, which buys three things: the boxes stay individually resolvable
+rather than merging into one wall; the summation in build_multi_box is exactly an overlay, since
+no two bump layers are ever nonzero at the same cell (asserted); and the "flat-ish background
+plus a few much-taller obstacles" assumption that height-threshold spawn filters rely on (see
+grid-learning/generate_dataset.py's obstacle_height_threshold, which estimates the background as
+the map's MEDIAN height) keeps holding -- one box plus its ramp is ~3.5% of a 10x10 m grid, so
+the median stays on the ground until obstacles cover half the map, i.e. ~14 boxes.
+
+Multi-box maps are written to box_random_k<K>_i<index>_h<height>cm, still under
+assets/box_random/. The K tag goes BEFORE the index deliberately: the single-box series' natural
+glob, box_random_i*_h*, must not also match multi-box maps, and it would if K were a suffix or
+sat between the index and the height (`i*` happily spans an underscore). K=1 keeps the original
+un-tagged box_random_i<index>_h<height>cm name, so the existing 100-map series regenerates
+byte-identically.
+
 CLI parameters:
     --cell FLOAT          grid resolution in meters (default: 0.05)
     --incline-deg FLOAT   ramp incline angle in degrees, shared by every obstacle height in the
@@ -70,11 +92,16 @@ CLI parameters:
     --n INT                number of maps to generate in --batch mode (default: 100)
     --height FLOAT         obstacle height in meters shared by every map in --batch mode
                            (default: 0.50)
+    --n-boxes INT          boxes per map in --batch mode, each independently placed (default: 1);
+                           K > 1 writes box_random_k<K>_i*_h*cm
+    --min-gap FLOAT        minimum clearance in meters between two boxes' ramp footprints
+                           (default: 1.6); only meaningful with --n-boxes > 1
     --seed INT             RNG seed for the random position(s); ignored with --center
 
 Usage:
     python src/feasibility/heightmap/create_box_obstacles.py                  # random position (default)
     python src/feasibility/heightmap/create_box_obstacles.py --seed 0         # reproducible random position
+    python src/feasibility/heightmap/create_box_obstacles.py --batch --n-boxes 2 --height 0.7
     python src/feasibility/heightmap/create_box_obstacles.py --center         # centered at the origin
     python src/feasibility/heightmap/create_box_obstacles.py --extent 20      # wider grid
     python src/feasibility/heightmap/create_box_obstacles.py --cell 0.01 --incline-deg 60
@@ -122,6 +149,16 @@ RANDOM_ASSETS_DIR = REPO_ROOT / "assets" / "box_random"
 # --- batch mode: N single-height maps, each its own random position -- see module docstring ---
 DEFAULT_BATCH_N = 100
 DEFAULT_BATCH_HEIGHT = 0.50  # m
+DEFAULT_BATCH_N_BOXES = 1  # boxes per map -- knob: --n-boxes, see module docstring
+DEFAULT_MIN_GAP = 1.6  # m, clearance between two boxes' ramp footprints -- knob: --min-gap.
+# Sized off the divergence signal a box actually produces: on the grid-learning spawn lattice the
+# cells whose rollout diverges are those within ~0.8 m of the obstacle, so 2 x 0.8 m keeps two
+# boxes' signal rings from merging into one indistinguishable blob. It is also comfortably more
+# than zero, which is all build_multi_box's no-overlap assertion strictly needs.
+MAX_PLACEMENT_ATTEMPTS = 200  # per box, before restarting the whole map's layout
+MAX_PLACEMENT_RESTARTS = 20  # whole-layout retries before giving up -- a feasible (n_boxes,
+# extent, min_gap) combination succeeds on the first restart essentially always; this only bounds
+# the failure case, which raises with the arithmetic rather than looping forever.
 
 
 def parse_args() -> argparse.Namespace:
@@ -165,6 +202,20 @@ def parse_args() -> argparse.Namespace:
         help=f"obstacle height in meters shared by every map in --batch mode (default: {DEFAULT_BATCH_HEIGHT})",
     )
     parser.add_argument(
+        "--n-boxes",
+        type=int,
+        default=DEFAULT_BATCH_N_BOXES,
+        help=f"boxes per map in --batch mode, each independently placed (default: "
+        f"{DEFAULT_BATCH_N_BOXES}); K > 1 writes box_random_k<K>_i*_h*cm",
+    )
+    parser.add_argument(
+        "--min-gap",
+        type=float,
+        default=DEFAULT_MIN_GAP,
+        help=f"minimum clearance in meters between two boxes' ramp footprints "
+        f"(default: {DEFAULT_MIN_GAP}); only meaningful with --n-boxes > 1",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=None,
@@ -173,6 +224,12 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.batch and args.center:
         parser.error("--batch and --center are mutually exclusive")
+    if args.n_boxes < 1:
+        parser.error("--n-boxes must be >= 1")
+    if args.n_boxes > 1 and not args.batch:
+        parser.error("--n-boxes > 1 only applies to --batch mode")
+    if args.min_gap < 0.0:
+        parser.error("--min-gap must be >= 0")
     return args
 
 
@@ -217,11 +274,17 @@ BATCH_INDEX_WIDTH = 4  # zero-padding width for --batch indices -- fixed (not n-
 # filenames sort consistently regardless of which --n a given batch used, up to 9999 maps.
 
 
-def random_batch_path(index: int, height: float) -> pathlib.Path:
-    """assets/box_random/box_random_i<index, zero-padded to BATCH_INDEX_WIDTH>_h<height, cm, no
-    dot> -- index-prefixed so --batch's per-map files never collide with random_box_path()'s
-    single shared-position series in the same directory."""
-    return RANDOM_ASSETS_DIR / f"box_random_i{index:0{BATCH_INDEX_WIDTH}d}_h{round(height * 100):03d}cm"
+def random_batch_path(index: int, height: float, n_boxes: int = 1) -> pathlib.Path:
+    """assets/box_random/box_random_[k<n_boxes>_]i<index, zero-padded to BATCH_INDEX_WIDTH>_h<
+    height, cm, no dot> -- index-prefixed so --batch's per-map files never collide with
+    random_box_path()'s single shared-position series in the same directory.
+
+    The k<K> tag appears only for K > 1, and BEFORE the index: K=1 then keeps the original name
+    (so the existing single-box series regenerates byte-identically), and the single-box glob
+    box_random_i*_h* cannot match a multi-box map -- which it would if the tag came after the
+    index, since `i*` spans underscores too. See the module docstring."""
+    tag = "" if n_boxes <= 1 else f"k{n_boxes}_"
+    return RANDOM_ASSETS_DIR / f"box_random_{tag}i{index:0{BATCH_INDEX_WIDTH}d}_h{round(height * 100):03d}cm"
 
 
 def build_box_obstacle(
@@ -268,6 +331,37 @@ def build_centered_box(
     return build_box_obstacle(height, cell, incline_deg, xlim=(-half, half), ylim=(-half, half), cx=cx, cy=cy)
 
 
+def build_multi_box(
+    height: float,
+    cell: float,
+    incline_deg: float,
+    extent: float,
+    centers: list[tuple[float, float]],
+) -> HeightMapReader:
+    """build_centered_box summed over one layer per (cx, cy) in `centers`. Addition is exactly an
+    overlay here, not a blend: each layer is a RELATIVE bump field -- zero outside its own
+    footprint+ramp, rising to `height` only inside it -- and sample_random_centers() guarantees a
+    positive gap between footprints, so no two layers are ever nonzero at the same cell. The
+    assertion below is what actually holds that guarantee: if a caller ever passes centers closer
+    together than that, overlapping ramps would sum into a spurious taller-than-`height` tower
+    instead of merging, and this fails loudly rather than writing a quietly wrong asset.
+
+    A single center reproduces build_centered_box exactly, so callers need not special-case K=1.
+    """
+    if not centers:
+        raise ValueError("centers must hold at least one (cx, cy)")
+    layers = [build_centered_box(height, cell, incline_deg, extent, cx=cx, cy=cy) for cx, cy in centers]
+    H = np.sum([layer.H for layer in layers], axis=0)
+    assert H.max() <= height + 1e-9, (
+        f"overlapping box footprints: summed elevation reached {H.max():.4f} m against a box "
+        f"height of {height:.4f} m -- centers {centers} are too close together"
+    )
+    # min_z/max_z pinned to the series' own range rather than derived from H, so every map in a
+    # batch shares one quantization scale on save() regardless of how many boxes it happens to
+    # carry (see HeightMapReader.save: the png is normalized by max_z - min_z).
+    return HeightMapReader(H, origin=(layers[0].x0, layers[0].y0), cell=cell, min_z=0.0, max_z=height)
+
+
 def max_ramp_width(height: float, incline_deg: float) -> float:
     """Ramp width at `height` -- the footprint inflation an obstacle of this height needs on
     every side before reaching ground level (ramp_width = height / tan(incline), see module
@@ -292,33 +386,83 @@ def sample_random_center(
     return rng.uniform(-bound, bound), rng.uniform(-bound, bound)
 
 
+def sample_random_centers(
+    n_boxes: int,
+    extent: float,
+    incline_deg: float,
+    rng: np.random.Generator,
+    max_height: float = max(BOX_HEIGHTS),
+    min_gap: float = DEFAULT_MIN_GAP,
+) -> list[tuple[float, float]]:
+    """`n_boxes` footprint centers, each within sample_random_center()'s bounds and pairwise
+    separated so at least `min_gap` m of untouched ground lies between any two boxes' ramp
+    footprints.
+
+    Separation is measured in the CHEBYSHEV metric, not Euclidean, because the footprints are
+    axis-aligned squares: two squares of half-extent `BOX_SIZE/2 + ramp` are disjoint with a
+    `min_gap` margin exactly when max(|dx|, |dy|) >= BOX_SIZE + 2*ramp + min_gap. Using the
+    Euclidean distance instead would wrongly accept a diagonal pair whose corners overlap.
+
+    n_boxes=1 consumes the RNG identically to sample_random_center (two scalar uniform draws in
+    x, y order), so a batch generated with --n-boxes 1 reproduces the original series exactly.
+    """
+    if n_boxes < 1:
+        raise ValueError(f"n_boxes must be >= 1, got {n_boxes}")
+    ramp = max_ramp_width(max_height, incline_deg)
+    min_sep = BOX_SIZE + 2.0 * ramp + min_gap
+    for _ in range(MAX_PLACEMENT_RESTARTS):
+        centers: list[tuple[float, float]] = []
+        for _ in range(n_boxes):
+            for _ in range(MAX_PLACEMENT_ATTEMPTS):
+                c = sample_random_center(extent, incline_deg, rng, max_height=max_height)
+                if all(max(abs(c[0] - p[0]), abs(c[1] - p[1])) >= min_sep for p in centers):
+                    centers.append(c)
+                    break
+            else:
+                break  # this box never found a spot -- restart the whole layout
+        if len(centers) == n_boxes:
+            return centers
+    bound = extent / 2.0 - BOX_SIZE / 2.0 - ramp
+    raise ValueError(
+        f"could not place {n_boxes} boxes with a {min_gap} m gap on a {extent} m grid: centers "
+        f"are confined to a {2 * bound:.3f} m square and must sit {min_sep:.3f} m apart "
+        f"(Chebyshev). Lower --n-boxes or --min-gap, or raise --extent."
+    )
+
+
 def main() -> None:
     args = parse_args()
 
-    # (label, height, cx, cy, path) per mode -- one shared build+save+print loop below.
-    tasks: list[tuple[str, float, float, float, pathlib.Path]]
+    # (label, height, centers, path) per mode -- one shared build+save+print loop below. `centers`
+    # is a list even in the single-box modes, so build_multi_box covers every mode uniformly (with
+    # one center it reproduces build_centered_box exactly).
+    tasks: list[tuple[str, float, list[tuple[float, float]], pathlib.Path]]
     if args.batch:
         RANDOM_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
         rng = np.random.default_rng(args.seed)
         tasks = []
         for i in range(args.n):
-            cx, cy = sample_random_center(args.extent, args.incline_deg, rng, max_height=args.height)
-            tasks.append((f"random (x={cx:.3f}, y={cy:.3f})", args.height, cx, cy, random_batch_path(i, args.height)))
+            centers = sample_random_centers(
+                args.n_boxes, args.extent, args.incline_deg, rng,
+                max_height=args.height, min_gap=args.min_gap,
+            )
+            label = "random " + " ".join(f"(x={cx:.3f}, y={cy:.3f})" for cx, cy in centers)
+            tasks.append((label, args.height, centers, random_batch_path(i, args.height, args.n_boxes)))
     elif args.center:
         CENTERED_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
-        tasks = [("centered", h, CENTERED_CX, CENTERED_CY, path) for h, path in centered_box_paths()]
+        tasks = [("centered", h, [(CENTERED_CX, CENTERED_CY)], path) for h, path in centered_box_paths()]
     else:
         RANDOM_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
         rng = np.random.default_rng(args.seed)
         cx, cy = sample_random_center(args.extent, args.incline_deg, rng)
         label = f"random (x={cx:.3f}, y={cy:.3f})"
-        tasks = [(label, h, cx, cy, path) for h, path in random_box_paths()]
+        tasks = [(label, h, [(cx, cy)], path) for h, path in random_box_paths()]
 
-    for label, height, cx, cy, path in tasks:
-        build_centered_box(height, args.cell, args.incline_deg, args.extent, cx=cx, cy=cy).save(path)
+    for label, height, centers, path in tasks:
+        build_multi_box(height, args.cell, args.incline_deg, args.extent, centers).save(path)
         print(
             f"saved {path}.png / {path}.yaml  "
-            f"({label} box height {height:.2f} m, extent {args.extent:.1f} m, "
+            f"({label} {len(centers)} box(es) height {height:.2f} m, extent {args.extent:.1f} m, "
             f"cell {args.cell} m, incline {args.incline_deg:.1f} deg)"
         )
 
