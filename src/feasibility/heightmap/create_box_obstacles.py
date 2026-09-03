@@ -59,7 +59,7 @@ less conservative than the default mode's shared-position bound.
 
 --n-boxes puts MORE THAN ONE box on each --batch map, at independently sampled positions. A
 single box occupies only a few percent of a 10x10 m grid, so a dataset whose label is a field
-over the whole map (src/feasibility/grid-learning/) gets most of its cells from open flat ground
+over the whole map (src/feasibility/grid_learning/) gets most of its cells from open flat ground
 and only a thin ring of cells around the one obstacle where the two simulators actually diverge
 -- measured at ~6% of the map for one box. K boxes multiply that signal roughly K-fold while
 making the map CHEAPER to simulate (cells whose spawn footprint lands on an obstacle are skipped
@@ -68,7 +68,7 @@ between obstacle footprints, which buys three things: the boxes stay individuall
 rather than merging into one wall; the summation in build_multi_box is exactly an overlay, since
 no two bump layers are ever nonzero at the same cell (asserted); and the "flat-ish background
 plus a few much-taller obstacles" assumption that height-threshold spawn filters rely on (see
-grid-learning/generate_dataset.py's obstacle_height_threshold, which estimates the background as
+grid_learning/generate_dataset.py's obstacle_height_threshold, which estimates the background as
 the map's MEDIAN height) keeps holding -- one box plus its ramp is ~3.5% of a 10x10 m grid, so
 the median stays on the ground until obstacles cover half the map, i.e. ~14 boxes.
 
@@ -151,7 +151,7 @@ DEFAULT_BATCH_N = 100
 DEFAULT_BATCH_HEIGHT = 0.50  # m
 DEFAULT_BATCH_N_BOXES = 1  # boxes per map -- knob: --n-boxes, see module docstring
 DEFAULT_MIN_GAP = 1.6  # m, clearance between two boxes' ramp footprints -- knob: --min-gap.
-# Sized off the divergence signal a box actually produces: on the grid-learning spawn lattice the
+# Sized off the divergence signal a box actually produces: on the grid_learning spawn lattice the
 # cells whose rollout diverges are those within ~0.8 m of the obstacle, so 2 x 0.8 m keeps two
 # boxes' signal rings from merging into one indistinguishable blob. It is also comfortably more
 # than zero, which is all build_multi_box's no-overlap assertion strictly needs.

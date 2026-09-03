@@ -59,15 +59,14 @@ config):
     (engine=mujoco, simulation=..., logging=...); rendering is forced headless.
 
 Usage:
-    python src/feasibility/grid-learning/generate_dataset.py +dry_run=true   # cheap CPU-only check
-    python src/feasibility/grid-learning/generate_dataset.py +n_maps=1 +n_commands=1
-    python src/feasibility/grid-learning/generate_dataset.py                 # M=10, L=10
-    python src/feasibility/grid-learning/generate_dataset.py +chunk=64       # if the GPU OOMs
+    python src/feasibility/grid_learning/generate_dataset.py +dry_run=true   # cheap CPU-only check
+    python src/feasibility/grid_learning/generate_dataset.py +n_maps=1 +n_commands=1
+    python src/feasibility/grid_learning/generate_dataset.py                 # M=10, L=10
+    python src/feasibility/grid_learning/generate_dataset.py +chunk=64       # if the GPU OOMs
 """
 from __future__ import annotations
 
 import pathlib
-import sys
 import time
 
 import h5py
@@ -91,17 +90,10 @@ from feasibility.comparator.common import run_hstack_batch
 from feasibility.comparator.common import run_ostrich_batch
 from feasibility.comparator.provenance import git_provenance
 from feasibility.comparator.provenance import terrain_fields
+from feasibility.grid_learning.utils import DEFAULT_EXTENT
+from feasibility.grid_learning.utils import DEFAULT_RESOLUTION
+from feasibility.grid_learning.utils import heightmap_to_tensor
 from feasibility.heightmap import HeightMapReader
-
-# utils.py is a sibling in a HYPHENATED directory, which is therefore not an importable package
-# (`import feasibility.grid_learning` is invalid syntax -- see the root CLAUDE.md). Running this
-# file as a script already puts its own directory at sys.path[0], and Hydra changes the working
-# directory rather than sys.path, so the plain `from utils import ...` below resolves; the insert
-# is belt-and-braces for any other invocation path.
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from utils import DEFAULT_EXTENT  # noqa: E402
-from utils import DEFAULT_RESOLUTION  # noqa: E402
-from utils import heightmap_to_tensor  # noqa: E402
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 
@@ -156,7 +148,7 @@ POS_MARGIN = 3.0  # m -- how far a final pose may legitimately land beyond the t
 # mid-turn flung to z=-23 m still read as "valid" under a symmetric +-50 m check on every axis.
 # 3 m covers real cases with room to spare (the worst observed real collision divergence, i.e. the
 # gap between the two sims' final poses on an otherwise-sane trial, was ~7 m -- see the
-# grid-learning viewer's cell (10,12) investigation for the exploded case this replaces).
+# grid_learning viewer's cell (10,12) investigation for the exploded case this replaces).
 
 WHEEL_CONTACTS_LOCAL = np.array(
     [

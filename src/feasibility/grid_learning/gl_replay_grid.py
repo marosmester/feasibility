@@ -1,4 +1,4 @@
-"""GL viewer for a grid-learning dataset_grid_*.h5 (generate_dataset.py's output): steps through
+"""GL viewer for a grid_learning dataset_grid_*.h5 (generate_dataset.py's output): steps through
 the sampled trials of one (map, commanded wz) row, showing each lattice cell's ostrich/hstack
 FINAL poses on the real terrain, for manual sanity-checking before the dataset is fed to a
 network -- does the spawn lattice line up with the obstacle(s), are masked cells the ones
@@ -18,7 +18,7 @@ body=-1, same static-world pattern the ground mesh itself uses), three-way color
 mask=True (valid solve), gray = never simulated (spawn footprint on an obstacle, recomputed
 locally via footprint_clear() -- same math as generate_dataset.py's own obstacle filter, copied
 rather than imported so this stays a standalone script, see that module's docstring on why
-grid-learning/ re-derives rather than shares), red = was footprint-clear but mask is False anyway
+grid_learning/ re-derives rather than shares), red = was footprint-clear but mask is False anyway
 -- a diverged solve, the case actually worth flagging. The currently-shown cell's sphere is
 recolored white as a highlight. pos_error/rot_error (T_err = T1^-1 @ T2 convention) are the same
 formula learning/pose_error.py uses, reimplemented locally for the same independence reason, so
@@ -40,11 +40,11 @@ CLI parameters:
                             generate_dataset.py's own +dry_run convention
 
 Usage:
-    python src/feasibility/grid-learning/gl_replay_grid.py --file outputs/dataset_grid_box_random_M2_L5_g15.h5 --dry-run
-    python src/feasibility/grid-learning/gl_replay_grid.py --file outputs/dataset_grid_box_random_M2_L5_g15.h5
-    python src/feasibility/grid-learning/gl_replay_grid.py --file outputs/dataset_grid_box_random_M2_L5_g15.h5 --map-index 1 --command-index 2
-    python src/feasibility/grid-learning/gl_replay_grid.py --file outputs/dataset_grid_box_random_M2_L5_g15.h5 --cell 7 7 --which ostrich
-    python src/feasibility/grid-learning/gl_replay_grid.py --file outputs/dataset_grid_box_random_M2_L5_g15.h5 --show-masked --loop --dwell 0.5
+    python src/feasibility/grid_learning/gl_replay_grid.py --file outputs/dataset_grid_box_random_M2_L5_g15.h5 --dry-run
+    python src/feasibility/grid_learning/gl_replay_grid.py --file outputs/dataset_grid_box_random_M2_L5_g15.h5
+    python src/feasibility/grid_learning/gl_replay_grid.py --file outputs/dataset_grid_box_random_M2_L5_g15.h5 --map-index 1 --command-index 2
+    python src/feasibility/grid_learning/gl_replay_grid.py --file outputs/dataset_grid_box_random_M2_L5_g15.h5 --cell 7 7 --which ostrich
+    python src/feasibility/grid_learning/gl_replay_grid.py --file outputs/dataset_grid_box_random_M2_L5_g15.h5 --show-masked --loop --dwell 0.5
 """
 from __future__ import annotations
 

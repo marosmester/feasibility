@@ -20,7 +20,7 @@ CLI parameters:
     --extent          square extent to sample in meters (default: 10.0)
 
 Usage:
-    python src/feasibility/grid-learning/utils.py assets/box_random/box_random_i0000_h070cm
+    python src/feasibility/grid_learning/utils.py assets/box_random/box_random_i0000_h070cm
 """
 from __future__ import annotations
 
