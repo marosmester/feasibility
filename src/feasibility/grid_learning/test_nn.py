@@ -15,7 +15,7 @@ cannot represent) is the entire reason this dataset exists.
 Held-out maps: there is no repo convention of a literal "validation/" directory -- a folder like
 `assets/box_random/1/` is just another indexed batch. By default this script instead reads the
 checkpoint's own self-described `dataset_path` (see train.build_checkpoint) and excludes any map
-that file was trained on from the candidates drawn out of `+maps_dir`/`+map_glob`, so an eval run
+that file was trained on from the candidates drawn out of `+maps_dir`, so an eval run
 against the SAME folder used for training still measures generalization rather than memorization.
 `+exclude_training_maps=false` disables this. If the training dataset file no longer exists on
 disk, a warning is printed and every selected map is evaluated instead of failing outright -- the
@@ -37,7 +37,6 @@ engine_config/logging_config via hydra.utils.instantiate):
     +n_maps=INT                  maps drawn (without replacement) for evaluation (default: 5)
     +n_commands=INT               wz commands per map, equidistant across WZ_RANGE (default: 5)
     +maps_dir=STR                 repo-root-relative or absolute map directory (default: assets/box_random)
-    +map_glob=STR                  filename pattern selecting the series in it (default: box_random_*_h*.png)
     +seed=INT                      RNG seed for map selection (default: 0)
     +exclude_training_maps=BOOL    drop maps the checkpoint was trained on, if that dataset file
                                     is still reachable (default: true)
@@ -47,7 +46,8 @@ engine_config/logging_config via hydra.utils.instantiate):
     +settle_steps=INT              ostrich settle steps, paid once per chunk (default: 12)
     +mu=FLOAT                      ground friction (default: 0.8)
     +k_turn=FLOAT                  hstack ICR turning-rate gain (default: dynamics.K_TURN)
-    +device=STR                    torch/warp device, used for both the network and hstack (default: "cuda:0")
+    +device=STR                    torch/warp device for the network, hstack, AND ostrich (via
+                                    init_warp_device) (default: "cuda:0")
     +save_fig=STR                  save the comparison figure here instead of showing it interactively
     +dry_run=BOOL                  lattice/checkpoint self-checks only -- no simulation (default: false)
     Also accepts any standard Hydra config-group override against the "helhest" base config
@@ -68,7 +68,6 @@ import hydra
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import warp as wp
 from helhest import dynamics
 from omegaconf import DictConfig
 from ostrich import EngineConfig
@@ -77,15 +76,16 @@ from ostrich import RenderingConfig
 from ostrich import SimulationConfig
 
 from feasibility.comparator.common import CONFIG_PATH
+from feasibility.comparator.common import init_warp_device
 from feasibility.grid_learning.custom_dataset import poses_to_se3
 from feasibility.grid_learning.custom_dataset import se3_errors
 from feasibility.grid_learning.custom_dataset import TARGET_NAMES
 from feasibility.grid_learning.generate_dataset import DEFAULT_CHUNK
 from feasibility.grid_learning.generate_dataset import DEFAULT_DURATION_S
-from feasibility.grid_learning.generate_dataset import DEFAULT_MAP_GLOB
 from feasibility.grid_learning.generate_dataset import DEFAULT_MAPS_DIR
 from feasibility.grid_learning.generate_dataset import DEFAULT_SETTLE_STEPS
 from feasibility.grid_learning.generate_dataset import footprint_clear
+from feasibility.grid_learning.generate_dataset import MAP_GLOB
 from feasibility.grid_learning.generate_dataset import obstacle_height_threshold
 from feasibility.grid_learning.generate_dataset import resolve_path
 from feasibility.grid_learning.generate_dataset import simulate_map
@@ -165,15 +165,14 @@ def select_eval_maps(
     maps_dir: pathlib.Path,
     n_maps: int,
     rng: np.random.Generator,
-    glob: str,
     exclude: set[str],
 ) -> list[pathlib.Path]:
-    """`n_maps` extension-less heightmap stems drawn without replacement from `maps_dir`'s `glob`
-    series, after dropping any stem in `exclude` (the checkpoint's own training maps, see
+    """`n_maps` extension-less heightmap stems drawn without replacement from every PNG directly
+    in `maps_dir`, after dropping any stem in `exclude` (the checkpoint's own training maps, see
     resolve_training_context) -- same sorted-candidates-then-seeded-draw recipe as
     generate_dataset.select_maps, restated here since it also needs the exclusion step that
     function doesn't have."""
-    candidates = sorted(p.with_suffix("") for p in maps_dir.glob(glob))
+    candidates = sorted(p.with_suffix("") for p in maps_dir.glob(MAP_GLOB))
     if exclude:
         before = len(candidates)
         candidates = [p for p in candidates if str(p) not in exclude]
@@ -181,8 +180,8 @@ def select_eval_maps(
             print(f"[maps]     excluded {before - len(candidates)} map(s) already used to train this checkpoint")
     if len(candidates) < n_maps:
         raise ValueError(
-            f"{maps_dir} holds {len(candidates)} eligible map(s) matching {glob} (after training-"
-            f"map exclusion), need {n_maps}. Lower +n_maps, point +maps_dir elsewhere, or pass "
+            f"{maps_dir} holds {len(candidates)} eligible map(s) (after training-map exclusion), "
+            f"need {n_maps}. Lower +n_maps, point +maps_dir elsewhere, or pass "
             f"+exclude_training_maps=false."
         )
     return [candidates[i] for i in rng.choice(len(candidates), size=n_maps, replace=False)]
@@ -339,7 +338,6 @@ def evaluate(cfg: DictConfig) -> None:
     n_commands = int(cfg.get("n_commands", DEFAULT_N_COMMANDS))
     seed = int(cfg.get("seed", DEFAULT_SEED))
     maps_dir = resolve_path(str(cfg.get("maps_dir", DEFAULT_MAPS_DIR)))
-    map_glob = str(cfg.get("map_glob", DEFAULT_MAP_GLOB))
     exclude_training_maps = bool(cfg.get("exclude_training_maps", True))
     near_obstacle_radius = float(cfg.get("near_obstacle_radius", NEAR_OBSTACLE_RADIUS))
     duration_s = float(cfg.get("duration_s", DEFAULT_DURATION_S))
@@ -375,7 +373,7 @@ def evaluate(cfg: DictConfig) -> None:
     resolution, train_maps = resolve_training_context(ckpt)
     rng = np.random.default_rng(seed)
     map_paths = select_eval_maps(
-        maps_dir, n_maps, rng, map_glob, train_maps if exclude_training_maps else set()
+        maps_dir, n_maps, rng, train_maps if exclude_training_maps else set()
     )
     wz_values = np.linspace(*WZ_RANGE, n_commands, dtype=np.float32)
     print(f"[maps]     {n_maps} from {maps_dir}, {n_commands} wz command(s) each")
@@ -393,7 +391,8 @@ def evaluate(cfg: DictConfig) -> None:
         print("[dry-run]  lattice/checkpoint/near-obstacle self-checks ok, nothing simulated")
         return
 
-    wp.init()
+    init_warp_device(device_str)  # pins ostrich onto the same GPU `device` puts hstack/the model
+    # on -- ostrich has no device config field of its own, see init_warp_device's docstring
     sim_config: SimulationConfig = hydra.utils.instantiate(cfg.simulation)
     render_config: RenderingConfig = hydra.utils.instantiate(cfg.rendering)
     engine_config: EngineConfig = hydra.utils.instantiate(cfg.engine)

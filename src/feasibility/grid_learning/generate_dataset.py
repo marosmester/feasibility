@@ -44,14 +44,13 @@ config):
     +n_maps=INT        maps drawn (without replacement) from maps_dir  (default: 10)
     +n_commands=INT    wz commands per map, equidistant across WZ_RANGE (default: 10)
     +maps_dir=STR      repo-root-relative or absolute map directory    (default: assets/box_random)
-    +map_glob=STR      filename pattern selecting the series in it     (default: box_random_*_h*.png)
     +seed=INT          RNG seed for map selection                     (default: 0)
     +duration_s=FLOAT  command hold time                               (default: 2.4)
     +chunk=INT         worlds per ostrich model build                  (default: 128)
     +settle_steps=INT  ostrich settle steps, paid once per chunk       (default: 12)
     +mu=FLOAT          ground friction                                 (default: 0.8)
     +k_turn=FLOAT      hstack ICR turning-rate gain                    (default: dynamics.K_TURN)
-    +device=STR        helhest_stack torch/warp device                 (default: "cuda:0")
+    +device=STR        torch/warp device for BOTH sims (via init_warp_device) (default: "cuda:0")
     +resolution=FLOAT  heightmap tensor cell size, m                   (default: 0.10)
     +extent=FLOAT      heightmap tensor extent, m                      (default: 10.0)
     +dry_run=BOOL      lattice/filter/count only -- no simulation, no output file (default: false)
@@ -72,7 +71,6 @@ import time
 import h5py
 import hydra
 import numpy as np
-import warp as wp
 from examples.helhest_junior.common import HelhestJuniorConfig
 from helhest import dynamics
 from omegaconf import DictConfig
@@ -84,6 +82,7 @@ from ostrich import SimulationConfig
 from feasibility.comparator.common import build_setpoints
 from feasibility.comparator.common import CONFIG_PATH
 from feasibility.comparator.common import euler_zyx_to_quat_xyzw
+from feasibility.comparator.common import init_warp_device
 from feasibility.comparator.common import K_P
 from feasibility.comparator.common import OUT_DIR
 from feasibility.comparator.common import run_hstack_batch
@@ -123,14 +122,9 @@ DEFAULT_SETTLE_STEPS = 12  # ostrich steps spent dropping the robot onto the ter
 # chassis is measurably at rest by step 7, so 12 is that with ~1.7x margin).
 
 DEFAULT_MAPS_DIR = "assets/box_random"
-DEFAULT_MAP_GLOB = "box_random_*_h*.png"  # the --batch series create_box_obstacles.py writes: N
-# maps at one height, each with its own independently-sampled box position(s) -- both the K=1
-# form (box_random_i<index>_h<height>cm) and the --n-boxes K>1 form
-# (box_random_k<K>_i<index>_h<height>cm), since nothing downstream cares how many obstacles a map
-# has or where they are (see footprint_clear), only that every map in one run shares a grid shape.
-# The `_h*` requirement still excludes the single shared-position height series in the same
-# directory (box_random_h<height>cm, no index -- one position reused across the whole height
-# sweep, not N independent maps). Override with `+map_glob=` for any other series.
+MAP_GLOB = "*.png"  # every heightmap PNG in maps_dir is a candidate; nothing downstream cares
+# how many obstacles a map has or where they are (see footprint_clear), only that every map in
+# one run shares a grid shape, so no naming-pattern filter is needed -- just enough of them.
 
 OBSTACLE_MARGIN_FRACTION = 0.15  # a footprint point counts as "on an obstacle" once its height
 # clears this fraction of the way from the terrain's median height (background, assumed to cover
@@ -173,15 +167,15 @@ def resolve_path(arg: str) -> pathlib.Path:
 
 
 def select_maps(
-    maps_dir: pathlib.Path, n_maps: int, rng: np.random.Generator, glob: str = DEFAULT_MAP_GLOB
+    maps_dir: pathlib.Path, n_maps: int, rng: np.random.Generator
 ) -> list[pathlib.Path]:
-    """`n_maps` extension-less heightmap stems drawn WITHOUT replacement from `maps_dir`'s `glob`
-    series. The candidate list is sorted before drawing so a given seed always picks the same maps
-    regardless of filesystem ordering."""
-    candidates = sorted(p.with_suffix("") for p in maps_dir.glob(glob))
+    """`n_maps` extension-less heightmap stems drawn WITHOUT replacement from every PNG directly
+    in `maps_dir`. The candidate list is sorted before drawing so a given seed always picks the
+    same maps regardless of filesystem ordering."""
+    candidates = sorted(p.with_suffix("") for p in maps_dir.glob(MAP_GLOB))
     if len(candidates) < n_maps:
         raise ValueError(
-            f"{maps_dir} holds {len(candidates)} map(s) matching {glob}, need {n_maps}. "
+            f"{maps_dir} holds {len(candidates)} map(s), need {n_maps}. "
             f"Generate more with: python src/feasibility/heightmap/create_box_obstacles.py "
             f"--batch --n {n_maps}"
         )
@@ -391,7 +385,6 @@ def generate(cfg: DictConfig) -> None:
     n_commands = int(cfg.get("n_commands", DEFAULT_N_COMMANDS))
     seed = int(cfg.get("seed", DEFAULT_SEED))
     maps_dir = resolve_path(str(cfg.get("maps_dir", DEFAULT_MAPS_DIR)))
-    map_glob = str(cfg.get("map_glob", DEFAULT_MAP_GLOB))
     duration_s = float(cfg.get("duration_s", DEFAULT_DURATION_S))
     chunk = int(cfg.get("chunk", DEFAULT_CHUNK))
     settle_steps = int(cfg.get("settle_steps", DEFAULT_SETTLE_STEPS))
@@ -407,7 +400,7 @@ def generate(cfg: DictConfig) -> None:
     # n_commands-length command set -- results stay directly comparable across maps/seeds and a
     # regeneration at the same n_commands reproduces the same commands even with a different seed.
     rng = np.random.default_rng(seed)
-    map_paths = select_maps(maps_dir, n_maps, rng, map_glob)
+    map_paths = select_maps(maps_dir, n_maps, rng)
 
     wz_values = np.linspace(*WZ_RANGE, n_commands, dtype=np.float32)  # e.g. n_commands=5 ->
     # [-1, -0.5, 0, 0.5, 1] -- equidistant coverage of the command range rather than a random
@@ -446,7 +439,8 @@ def generate(cfg: DictConfig) -> None:
         print("[dry-run]  lattice/heightmap convention + filter self-checks ok, nothing simulated")
         return
 
-    wp.init()
+    init_warp_device(device)  # pins ostrich onto the same GPU `device` puts hstack on -- ostrich
+    # has no device config field of its own, see init_warp_device's docstring
 
     sim_config: SimulationConfig = hydra.utils.instantiate(cfg.simulation)
     render_config: RenderingConfig = hydra.utils.instantiate(cfg.rendering)

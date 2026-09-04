@@ -35,6 +35,14 @@ CLI parameters:
     --dwell FLOAT            seconds spent on each cell before advancing (default: 1.5)
     --loop                  wrap back to the first cell instead of freezing on the last
     --show-masked            also step through mask=False cells (default: skip them)
+    --nn-checkpoint PATH      trained model.GridPoseErrorNet checkpoint (train.py's
+                            build_checkpoint) -- when given, runs inference once for this row's
+                            whole [G, G] lattice (heightmap + wz straight from --file) and, for
+                            every cell shown, prints the network's PREDICTED (e_pos, e_rot)
+                            alongside the REAL value custom_dataset.py's own se3_errors formula
+                            already computes here for the on-screen status line
+    --device STR              torch device for --nn-checkpoint inference (default: cuda if
+                            available else cpu)
     --dry-run                load + validate the row and print summary stats, no GL viewer --
                             the only piece of this script testable without a display, mirroring
                             generate_dataset.py's own +dry_run convention
@@ -45,6 +53,7 @@ Usage:
     python src/feasibility/grid_learning/gl_replay_grid.py --file outputs/dataset_grid_box_random_M2_L5_g15.h5 --map-index 1 --command-index 2
     python src/feasibility/grid_learning/gl_replay_grid.py --file outputs/dataset_grid_box_random_M2_L5_g15.h5 --cell 7 7 --which ostrich
     python src/feasibility/grid_learning/gl_replay_grid.py --file outputs/dataset_grid_box_random_M2_L5_g15.h5 --show-masked --loop --dwell 0.5
+    python src/feasibility/grid_learning/gl_replay_grid.py --file outputs/dataset_grid_box_random_M2_L5_g15.h5 --nn-checkpoint outputs/checkpoints/dataset_grid_box_random_M2_L5_g15.pt
 """
 from __future__ import annotations
 
@@ -55,12 +64,14 @@ import time
 import h5py
 import newton
 import numpy as np
+import torch
 import warp as wp
 from examples.helhest_junior.common import create_helhest_junior_model
 from examples.helhest_junior.common import HelhestJuniorConfig
 from ostrich.core.model_builder import OstrichModelBuilder
 
 from feasibility.comparator.provenance import terrain_from_h5
+from feasibility.grid_learning.train import load_checkpoint
 from feasibility.heightmap import HeightMapReader
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
@@ -245,6 +256,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--dwell", type=float, default=1.5, help="seconds per cell (default: 1.5)")
     ap.add_argument("--loop", action="store_true", help="wrap to the first cell instead of freezing on the last")
     ap.add_argument("--show-masked", action="store_true", help="also step through mask=False cells")
+    ap.add_argument("--nn-checkpoint", type=pathlib.Path, default=None,
+                     help="trained model.GridPoseErrorNet checkpoint -- when given, print the "
+                          "network's predicted (e_pos, e_rot) alongside the real value for each "
+                          "cell shown")
+    ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",
+                     help="torch device for --nn-checkpoint inference (default: cuda if available else cpu)")
     ap.add_argument("--dry-run", action="store_true", help="validate + print stats only, no GL viewer")
     return ap.parse_args()
 
@@ -269,6 +286,12 @@ def main() -> None:
         lattice = f["spawn_xy"][:]  # [G, G, 2], shared by every row
         mask_row = f["mask"][row]  # [G, G] bool
         y_row = f["y"][row]  # [G, G, 14]
+
+        heightmap_tensor, grid_extent = None, None
+        if args.nn_checkpoint is not None:
+            map_index_row = int(f["map_index"][row])
+            heightmap_tensor = f["grid/heightmap"][map_index_row].astype(np.float32)  # [G_h, G_h]
+            grid_extent = float(f["grid/extent"][()])
 
     clear = footprint_clear(terrain, lattice, spawn_yaw)
     inconsistent = mask_row & ~clear
@@ -300,6 +323,18 @@ def main() -> None:
         cells = [(i, j) for i in range(G) for j in range(G) if mask_row[i, j] or args.show_masked]
         if not cells:
             raise SystemExit("no cells to show -- every cell is masked; pass --show-masked to include them")
+
+    pred_field = None  # [G, G, 2] (e_pos, e_rot), filled below iff --nn-checkpoint was given
+    if args.nn_checkpoint is not None:
+        device = torch.device(args.device)
+        nn_model, ckpt = load_checkpoint(args.nn_checkpoint, device)
+        nn_model.eval()
+        heightmap_in = torch.from_numpy(heightmap_tensor).unsqueeze(0).to(device)  # [1, G_h, G_h]
+        wz_in = torch.tensor([wz], dtype=torch.float32, device=device)
+        spawn_xy_in = torch.from_numpy(lattice.astype(np.float32)).to(device)  # [G, G, 2]
+        pred = nn_model.predict(heightmap_in, wz_in, spawn_xy_in, extent=grid_extent)
+        pred_field = pred[0].cpu().numpy()  # [G, G, 2]
+        print(f"nn-checkpoint: {args.nn_checkpoint}  device={device}")
 
     wp.init()
     model, robots, sphere_idx = build_model(terrain, which, lattice, mask_row, clear, spawn_yaw)
@@ -341,6 +376,12 @@ def main() -> None:
             status = "blocked (on obstacle, never simulated) -- robots left at previous cell"
         else:
             status = "DIVERGED (footprint-clear but no valid solve) -- robots left at previous cell"
+        if pred_field is not None:
+            pred_pos_e, pred_rot_e = pred_field[i, j]
+            status += (
+                f"  |  PRED pos_err={pred_pos_e:.3f} m  rot_err={pred_rot_e:.3f} rad "
+                f"({np.degrees(pred_rot_e):.1f} deg)"
+            )
         print(f"  [cell {i:2d},{j:2d}] xy=({x:.2f},{y:.2f})  {status}")
 
     idx = 0

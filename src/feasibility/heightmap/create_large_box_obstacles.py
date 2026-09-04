@@ -55,9 +55,10 @@ Written to assets/large_box_random/<seed>/large_box_i<index>_h<height,cm>cm[.png
 --seed is REQUIRED (as in create_box_obstacles.py's --batch mode) both to seed the RNG and to
 namespace the output directory, so re-running one seed always regenerates the same maps in the
 same place and different seeds never collide. The filename pattern deliberately does NOT start
-with "box_random_" (create_box_obstacles.py's prefix), so grid_learning/generate_dataset.py's
-default --map-glob (box_random_*_h*.png) will never accidentally pick these up; point it here
-explicitly via +maps_dir=assets/large_box_random/<seed> +map_glob=large_box_i*_h*.png.
+with "box_random_" (create_box_obstacles.py's prefix) so a listing of this directory is never
+confused with that series; grid_learning/generate_dataset.py globs every PNG in whatever
++maps_dir= it is pointed at, so point it here explicitly via
++maps_dir=assets/large_box_random/<seed>.
 
 CLI parameters:
     --seed INT                 RNG seed; REQUIRED -- also names the

@@ -42,7 +42,6 @@ from __future__ import annotations
 
 import hydra
 import numpy as np
-import warp as wp
 from omegaconf import DictConfig
 
 from feasibility.comparator.common import CONFIG_PATH
@@ -69,8 +68,8 @@ from feasibility.learning.terrain_patch import sample_patches
 
 
 def generate(cfg: DictConfig) -> None:
-    wp.init()
-
+    # Warp init (pinned to `+device=`) happens inside simulate_dataset_rollout, since it's the
+    # first thing here that touches ostrich/warp at all.
     n = int(cfg.get("n_samples", DEFAULT_N))
     seed = int(cfg.get("seed", DEFAULT_SEED))
     spawn_mode = str(cfg.get("spawn_mode", DEFAULT_SPAWN_MODE))

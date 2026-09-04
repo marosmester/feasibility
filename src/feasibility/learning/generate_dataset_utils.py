@@ -66,6 +66,7 @@ from helhest import dynamics
 
 from feasibility.comparator.common import build_setpoints
 from feasibility.comparator.common import euler_zyx_to_quat_xyzw
+from feasibility.comparator.common import init_warp_device
 from feasibility.comparator.common import run_hstack_batch
 from feasibility.comparator.common import run_ostrich_batch
 from feasibility.heightmap import HeightMapReader
@@ -267,7 +268,10 @@ def simulate_dataset_rollout(
 
     Reads n_samples-independent knobs from `cfg` (see module docstring): duration_s, chunk,
     settle_steps, mu, k_turn, device, plus any Hydra config-group override against the "helhest"
-    base config (engine=, simulation=, logging=...). rendering is forced to headless.
+    base config (engine=, simulation=, logging=...). rendering is forced to headless. Also owns
+    Warp initialization (init_warp_device(device)) so callers don't need their own bare
+    wp.init() -- ostrich has no device config field of its own, so it has to be pinned here,
+    before any model gets built, to land on the same GPU `device` puts hstack on.
 
     Returns (ostrich_fields, hstack_fields, mu, k_turn) -- the first two are ready to splice
     straight into comparator.provenance.write_comparison's `ostrich=`/`hstack=` kwargs; mu/k_turn
@@ -279,6 +283,7 @@ def simulate_dataset_rollout(
     mu = float(cfg.get("mu", 0.8))
     k_turn = float(cfg.get("k_turn", dynamics.K_TURN))
     device = str(cfg.get("device", "cuda:0"))
+    init_warp_device(device)  # pins ostrich onto the same GPU -- see init_warp_device's docstring
 
     sim_config: SimulationConfig = hydra.utils.instantiate(cfg.simulation)
     render_config: RenderingConfig = hydra.utils.instantiate(cfg.rendering)

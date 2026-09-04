@@ -66,6 +66,18 @@ DEFAULT_MAX_TRIANGLE_PAIRS = 1_000_000
 TRIANGLE_PAIRS_PER_WORLD = 12_000
 
 
+def init_warp_device(device: str) -> None:
+    """wp.init() plus pinning Warp's global default device to `device`. Ostrich's model build
+    (HelhestBatchSimulator.build_model -> newton's finalize_replicated) never takes an explicit
+    device of its own -- it just uses whatever wp.get_device() currently resolves to -- so a bare
+    wp.init() silently leaves ostrich on cuda:0 (or the ambient CUDA context) even when `device`
+    (the same torch-style string already threaded through run_hstack_batch) points somewhere
+    else. Call this once, before building any ostrich model, so a `+device=cuda:1` override moves
+    BOTH sims onto that GPU instead of splitting them across two different defaults."""
+    wp.init()
+    wp.set_device(device)
+
+
 @dataclass(frozen=True)
 class ScenarioSpec:
     """Everything a comparison needs beyond the shared machinery below. `variants` comes
@@ -566,11 +578,11 @@ def run_comparison(cfg: DictConfig, spec: ScenarioSpec) -> None:
     it, see select_variants), writing outputs/compare_<spec.name>.h5. Shared by every
     comparator/compare_*.py driver -- see the module docstring for what varies per scenario
     (just `spec`)."""
-    wp.init()
+    device = str(cfg.get("device", "cuda:0"))
+    init_warp_device(device)
 
     mu = float(cfg.get("mu", 0.8))
     k_turn = float(cfg.get("k_turn", dynamics.K_TURN))
-    device = str(cfg.get("device", "cuda:0"))
 
     variants = select_variants(spec.variants, cfg.get("heights", None))
     variant_values = np.array([h for h, _ in variants], dtype=np.float32)
@@ -725,11 +737,11 @@ def run_trial_comparison(cfg: DictConfig, spec: TrialScenarioSpec) -> None:
     terrain/setpoints/spawn_pose as plain arguments, so nothing about them assumes which one
     varies) and HDF5 schema, so comparator/plotting and comparator/replay work unmodified on
     either kind of output."""
-    wp.init()
+    device = str(cfg.get("device", "cuda:0"))
+    init_warp_device(device)
 
     mu = float(cfg.get("mu", 0.8))
     k_turn = float(cfg.get("k_turn", dynamics.K_TURN))
-    device = str(cfg.get("device", "cuda:0"))
 
     trials = select_trials(spec.trials, cfg.get("trials", None))
     n = len(trials)
