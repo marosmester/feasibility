@@ -32,7 +32,10 @@ each run places the (shared, series-wide) box footprint at ONE of two positions:
   * random (default) -- uniformly sampled anywhere such that the box AND its ramp (sized for
     the series' tallest height, so the same sampled position stays valid across the whole
     height series) stay fully within the grid -- written to box_random_h* under
-    assets/box_random/, a position genuinely different on every run (--seed to reproduce one).
+    assets/box_random/<seed>/, a position genuinely different for every seed. --seed is
+    REQUIRED in this mode (and in --batch): it both seeds the RNG and names the output
+    subdirectory, so two runs of the same seed always regenerate the same maps in the same
+    place, and two different seeds' maps never collide or get mixed together on disk.
   * --center -- footprint centered at the grid origin -- written to box_centered_h* under
     assets/box_centered/, unchanged from run to run. Kept in its own directory (rather than
     reusing box_random_h* with cx=cy=0) because other code hard-assumes an origin-centered box:
@@ -51,11 +54,11 @@ script's CLI. Regenerate it (e.g. after changing --cell/--incline-deg) via a one
 --batch generates a THIRD mode: N single-height maps (one obstacle height, --height, shared by
 all of them -- NOT the BOX_HEIGHTS series), each its OWN independently-sampled random position
 -- for a dataset generator that wants position variety across many terrains rather than a height
-sweep at one position. Written to box_random_i<index>_h<height>cm under assets/box_random/
-(same directory as the single-position random default, but index-prefixed so the two naming
-patterns never collide). Since each map carries only one height, its position's valid sampling
-region is sized for THAT height's own ramp width, not the whole series' worst case -- larger and
-less conservative than the default mode's shared-position bound.
+sweep at one position. Written to box_random_i<index>_h<height>cm under assets/box_random/<seed>/
+(same seed subdirectory the single-position random default uses, but index-prefixed so the two
+naming patterns never collide within it). Since each map carries only one height, its position's
+valid sampling region is sized for THAT height's own ramp width, not the whole series' worst
+case -- larger and less conservative than the default mode's shared-position bound.
 
 --n-boxes puts MORE THAN ONE box on each --batch map, at independently sampled positions. A
 single box occupies only a few percent of a 10x10 m grid, so a dataset whose label is a field
@@ -73,11 +76,19 @@ the map's MEDIAN height) keeps holding -- one box plus its ramp is ~3.5% of a 10
 the median stays on the ground until obstacles cover half the map, i.e. ~14 boxes.
 
 Multi-box maps are written to box_random_k<K>_i<index>_h<height>cm, still under
-assets/box_random/. The K tag goes BEFORE the index deliberately: the single-box series' natural
-glob, box_random_i*_h*, must not also match multi-box maps, and it would if K were a suffix or
-sat between the index and the height (`i*` happily spans an underscore). K=1 keeps the original
-un-tagged box_random_i<index>_h<height>cm name, so the existing 100-map series regenerates
-byte-identically.
+assets/box_random/<seed>/. The K tag goes BEFORE the index deliberately: the single-box series'
+natural glob, box_random_i*_h*, must not also match multi-box maps, and it would if K were a
+suffix or sat between the index and the height (`i*` happily spans an underscore). K=1 keeps the
+original un-tagged box_random_i<index>_h<height>cm name, so the existing 100-map series
+regenerates byte-identically.
+
+Every box_random/ write is namespaced under a per-seed subdirectory, assets/box_random/<seed>/,
+so --seed is REQUIRED for both the default random-position mode and --batch mode (a bare
+`parser.error` catches a missing --seed before any RNG draw or file write happens). This makes
+the two axes that vary a run's output -- the RNG seed and the directory it lands in -- always
+agree: re-running the same --seed always regenerates the same maps in the same place, and every
+other seed gets its own directory rather than overwriting or intermixing with it. --center is
+unaffected (it draws no randomness, so it keeps writing flat into assets/box_centered/).
 
 CLI parameters:
     --cell FLOAT          grid resolution in meters (default: 0.05)
@@ -85,10 +96,10 @@ CLI parameters:
                            series (default: 75.0)
     --extent FLOAT        full width/height in meters of the square grid (default: 10.0)
     --center               center the box footprint at the grid origin (box_centered_h* series)
-                           instead of the default random position (box_random_h* series)
+                           instead of the default random position (box_random_<seed>/h* series)
     --batch                generate N single-height maps with independently random positions
-                           (box_random_i*_h*cm) instead of the default height-series-at-one-
-                           position behavior; mutually exclusive with --center
+                           (box_random_<seed>/i*_h*cm) instead of the default height-series-at-
+                           one-position behavior; mutually exclusive with --center
     --n INT                number of maps to generate in --batch mode (default: 100)
     --height FLOAT         obstacle height in meters shared by every map in --batch mode
                            (default: 0.50)
@@ -96,17 +107,17 @@ CLI parameters:
                            K > 1 writes box_random_k<K>_i*_h*cm
     --min-gap FLOAT        minimum clearance in meters between two boxes' ramp footprints
                            (default: 1.6); only meaningful with --n-boxes > 1
-    --seed INT             RNG seed for the random position(s); ignored with --center
+    --seed INT             RNG seed for the random position(s); REQUIRED except with --center --
+                           also names the assets/box_random/<seed>/ output subdirectory
 
 Usage:
-    python src/feasibility/heightmap/create_box_obstacles.py                  # random position (default)
-    python src/feasibility/heightmap/create_box_obstacles.py --seed 0         # reproducible random position
-    python src/feasibility/heightmap/create_box_obstacles.py --batch --n-boxes 2 --height 0.7
-    python src/feasibility/heightmap/create_box_obstacles.py --center         # centered at the origin
-    python src/feasibility/heightmap/create_box_obstacles.py --extent 20      # wider grid
-    python src/feasibility/heightmap/create_box_obstacles.py --cell 0.01 --incline-deg 60
-    python src/feasibility/heightmap/create_box_obstacles.py --batch          # 100 random-position maps, h=0.50m
-    python src/feasibility/heightmap/create_box_obstacles.py --batch --n 500 --height 0.30 --seed 0
+    python src/feasibility/heightmap/create_box_obstacles.py --seed 0        # -> assets/box_random/0/
+    python src/feasibility/heightmap/create_box_obstacles.py --batch --seed 0 --n-boxes 2 --height 0.7
+    python src/feasibility/heightmap/create_box_obstacles.py --center        # centered at the origin
+    python src/feasibility/heightmap/create_box_obstacles.py --seed 0 --extent 20   # wider grid
+    python src/feasibility/heightmap/create_box_obstacles.py --seed 0 --cell 0.01 --incline-deg 60
+    python src/feasibility/heightmap/create_box_obstacles.py --batch --seed 0        # 100 maps, h=0.50m -> assets/box_random/0/
+    python src/feasibility/heightmap/create_box_obstacles.py --batch --n 500 --height 0.30 --seed 1
 """
 from __future__ import annotations
 
@@ -219,7 +230,8 @@ def parse_args() -> argparse.Namespace:
         "--seed",
         type=int,
         default=None,
-        help="RNG seed for the random position(s); ignored with --center",
+        help="RNG seed for the random position(s); REQUIRED except with --center -- also names "
+        "the assets/box_random/<seed>/ output subdirectory",
     )
     args = parser.parse_args()
     if args.batch and args.center:
@@ -230,6 +242,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--n-boxes > 1 only applies to --batch mode")
     if args.min_gap < 0.0:
         parser.error("--min-gap must be >= 0")
+    if not args.center and args.seed is None:
+        parser.error("--seed is required (it names the assets/box_random/<seed>/ output subdirectory)")
     return args
 
 
@@ -259,32 +273,38 @@ def centered_box_paths(heights: tuple[float, ...] = BOX_HEIGHTS) -> list[tuple[f
     return [(h, centered_box_path(h)) for h in heights]
 
 
-def random_box_path(height: float) -> pathlib.Path:
-    """assets/box_random/box_random_h<height, cm, no dot> -- see box_path's docstring for why
-    cm integers, not a dotted decimal."""
-    return RANDOM_ASSETS_DIR / f"box_random_h{round(height * 100):03d}cm"
+def random_box_path(height: float, seed: int) -> pathlib.Path:
+    """assets/box_random/<seed>/box_random_h<height, cm, no dot> -- see box_path's docstring for
+    why cm integers, not a dotted decimal. Namespaced under the seed that produced the shared
+    position, so re-running the same --seed always regenerates in the same place and different
+    seeds never collide -- see the module docstring."""
+    return RANDOM_ASSETS_DIR / str(seed) / f"box_random_h{round(height * 100):03d}cm"
 
 
-def random_box_paths(heights: tuple[float, ...] = BOX_HEIGHTS) -> list[tuple[float, pathlib.Path]]:
+def random_box_paths(seed: int, heights: tuple[float, ...] = BOX_HEIGHTS) -> list[tuple[float, pathlib.Path]]:
     """(height, path) pairs for the random series -- mirrors box_obstacle_paths()."""
-    return [(h, random_box_path(h)) for h in heights]
+    return [(h, random_box_path(h, seed)) for h in heights]
 
 
 BATCH_INDEX_WIDTH = 4  # zero-padding width for --batch indices -- fixed (not n-derived) so
 # filenames sort consistently regardless of which --n a given batch used, up to 9999 maps.
 
 
-def random_batch_path(index: int, height: float, n_boxes: int = 1) -> pathlib.Path:
-    """assets/box_random/box_random_[k<n_boxes>_]i<index, zero-padded to BATCH_INDEX_WIDTH>_h<
-    height, cm, no dot> -- index-prefixed so --batch's per-map files never collide with
-    random_box_path()'s single shared-position series in the same directory.
+def random_batch_path(index: int, height: float, seed: int, n_boxes: int = 1) -> pathlib.Path:
+    """assets/box_random/<seed>/box_random_[k<n_boxes>_]i<index, zero-padded to
+    BATCH_INDEX_WIDTH>_h<height, cm, no dot> -- index-prefixed so --batch's per-map files never
+    collide with random_box_path()'s single shared-position series in the same seed directory.
 
     The k<K> tag appears only for K > 1, and BEFORE the index: K=1 then keeps the original name
     (so the existing single-box series regenerates byte-identically), and the single-box glob
     box_random_i*_h* cannot match a multi-box map -- which it would if the tag came after the
     index, since `i*` spans underscores too. See the module docstring."""
     tag = "" if n_boxes <= 1 else f"k{n_boxes}_"
-    return RANDOM_ASSETS_DIR / f"box_random_{tag}i{index:0{BATCH_INDEX_WIDTH}d}_h{round(height * 100):03d}cm"
+    return (
+        RANDOM_ASSETS_DIR
+        / str(seed)
+        / f"box_random_{tag}i{index:0{BATCH_INDEX_WIDTH}d}_h{round(height * 100):03d}cm"
+    )
 
 
 def build_box_obstacle(
@@ -438,7 +458,7 @@ def main() -> None:
     # one center it reproduces build_centered_box exactly).
     tasks: list[tuple[str, float, list[tuple[float, float]], pathlib.Path]]
     if args.batch:
-        RANDOM_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+        (RANDOM_ASSETS_DIR / str(args.seed)).mkdir(parents=True, exist_ok=True)
         rng = np.random.default_rng(args.seed)
         tasks = []
         for i in range(args.n):
@@ -447,16 +467,18 @@ def main() -> None:
                 max_height=args.height, min_gap=args.min_gap,
             )
             label = "random " + " ".join(f"(x={cx:.3f}, y={cy:.3f})" for cx, cy in centers)
-            tasks.append((label, args.height, centers, random_batch_path(i, args.height, args.n_boxes)))
+            tasks.append(
+                (label, args.height, centers, random_batch_path(i, args.height, args.seed, args.n_boxes))
+            )
     elif args.center:
         CENTERED_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
         tasks = [("centered", h, [(CENTERED_CX, CENTERED_CY)], path) for h, path in centered_box_paths()]
     else:
-        RANDOM_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+        (RANDOM_ASSETS_DIR / str(args.seed)).mkdir(parents=True, exist_ok=True)
         rng = np.random.default_rng(args.seed)
         cx, cy = sample_random_center(args.extent, args.incline_deg, rng)
         label = f"random (x={cx:.3f}, y={cy:.3f})"
-        tasks = [(label, h, [(cx, cy)], path) for h, path in random_box_paths()]
+        tasks = [(label, h, [(cx, cy)], path) for h, path in random_box_paths(args.seed)]
 
     for label, height, centers, path in tasks:
         build_multi_box(height, args.cell, args.incline_deg, args.extent, centers).save(path)
