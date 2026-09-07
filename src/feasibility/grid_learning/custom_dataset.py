@@ -109,6 +109,14 @@ class GridPoseErrorDataset(Dataset):
             y_raw = f["y"][()].astype(np.float32)  # [R, G, G, 14]
             mask = f["mask"][()]  # [R, G, G] bool
             heightmaps = f["grid/heightmap"][()].astype(np.float32)  # [n_maps, G_h, G_h]
+            # [n_maps] map -> the map it derives from, written by mirror_dataset.py so a mirrored
+            # map groups with its source. Absent on a generate_dataset.py file, where every map is
+            # its own group -- so the fallback reproduces the pre-existing behaviour exactly.
+            map_source = (
+                f["grid/map_source"][()].astype(np.int64)
+                if "map_source" in f["grid"]
+                else np.arange(heightmaps.shape[0], dtype=np.int64)
+            )
             self.spawn_xy = torch.from_numpy(f["spawn_xy"][()].astype(np.float32))  # [G, G, 2]
             self.resolution = float(f["grid/resolution"][()])
             self.extent = float(f["grid/extent"][()])
@@ -122,6 +130,8 @@ class GridPoseErrorDataset(Dataset):
 
         self.wz = torch.from_numpy(wz).to(device)
         self.map_index = torch.from_numpy(map_index).to(device)
+        self.map_group = torch.from_numpy(map_source[map_index]).to(device)  # [R] per-row split
+        # key: equal to map_index unless mirror_dataset.py paired maps with their mirrors
         self.heightmap = torch.from_numpy(heightmaps).to(device)
         self.y = torch.from_numpy(y).to(device)
         self.mask = torch.from_numpy(mask).to(device)
@@ -159,14 +169,19 @@ def split_dataset_by_map(
     6b. split_dataset's row-level split leaks: with e.g. 100 maps x 10 commands a val row's map
     almost always also appears in train under a different wz, so that val score measures
     interpolation-in-wz on memorized terrain rather than transfer to unseen terrain. Here every
-    row of a given map goes to the same side, so a val map is never touched during training."""
-    map_ids = ds.map_index.unique()
+    row of a given map goes to the same side, so a val map is never touched during training.
+
+    Splits on `ds.map_group`, not `ds.map_index`: on a mirror_dataset.py-augmented file a mirrored
+    map is the SAME terrain as its source, so splitting them apart would leak just as badly as the
+    row-level split this function exists to replace. map_group collapses each mirror onto its
+    source and is identical to map_index on any un-augmented file."""
+    map_ids = ds.map_group.unique()
     generator = torch.Generator().manual_seed(seed)
     perm = torch.randperm(map_ids.shape[0], generator=generator)
     n_val_maps = max(1, round(map_ids.shape[0] * val_frac))
     val_maps = set(map_ids[perm[:n_val_maps]].tolist())
-    train_indices = [i for i in range(len(ds)) if int(ds.map_index[i]) not in val_maps]
-    val_indices = [i for i in range(len(ds)) if int(ds.map_index[i]) in val_maps]
+    train_indices = [i for i in range(len(ds)) if int(ds.map_group[i]) not in val_maps]
+    val_indices = [i for i in range(len(ds)) if int(ds.map_group[i]) in val_maps]
     return Subset(ds, train_indices), Subset(ds, val_indices)
 
 
