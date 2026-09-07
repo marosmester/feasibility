@@ -2,7 +2,8 @@
 *.txt
 .venv/
 __pycache__/
-outputs
+outputs/*
+!outputs/eval_log.csv
 assets
 imgui.ini
 wandb

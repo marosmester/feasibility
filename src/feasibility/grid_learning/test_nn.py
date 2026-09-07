@@ -50,6 +50,9 @@ engine_config/logging_config via hydra.utils.instantiate):
                                     init_warp_device) (default: "cuda:0")
     +save_fig=STR                  save the comparison figure here instead of showing it interactively
     +dry_run=BOOL                  lattice/checkpoint self-checks only -- no simulation (default: false)
+    +log_path=STR                  CSV evaluation log to append this run's stats to, one row per
+                                    run (default: outputs/eval_log.csv, see eval_log.py)
+    +no_log=BOOL                    skip the CSV log append entirely (default: false)
     Also accepts any standard Hydra config-group override against the "helhest" base config
     (engine=mujoco, simulation=..., logging=...); rendering is forced headless.
 
@@ -77,6 +80,7 @@ from ostrich import SimulationConfig
 
 from feasibility.comparator.common import CONFIG_PATH
 from feasibility.comparator.common import init_warp_device
+from feasibility.grid_learning import eval_log
 from feasibility.grid_learning.custom_dataset import poses_to_se3
 from feasibility.grid_learning.custom_dataset import se3_errors
 from feasibility.grid_learning.custom_dataset import TARGET_NAMES
@@ -349,6 +353,8 @@ def evaluate(cfg: DictConfig) -> None:
     save_fig = cfg.get("save_fig", None)
     save_fig = resolve_path(str(save_fig)) if save_fig is not None else None
     dry_run = bool(cfg.get("dry_run", False))
+    log_path = resolve_path(str(cfg.get("log_path", eval_log.DEFAULT_LOG_PATH)))
+    no_log = bool(cfg.get("no_log", False))
 
     device = torch.device(device_str)
     model, ckpt = load_checkpoint(checkpoint_path, device)
@@ -459,6 +465,16 @@ def evaluate(cfg: DictConfig) -> None:
         checkpoint_path, ckpt, real_pos, real_rot, pred_pos, pred_rot, near,
         n_maps, n_commands, maps_dir, n_blocked_total, n_diverged_total,
     )
+
+    if not no_log:
+        row = eval_log.build_row(
+            checkpoint_path, stats, val_loss=float(ckpt["val_loss"]), maps_dir=maps_dir,
+            n_maps=n_maps, n_commands=n_commands, seed=seed, duration_s=duration_s, mu=mu,
+            k_turn=k_turn, device_str=device_str, near_obstacle_radius=near_obstacle_radius,
+            exclude_training_maps=exclude_training_maps,
+        )
+        eval_log.append_row(row, log_path)
+
     make_figure(checkpoint_path, real_pos, real_rot, pred_pos, pred_rot, near, stats, save_fig)
 
 
