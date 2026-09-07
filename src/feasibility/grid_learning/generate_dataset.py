@@ -144,6 +144,19 @@ POS_MARGIN = 3.0  # m -- how far a final pose may legitimately land beyond the t
 # gap between the two sims' final poses on an otherwise-sane trial, was ~7 m -- see the
 # grid_learning viewer's cell (10,12) investigation for the exploded case this replaces).
 
+MAX_SPAWN_DISPLACEMENT = 2.0  # m -- how far a final pose may legitimately sit from its OWN spawn
+# cell. POS_MARGIN above is a per-map absolute box, so on a 10 m map it still admits a body flung
+# 8 m sideways; this is the per-trial companion that catches those. It can be this tight because
+# V_DRIVE == 0: every trial is a turn in place, so the body has no commanded translation at all
+# and only contact interaction moves it. Measured over a 100-map x 10-command run (101300 cells
+# that passed the checks above), ostrich's displacement has median 0.11 m and 90th percentile
+# 0.20 m -- an order of magnitude inside this cutoff -- yet a 2.75% tail runs out to 8.6 m. Those
+# are contact-solver explosions, not large-but-real collisions, and being unlearnable noise of
+# enormous magnitude they carried ~90% of the e_pos label variance: i.e. most of what a model
+# trained on the unfiltered labels was being asked to fit. Applied to both sims for symmetry,
+# though it is overwhelmingly ostrich (the one with a contact solver) that trips it -- 2783 cells
+# of that run versus 3 for hstack.
+
 WHEEL_CONTACTS_LOCAL = np.array(
     [
         [float(p[0]), float(p[1])]
@@ -323,6 +336,10 @@ def simulate_map(
             # the terrain's own plausible x/y/z bounds -- see plausible_bounds()
             ok &= (final[:, :3] >= bounds[:, 0]).all(axis=1)
             ok &= (final[:, :3] <= bounds[:, 1]).all(axis=1)
+            # ...and within MAX_SPAWN_DISPLACEMENT of the trial's OWN spawn cell, which the
+            # map-wide box above cannot express -- see MAX_SPAWN_DISPLACEMENT
+            travelled = np.linalg.norm(final[:, :2] - spawn_chunk[:, :2], axis=1)
+            ok &= travelled <= MAX_SPAWN_DISPLACEMENT
 
         sl = slice(start, end)
         y[trial_l[sl], trial_i[sl], trial_j[sl]] = both
@@ -520,12 +537,12 @@ def generate(cfg: DictConfig) -> None:
     n_valid = int(mask.sum())
     n_total = mask.size
     n_diverged = n_total - n_blocked - n_valid  # footprint-clear (simulated) but failed the
-    # finite/plausible-bounds check in simulate_map -- see that function's `ok` computation
+    # finite/plausible-bounds/displacement check in simulate_map -- see its `ok` computation
     print("=" * 60)
     print(f"[summary]  {n_total} lattice cells across {len(y)} rows ({n_maps} maps x {n_commands} commands)")
     print(f"  valid     {n_valid:>7d}  ({100 * n_valid / n_total:5.1f}%)")
     print(f"  blocked   {n_blocked:>7d}  ({100 * n_blocked / n_total:5.1f}%)  -- obstacle footprint, never simulated")
-    print(f"  diverged  {n_diverged:>7d}  ({100 * n_diverged / n_total:5.1f}%)  -- simulated but failed the finite/plausible-bounds check")
+    print(f"  diverged  {n_diverged:>7d}  ({100 * n_diverged / n_total:5.1f}%)  -- simulated but failed the finite/plausible-bounds/displacement check")
     print("=" * 60)
 
 
