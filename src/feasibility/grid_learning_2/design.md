@@ -501,6 +501,17 @@ tree). The checks that must exist:
 | concat head | `--head-fusion concat` | that FiLM earns its place (section 5d) |
 | v1 net, constant fields | `GridPoseErrorNet` on the same maps | that the reframing helps |
 
+The first four are in `train.py`; the last is not, and cannot be — it would mean importing
+`feasibility.grid_learning`, which section 11's dependency stance forbids, and it reads a different
+file schema besides. Run that tree's own `train.py` on a v1 file and compare the reported numbers.
+
+The per-`wz` mean is indexed by the CELL's own command here, not the row's (v1 had only one command
+per row), so the lookup table is `[bin, i, j]`: it already knows both where on the lattice a cell
+sits and how hard it was turning, which makes it a considerably stronger opponent than v1's and
+leaves terrain *structure* as the only thing the network can add. Entries are shrunk toward their
+bin's lattice-pooled mean — at `M*L/n_bins` samples per entry a raw mean is mostly noise on small
+files, and a noisy baseline flatters the model instead of challenging it.
+
 Reported in physical units on **held-out maps**: masked RMSE over all valid cells (m, rad), masked
 RMSE over the top decile by true `e_pos` (the collision cells, the entire point), R^2 per head.
 Plus the `wz ~ 0` check (cells commanded ~0 must predict ~0) which section 7b's zero anchor keeps
@@ -575,7 +586,7 @@ runnable standalone as a script — same convention as `grid_learning/`.
 | `custom_dataset.py` | `GridDivergenceDataset` — per-cell `wz` (a v1-shaped `[R]` is rejected, not broadcast), map-level split only, vectorised SE(3) error, `valid_targets()` for the train-only transform fit. Imports `TARGET_NAMES`/`Normalizer`/`TargetTransform` **from `model.py`** (the opposite of v1's direction), so `model.py` has no sibling imports beyond `utils.py`'s pure geometry and can be run and checked before any dataset exists |
 | `model.py` | `GridDivergenceNet` (sections 4, 5) + `TargetTransform` + the section 8 self-checks. `forward(heightmap, wz)` only — no `spawn_xy`, no `extent`: the readout is fixed integer geometry, and `check_lattice_alignment(spawn_xy)` verifies it once at setup |
 | `generate_dataset.py` | per-cell command sampling (section 7b), Hydra-driven, writes `dataset_grid2_*.h5`. Physics identical to v1's generator (same trials, same chunking, same cost); what differs is `sample_command_fields` and the one-line gather in `simulate_map`, plus the odd 81-cell grid it writes. Calls `model.check_lattice_alignment` **before** simulating, so a mis-sized `+cells`/`+resolution` fails in milliseconds rather than producing a file that loads fine and trains on misregistered labels. Defaults to `assets/large_box_random/<seed>/` — a whole-map divergence field starves for signal on the small fixed box series |
-| `train.py` | masked loss, map split, mirror augmentation, baselines |
+| `train.py` | masked loss in model space, held-out-MAP split (the only one offered), mirror augmentation with the command-field flip *and* negate, section 10's recipe, and the section 8 battery. `forward()` takes no `spawn_xy`/`extent` any more, so neither does the training loop; both are still written into the checkpoint as the geometry an inference caller checks a new map against. The `wz ~ 0` check is per CELL and runs over the generator's zero anchor, so it no longer depends on a val row happening to be commanded zero. `--head-fusion concat` and `--blur-terrain` are the two baselines that need the architecture trained, run through this same loop; `--self-test` trains a few epochs on `custom_dataset`'s synthetic file with wandb disabled and asserts the loss/augmentation/checkpoint invariants, so the module is testable with no dataset and no GPU |
 | `gl_replay_grid.py` | QA viewer for a generated file: steps a row's cells, freezing both sims' meshes at each cell's stored final pose, lattice drawn as valid/blocked/diverged spheres. `--dry-run` needs no display and is the useful half — label percentiles plus the worst cells listed as ready-to-paste `--cell` arguments |
 
 Later, if the experiment survives: `mirror_dataset.py`, `eval_log.py`, `test_nn.py`.
