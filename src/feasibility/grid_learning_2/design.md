@@ -576,9 +576,22 @@ runnable standalone as a script — same convention as `grid_learning/`.
 | `model.py` | `GridDivergenceNet` (sections 4, 5) + `TargetTransform` + the section 8 self-checks. `forward(heightmap, wz)` only — no `spawn_xy`, no `extent`: the readout is fixed integer geometry, and `check_lattice_alignment(spawn_xy)` verifies it once at setup |
 | `generate_dataset.py` | per-cell command sampling (section 7b), Hydra-driven, writes `dataset_grid2_*.h5`. Physics identical to v1's generator (same trials, same chunking, same cost); what differs is `sample_command_fields` and the one-line gather in `simulate_map`, plus the odd 81-cell grid it writes. Calls `model.check_lattice_alignment` **before** simulating, so a mis-sized `+cells`/`+resolution` fails in milliseconds rather than producing a file that loads fine and trains on misregistered labels. Defaults to `assets/large_box_random/<seed>/` — a whole-map divergence field starves for signal on the small fixed box series |
 | `train.py` | masked loss, map split, mirror augmentation, baselines |
+| `gl_replay_grid.py` | QA viewer for a generated file: steps a row's cells, freezing both sims' meshes at each cell's stored final pose, lattice drawn as valid/blocked/diverged spheres. `--dry-run` needs no display and is the useful half — label percentiles plus the worst cells listed as ready-to-paste `--cell` arguments |
 
-Later, if the experiment survives: `gl_replay_grid.py` (v1's works on this schema except for the
-`wz` shape — a two-line read change), `mirror_dataset.py`, `eval_log.py`, `test_nn.py`.
+Later, if the experiment survives: `mirror_dataset.py`, `eval_log.py`, `test_nn.py`.
+
+An earlier draft of this table claimed v1's `gl_replay_grid.py` runs on a v2 file "except for the
+`wz` shape — a two-line read change". Measured against the file the generator writes, that was too
+optimistic, which is why v2 has its own copy. Three reads break — `f.attrs["n_commands"]` (v2
+writes `rows_per_map`; this is where v1's dies), `float(f["wz"][row])` (a `[G, G]` field is not a
+scalar), and the status line that prints one `wz` for the whole row instead of `wz[i,j]` per cell
+— and the whole `--nn-checkpoint` branch is v1-model-specific: it loads a `GridPoseErrorNet`
+through `grid_learning.train.load_checkpoint` and calls `predict(heightmap, wz, spawn_xy,
+extent=...)`, a signature `GridDivergenceNet` deliberately does not have, so v2's copy simply omits
+it until `train.py` defines a checkpoint format. Everything else transfers untouched (row ordering,
+`spawn_xy`/`y`/`mask` layout, `terrain_from_h5`, the footprint filter, the SE(3) formula, all the
+rendering) — including the terrain mesh, which comes from the embedded raw asset grid rather than
+from `grid/heightmap`, so the 81 @ 0.125 m change is invisible to the viewer.
 
 **Dependency stance:** self-contained, in the same spirit as `grid_learning/` is towards
 `learning/`. `feasibility.heightmap` and `feasibility.comparator` are shared infrastructure and
