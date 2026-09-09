@@ -64,6 +64,7 @@ Usage:
 """
 from __future__ import annotations
 
+import os
 import pathlib
 
 import h5py
@@ -72,6 +73,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from helhest import dynamics
+from matplotlib.backend_bases import FigureCanvasBase
 from omegaconf import DictConfig
 from ostrich import EngineConfig
 from ostrich import LoggingConfig
@@ -191,6 +193,34 @@ def select_eval_maps(
     return [candidates[i] for i in rng.choice(len(candidates), size=n_maps, replace=False)]
 
 
+def validate_save_fig_path(save_fig: pathlib.Path) -> None:
+    """Fails fast on an ineligible `+save_fig` target -- called right at the top of `evaluate`,
+    before checkpoint loading or any simulation -- so a typo'd/nonexistent output path surfaces
+    immediately instead of after minutes of ostrich/hstack rollouts. Creates missing parent
+    directories (same mkdir(parents=True, exist_ok=True) convention as
+    generate_dataset.write_dataset/eval_log.append_row), then checks the resulting directory is
+    writable and the extension is one matplotlib's savefig can actually produce."""
+    if save_fig.is_dir():
+        raise SystemExit(f"+save_fig={save_fig} is a directory, not a file path")
+    suffix = save_fig.suffix.lstrip(".").lower()
+    supported = FigureCanvasBase.get_supported_filetypes()
+    if not suffix:
+        raise SystemExit(
+            f"+save_fig={save_fig} has no file extension -- supported: {', '.join(sorted(supported))}"
+        )
+    if suffix not in supported:
+        raise SystemExit(
+            f"+save_fig={save_fig}: unsupported extension '.{suffix}' -- "
+            f"supported: {', '.join(sorted(supported))}"
+        )
+    try:
+        save_fig.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise SystemExit(f"+save_fig={save_fig}: cannot create parent directory {save_fig.parent}: {e}")
+    if not os.access(save_fig.parent, os.W_OK):
+        raise SystemExit(f"+save_fig={save_fig}: directory {save_fig.parent} is not writable")
+
+
 def _paired_rmse(
     pred_pos: np.ndarray, pred_rot: np.ndarray, real_pos: np.ndarray, real_rot: np.ndarray
 ) -> torch.Tensor | None:
@@ -243,6 +273,8 @@ def report(
           f"e_pos={abs_err_pos.sum():.3f} m   e_rot={abs_err_rot.sum():.3f} rad")
     print(f"[eval] mean error (|pred-real| per cell):                           "
           f"e_pos={abs_err_pos.mean():.4f} m   e_rot={abs_err_rot.mean():.4f} rad")
+    print(f"[eval] variance of error (|pred-real| per cell):                    "
+          f"e_pos={abs_err_pos.var():.6f} m^2   e_rot={abs_err_rot.var():.6f} rad^2")
     print(f"[eval] RMSE, all valid cells:              {fmt(overall_rmse)}")
     print(f"[eval] RMSE, flat cells (n={int((~near).sum())}):           "
           f"{fmt(flat_rmse) if flat_rmse is not None else 'n/a'}")
@@ -254,7 +286,8 @@ def report(
     return dict(
         overall_rmse=overall_rmse, flat_rmse=flat_rmse, near_rmse=near_rmse, decile_rmse=decile_rmse,
         r2=r2, total_pos=abs_err_pos.sum(), total_rot=abs_err_rot.sum(),
-        mean_pos=abs_err_pos.mean(), mean_rot=abs_err_rot.mean(), n_valid=n_valid,
+        mean_pos=abs_err_pos.mean(), mean_rot=abs_err_rot.mean(),
+        var_pos=abs_err_pos.var(), var_rot=abs_err_rot.var(), n_valid=n_valid,
         n_flat=int((~near).sum()), n_near=int(near.sum()), n_blocked=n_blocked, n_diverged=n_diverged,
         epoch=ckpt["epoch"],
     )
@@ -270,11 +303,14 @@ def make_figure(
     stats: dict[str, object],
     save_fig: pathlib.Path | None,
 ) -> None:
-    """One 2x2 figure: RMSE bar chart (overall/flat/near-obstacle/top-decile), predicted-vs-real
-    scatter per head colored by flat/near-obstacle, and a text panel restating the stdout report
-    so the figure is self-contained. `+save_fig=PATH` saves instead of showing interactively --
-    same convention as learning/error_visual.py's `--out`."""
-    fig, ((ax_bar, ax_pos), (ax_text, ax_rot)) = plt.subplots(2, 2, figsize=(13, 10))
+    """One 3x2 figure: RMSE bar chart (overall/flat/near-obstacle/top-decile), predicted-vs-real
+    scatter per head colored by flat/near-obstacle, a text panel restating the stdout report so
+    the figure is self-contained, and real-vs-error scatter per head (error = |real - pred|, over
+    every valid testing sample). `+save_fig=PATH` saves instead of showing interactively -- same
+    convention as learning/error_visual.py's `--out`."""
+    fig, ((ax_bar, ax_pos), (ax_text, ax_rot), (ax_err_pos, ax_err_rot)) = plt.subplots(
+        3, 2, figsize=(13, 15)
+    )
 
     categories = ["overall", "flat", "near-obstacle", "top-decile"]
     rmses = [stats["overall_rmse"], stats["flat_rmse"], stats["near_rmse"], stats["decile_rmse"]]
@@ -306,6 +342,18 @@ def make_figure(
         ax.set_title(f"predicted vs. real {ylabel}")
         ax.legend(loc="upper left", fontsize=8)
 
+    err_pos = np.abs(real_pos - pred_pos)
+    err_rot = np.abs(real_rot - pred_rot)
+    for ax, real, err, ylabel in (
+        (ax_err_pos, real_pos, err_pos, "e_pos"), (ax_err_rot, real_rot, err_rot, "e_rot"),
+    ):
+        ax.scatter(real[~near], err[~near], s=8, alpha=0.5, color="#2ca02c", label="flat")
+        ax.scatter(real[near], err[near], s=8, alpha=0.5, color="#d62728", label="near-obstacle")
+        ax.set_xlabel(f"real {ylabel}")
+        ax.set_ylabel(f"|error| (|real - pred|) {ylabel}")
+        ax.set_title(f"prediction error vs. real {ylabel}")
+        ax.legend(loc="upper left", fontsize=8)
+
     ax_text.axis("off")
     text = (
         f"checkpoint: {checkpoint_path.name}\n"
@@ -318,7 +366,10 @@ def make_figure(
         f"  e_rot = {stats['total_rot']:.3f} rad\n\n"
         f"mean |pred-real| error:\n"
         f"  e_pos = {stats['mean_pos']:.4f} m\n"
-        f"  e_rot = {stats['mean_rot']:.4f} rad\n\n"
+        f"  e_rot = {stats['mean_rot']:.4f} rad\n"
+        f"variance of |pred-real| error:\n"
+        f"  e_pos = {stats['var_pos']:.6f} m^2\n"
+        f"  e_rot = {stats['var_rot']:.6f} rad^2\n\n"
         f"R^2:  e_pos = {float(stats['r2'][E_POS_IDX]):.3f}   e_rot = {float(stats['r2'][E_ROT_IDX]):.3f}"
     )
     ax_text.text(0.0, 1.0, text, va="top", ha="left", family="monospace", fontsize=10, transform=ax_text.transAxes)
@@ -355,6 +406,10 @@ def evaluate(cfg: DictConfig) -> None:
     dry_run = bool(cfg.get("dry_run", False))
     log_path = resolve_path(str(cfg.get("log_path", eval_log.DEFAULT_LOG_PATH)))
     no_log = bool(cfg.get("no_log", False))
+
+    # Fail fast on a bad +save_fig target before checkpoint loading or any simulation runs.
+    if save_fig is not None:
+        validate_save_fig_path(save_fig)
 
     device = torch.device(device_str)
     model, ckpt = load_checkpoint(checkpoint_path, device)
