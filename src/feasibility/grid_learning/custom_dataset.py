@@ -155,7 +155,7 @@ def split_dataset(
     cell: a row's whole [G, G] field is one sample, and multiple rows can share a map (different
     wz), so this is a row-level split, not a map-level one -- a val row's map may also appear in
     train under a different commanded wz. See split_dataset_by_map for the split train.py
-    actually uses (ARCHITECTURE.md section 6b: this one leaks)."""
+    actually uses (design.md section 6b: this one leaks)."""
     n_val = max(1, round(len(ds) * val_frac))
     n_train = len(ds) - n_val
     generator = torch.Generator().manual_seed(seed)
@@ -165,7 +165,7 @@ def split_dataset(
 def split_dataset_by_map(
     ds: GridPoseErrorDataset, val_frac: float = 0.2, seed: int = 0
 ) -> tuple[Subset, Subset]:
-    """Seeded, reproducible train/val split over `ds`'s MAPS, not rows -- ARCHITECTURE.md section
+    """Seeded, reproducible train/val split over `ds`'s MAPS, not rows -- design.md section
     6b. split_dataset's row-level split leaks: with e.g. 100 maps x 10 commands a val row's map
     almost always also appears in train under a different wz, so that val score measures
     interpolation-in-wz on memorized terrain rather than transfer to unseen terrain. Here every
@@ -225,7 +225,7 @@ def make_dataloaders(
 
     `by_map=False` (default, preserved for this module's own smoke test below) uses the row-level
     split_dataset; train.py passes `by_map=True` to get split_dataset_by_map instead -- the one
-    ARCHITECTURE.md section 6b actually calls for.
+    design.md section 6b actually calls for.
 
     Batch size defaults low (4, not 32): each sample carries a [G_h, G_h] heightmap (e.g.
     100x100 float32 = 40 KB) plus a [G, G, 2] label field, an order of magnitude heavier per row

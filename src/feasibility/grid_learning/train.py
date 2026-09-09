@@ -1,22 +1,22 @@
-"""Trains model.GridPoseErrorNet on custom_dataset.GridPoseErrorDataset -- ARCHITECTURE.md
+"""Trains model.GridPoseErrorNet on custom_dataset.GridPoseErrorDataset -- design.md
 section 10 names this file's job precisely: "masked loss (5b), map-level split (6b),
 augmentation (6a), baselines (7)". Structured after learning/train.py (same
 build_checkpoint/load_checkpoint contract, same wandb logging shape), with the grid_learning
 nuances substituted in:
 
-* The loss is masked, not plain MSE -- ARCHITECTURE.md 5b. A dataset row's label is a whole
+* The loss is masked, not plain MSE -- design.md 5b. A dataset row's label is a whole
   [G, G, 2] field, and roughly half the lattice is masked (obstacle-blocked spawn footprint or a
   diverged solve), so every loss/metric here averages over valid (cell, head) entries only, never
   over the fixed cell count. Masked cells are exact zeros in the file (never NaN -- see
   custom_dataset.py's module docstring), so nothing here needs a NaN-safe torch.where.
-* The train/val split is by MAP, not by row (ARCHITECTURE.md 6b, `by_map=True`): with e.g. 100
+* The train/val split is by MAP, not by row (design.md 6b, `by_map=True`): with e.g. 100
   maps x 10 commands, a row-level split leaks the terrain of almost every val row into train
   under a different wz, so the val score would measure wz-interpolation on memorized terrain
   rather than transfer to unseen terrain. `custom_dataset.split_dataset` (row-level) is still
   there and reachable via `--row-split`, purely as an ablation/debug knob.
-* Mirror-symmetry augmentation (ARCHITECTURE.md 6a) is applied per-sample, p=0.5, by default: the
+* Mirror-symmetry augmentation (design.md 6a) is applied per-sample, p=0.5, by default: the
   robot and both grids are exactly y-symmetric, so it is a free 2x on data, not an approximation.
-* Three non-parametric baselines from ARCHITECTURE.md section 7 (global mean, per-wz mean field)
+* Three non-parametric baselines from design.md section 7 (global mean, per-wz mean field)
   are computed once up front, before any training, and logged to wandb's summary so a run's own
   val RMSE has something to be judged against; the third (blur-the-terrain) needs the actual
   architecture trained on degraded input, so it is a `--blur-terrain` flag that reuses this same
@@ -28,7 +28,7 @@ nuances substituted in:
   never scored on undegraded terrain.
 * Like model.py's TargetTransform docstring, the transform is fit on TRAIN rows' VALID
   (mask == True) cells only.
-* End of run: a short battery of the free checks ARCHITECTURE.md section 7 calls out -- top-decile
+* End of run: a short battery of the free checks design.md section 7 calls out -- top-decile
   (by true e_pos) masked RMSE, per-head R^2, the wz~=0 sanity check, and the mirror-equivariance
   check -- against the BEST checkpoint (reloaded from disk, not just the last epoch's weights).
 
@@ -105,11 +105,11 @@ def fmt(values: torch.Tensor) -> str:
     return ", ".join(f"{n}={v:.4f}" for n, v in zip(TARGET_NAMES, values.tolist()))
 
 
-# --- masked loss / masked metrics (ARCHITECTURE.md 5b) -----------------------------------------
+# --- masked loss / masked metrics (design.md 5b) -----------------------------------------
 
 
 def masked_mse_loss(y_hat: torch.Tensor, y_target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """Masked MSE over valid (cell, head) entries only -- ARCHITECTURE.md section 5b. Both
+    """Masked MSE over valid (cell, head) entries only -- design.md section 5b. Both
     y_hat/y_target must already be in TargetTransform space; `mask` is [*, G, G] bool, broadcast
     over the trailing head dim since a cell's validity does not depend on which head is read.
     Normalizing by mask.sum() (not the fixed cell count) keeps the loss scale independent of how
@@ -131,7 +131,7 @@ def masked_rmse_per_head(
     return mse.sqrt()
 
 
-# --- mirror-symmetry augmentation (ARCHITECTURE.md 6a) ------------------------------------------
+# --- mirror-symmetry augmentation (design.md 6a) ------------------------------------------
 
 
 def mirror_augment(
@@ -139,7 +139,7 @@ def mirror_augment(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Per-sample, p=0.5: reflect the map in Y and negate wz -- an EXACT symmetry of the
     data-generating process (the robot and both grids are y-symmetric), not an approximation, per
-    ARCHITECTURE.md section 6a. e_pos/e_rot are magnitudes so their VALUES are unchanged, only
+    design.md section 6a. e_pos/e_rot are magnitudes so their VALUES are unchanged, only
     which lattice cell they sit at -- hence y/mask flip along the row axis (world Y) rather than
     being renormalized."""
     B = heightmap.shape[0]
@@ -151,7 +151,7 @@ def mirror_augment(
     return heightmap, wz, y, mask
 
 
-# --- non-parametric baselines (ARCHITECTURE.md 7) -----------------------------------------------
+# --- non-parametric baselines (design.md 7) -----------------------------------------------
 
 
 def masked_field_mean(y: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -165,7 +165,7 @@ def baseline_global_mean(
     ds: GridPoseErrorDataset, train_idx: list[int], val_idx: list[int]
 ) -> torch.Tensor:
     """Predict one constant (e_pos, e_rot) -- the train-set valid-cell mean -- everywhere.
-    ARCHITECTURE.md section 7's sanity floor: beating it proves almost nothing, but a run that
+    design.md section 7's sanity floor: beating it proves almost nothing, but a run that
     can't beat it is broken, not just unimpressive."""
     y_train, mask_train = ds.y[train_idx], ds.mask[train_idx]
     mask_f = mask_train.unsqueeze(-1).float()
@@ -179,7 +179,7 @@ def baseline_per_wz_mean(
     ds: GridPoseErrorDataset, train_idx: list[int], val_idx: list[int]
 ) -> torch.Tensor:
     """Look up the train-set mean FIELD for a val row's own wz (nearest match -- wz is sampled
-    from a fixed, equidistant grid, see generate_dataset.py's module docstring). ARCHITECTURE.md
+    from a fixed, equidistant grid, see generate_dataset.py's module docstring). design.md
     section 7's real bar: beating this proves the model uses the TERRAIN, not just the commanded
     wz."""
     wz_train, y_train, mask_train = ds.wz[train_idx], ds.y[train_idx], ds.mask[train_idx]
@@ -255,7 +255,7 @@ def load_checkpoint(
     return model, ckpt
 
 
-# --- LR schedule (ARCHITECTURE.md section 9: cosine to 0, ~5 epoch linear warmup) ---------------
+# --- LR schedule (design.md section 9: cosine to 0, ~5 epoch linear warmup) ---------------
 
 
 def build_scheduler(
@@ -273,7 +273,7 @@ def build_scheduler(
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-# --- end-of-run report (ARCHITECTURE.md section 7's metrics + the two free sanity checks) -------
+# --- end-of-run report (design.md section 7's metrics + the two free sanity checks) -------
 
 
 @torch.no_grad()
@@ -306,7 +306,7 @@ def top_decile_rmse(
     pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor, decile: float = 0.1
 ) -> torch.Tensor:
     """Masked RMSE restricted to the hardest `decile` of valid cells by TRUE e_pos --
-    ARCHITECTURE.md section 7: masked RMSE over ALL valid cells is dominated by the
+    design.md section 7: masked RMSE over ALL valid cells is dominated by the
     near-constant flat-ground background and is easy to score well on for the wrong reason; the
     collision cells in this tail are the entire point of the model."""
     e_pos_idx = TARGET_NAMES.index("e_pos")
@@ -321,7 +321,7 @@ def top_decile_rmse(
 
 def r_squared(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """[K] R^2 per head over valid cells: 1 - SS_res/SS_tot, SS_tot against the valid-cell mean
-    (not zero) -- ARCHITECTURE.md section 7."""
+    (not zero) -- design.md section 7."""
     mask_f = mask.unsqueeze(-1).expand_as(pred).float()
     reduce_dims = tuple(range(pred.dim() - 1))
     n = mask_f.sum(dim=reduce_dims).clamp_min(1.0)
@@ -342,7 +342,7 @@ def wz_zero_check(
     blur_terrain: bool = False,
 ) -> torch.Tensor | None:
     """Rows with wz~=0 command no motion, so the true field is ~0 everywhere -- the prediction
-    must be too. Free sanity check, needs no baseline at all (ARCHITECTURE.md section 7).
+    must be too. Free sanity check, needs no baseline at all (design.md section 7).
     Returns None if the val split happens to contain no such row."""
     idx = [i for i in val_idx if abs(float(ds.wz[i])) < 1e-6]
     if not idx:
@@ -367,7 +367,7 @@ def mirror_equivariance_check(
     n: int = 8,
 ) -> float:
     """f(flip(h), -wz) should equal flip(f(h, wz)) to numerical noise once trained -- the exact
-    symmetry mirror_augment() trains on doubles as this test (ARCHITECTURE.md section 6a).
+    symmetry mirror_augment() trains on doubles as this test (design.md section 6a).
     Compared in MODEL space (pre-TargetTransform), so this checks the net's own equivariance
     rather than round-tripping through log1p/standardize. Returns the max abs difference."""
     idx = val_idx[:n]
@@ -392,7 +392,7 @@ def final_report(
     blur_terrain: bool = False,
 ) -> None:
     """Reloads the BEST checkpoint (not just the last epoch's in-memory weights) and prints the
-    ARCHITECTURE.md section 7 battery: overall + top-decile masked RMSE, R^2 per head, the wz~=0
+    design.md section 7 battery: overall + top-decile masked RMSE, R^2 per head, the wz~=0
     check, and mirror equivariance."""
     model, ckpt = load_checkpoint(checkpoint_path, device)
     target_transform = model.target_transform

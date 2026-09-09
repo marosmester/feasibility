@@ -1,4 +1,4 @@
-"""`GridPoseErrorNet`: the divergence-FIELD architecture described in ARCHITECTURE.md -- read
+"""`GridPoseErrorNet`: the divergence-FIELD architecture described in design.md -- read
 that file first, this module is the literal implementation of its section 4 (network), 3
 (preprocessing) and 5a (target transform). Consumes exactly what
 custom_dataset.GridPoseErrorDataset yields:
@@ -9,7 +9,7 @@ custom_dataset.GridPoseErrorDataset yields:
 plus `spawn_xy` [G, G, 2] (world x,y of every lattice cell, identical for every row -- read
 straight from the dataset file, not hardcoded here).
 
-Architecture, one line each (see ARCHITECTURE.md for the why):
+Architecture, one line each (see design.md for the why):
     heightmap -> per-sample relief, in wheel radii     (section 3a)
     wz        -> (wz/WZ_MAX, |wz|/WZ_MAX)              (section 3b)
     8x FiLM'd conv blocks, valid-info-only via
@@ -59,7 +59,7 @@ DEFAULT_BASE_WIDTH = 32
 DEFAULT_EMBED_DIM = 32
 OUT_DIM = len(TARGET_NAMES)  # 2 -- (e_pos, e_rot)
 
-# (channel multiplier of base_width, stride) per trunk block -- ARCHITECTURE.md section 4c's
+# (channel multiplier of base_width, stride) per trunk block -- design.md section 4c's
 # table, literally: 8 blocks, two stride-2 downsamples, channels widen 1x -> 2x -> 3x. This list
 # IS the receptive-field derivation -- changing it changes the 35 px / 3.5 m RF the whole trunk
 # depth was chosen to hit, so treat it as load-bearing, not a free tuning knob.
@@ -70,7 +70,7 @@ TRUNK_PLAN: tuple[tuple[int, int], ...] = (
 
 def receptive_field(plan: tuple[tuple[int, int], ...] = TRUNK_PLAN, kernel: int = 3) -> int:
     """Receptive field in input pixels of the last block of `plan`, via the standard conv-stack
-    recurrence RF += (kernel-1)*jump, jump *= stride -- the arithmetic behind ARCHITECTURE.md's
+    recurrence RF += (kernel-1)*jump, jump *= stride -- the arithmetic behind design.md's
     per-block RF column. Used both to report the number and, in the self-check below, to verify
     it against an actual autograd probe rather than trusting the formula blindly."""
     rf, jump = 1, 1
@@ -82,7 +82,7 @@ def receptive_field(plan: tuple[tuple[int, int], ...] = TRUNK_PLAN, kernel: int 
 
 def readout_offset(extent: float, n_input: int, n_feat: int) -> float:
     """World-space offset (m) of the trunk's feature lattice from the map centre, which
-    ARCHITECTURE.md section 4d's "spans world x,y in [-5.0, +5.0]" glosses over and `grid_sample`
+    design.md section 4d's "spans world x,y in [-5.0, +5.0]" glosses over and `grid_sample`
     would otherwise get wrong.
 
     A stride-2 `padding=1` conv centres output cell k on INPUT cell 2k, so after two of them cell
@@ -105,7 +105,7 @@ def readout_offset(extent: float, n_input: int, n_feat: int) -> float:
 
 def relief(heightmap: torch.Tensor, wheel_radius: float = WHEEL_RADIUS) -> torch.Tensor:
     """[B, H, W] absolute world z (m) -> [B, 1, H, W] height relative to this SAMPLE's own median,
-    scaled by wheel radius -- ARCHITECTURE.md section 3a. The median is computed per sample (each
+    scaled by wheel radius -- design.md section 3a. The median is computed per sample (each
     map has its own background elevation) and is a single scalar per sample: it recenters every
     pixel by the same amount, so it does not leak position-specific information about far-away
     terrain into a given pixel -- only "what counts as flat here", the same background estimate
@@ -115,7 +115,7 @@ def relief(heightmap: torch.Tensor, wheel_radius: float = WHEEL_RADIUS) -> torch
 
 
 def command_features(wz: torch.Tensor, wz_max: float = WZ_MAX) -> torch.Tensor:
-    """[B] rad/s -> [B, 2] = (wz/wz_max, |wz|/wz_max) -- ARCHITECTURE.md section 3b. Two numbers
+    """[B] rad/s -> [B, 2] = (wz/wz_max, |wz|/wz_max) -- design.md section 3b. Two numbers
     because they mean different physical things: |wz| sets how far the fixed-duration turn
     sweeps (so how much of the disc is swept at all), the sign sets which way the rear wheel
     goes -- handing the net both spares it from carving |.| out of what is otherwise one linear
@@ -144,7 +144,7 @@ class ChannelLayerNorm(nn.Module):
 
 
 class FiLMBlock(nn.Module):
-    """One conv block, FiLM-conditioned on the command embedding `e` -- ARCHITECTURE.md section
+    """One conv block, FiLM-conditioned on the command embedding `e` -- design.md section
     4b. `replicate` padding, never zeros: zero padding stamps a distinctive constant at the
     border (a route to encoding absolute position), whereas replicate extends the edge height
     outward, which is the SAME boundary condition HeightMapReader.sample uses (clamps to the
@@ -182,7 +182,7 @@ class TargetTransform:
     Fit on TRAIN rows' VALID (mask == True) cells only: masked cells are exact zeros by
     construction (generate_dataset.py's `y[~mask] = 0.0`), and folding thousands of spurious
     zeros into the mean/std would badly skew the standardization toward "everything is zero" on
-    a field that is mostly-flat-ground anyway (see ARCHITECTURE.md section 5a)."""
+    a field that is mostly-flat-ground anyway (see design.md section 5a)."""
 
     normalizer: Normalizer
 
@@ -207,7 +207,7 @@ class TargetTransform:
 
 class GridPoseErrorNet(nn.Module):
     """heightmap [B, G_h, G_h] + wz [B] -> divergence field [B, G, G, 2] at `spawn_xy`'s
-    positions, in TargetTransform (log1p/standardized) space -- ARCHITECTURE.md section 4.
+    positions, in TargetTransform (log1p/standardized) space -- design.md section 4.
 
     `spawn_xy` and `extent` are forward() arguments rather than baked into the model: `spawn_xy`
     comes straight from the dataset file (so the lattice geometry is read from data, never
@@ -246,7 +246,7 @@ class GridPoseErrorNet(nn.Module):
             in_channels = out_channels
         self.blocks = nn.ModuleList(blocks)
 
-        # ARCHITECTURE.md section 4a's per-cell head: Conv1x1 96 -> 64 -> 2. Both widths are
+        # design.md section 4a's per-cell head: Conv1x1 96 -> 64 -> 2. Both widths are
         # expressed in base_width (3x -> 2x) rather than as a fraction of the trunk's output, so
         # they scale with the one knob section 4e names and can't silently floor for a TRUNK_PLAN
         # whose last multiplier isn't divisible by 3.
@@ -271,9 +271,9 @@ class GridPoseErrorNet(nn.Module):
         """heightmap [B, H, W], wz [B], spawn_xy [G, G, 2] (world x, y; shared across the batch)
         -> [B, G, G, 2] in TargetTransform space. `extent` must match the heightmap tensor's own
         (utils.heightmap_to_tensor's `extent` at generation time), so the grid_sample readout
-        queries world coordinates against the right normalization -- see ARCHITECTURE.md 4d.
+        queries world coordinates against the right normalization -- see design.md 4d.
 
-        `blur_terrain` is ARCHITECTURE.md section 7's third baseline: flatten the terrain to a
+        `blur_terrain` is design.md section 7's third baseline: flatten the terrain to a
         single number per sample, keeping the architecture and the command path intact, so a run
         with it on measures what the net can do WITHOUT terrain structure. It is applied to the
         RELIEF, not to the raw heightmap: relief() re-centres each map on its own median, so
@@ -374,7 +374,7 @@ if __name__ == "__main__":
     print(f"[forward] heightmap {tuple(heightmap.shape)}, wz {tuple(wz.shape)} -> y_hat {tuple(y_hat.shape)}")
 
     # --- blur baseline self-check: blurring the RELIEF must keep the "is there a box" scalar
-    # (ARCHITECTURE.md section 7), where blurring the raw heightmap would zero it out. ----------
+    # (design.md section 7), where blurring the raw heightmap would zero it out. ----------
     boxed = torch.zeros(1, H, H)
     boxed[0, 40:60, 40:60] = 0.7  # one 2 m box on flat ground
     blurred_relief = relief(boxed).mean(dim=(-2, -1))
