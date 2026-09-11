@@ -16,6 +16,7 @@ per build).
 
 from __future__ import annotations
 
+import gc
 import pathlib
 from dataclasses import dataclass
 
@@ -451,12 +452,34 @@ def run_ostrich_batch(
     free fall from the +0.5 m spawn, impact, then static to 4 decimal places), so the remaining
     ~53 are uncaptured Python-loop steps that change nothing. Callers that rebuild the simulator
     per batch (generate_dataset.py) pay that pre-roll once per chunk and should pass an explicit
-    count; the compare_*.py scenarios run it once for a whole sweep and leave it at None."""
-    sim = HelhestBatchSimulator(
-        sim_config, render_config, engine_config, logging_config,
-        k_p=K_P, mu_front=mu, mu_rear=mu, terrain=terrain, spawn_pose=spawn_pose,
-    )
-    return sim.replay_graph_batch(setpoints, settle_steps)
+    count; the compare_*.py scenarios run it once for a whole sweep and leave it at None.
+
+    The build is torn down before returning, which is what keeps a per-chunk caller's VRAM flat
+    -- see the `finally` below."""
+    try:
+        sim = HelhestBatchSimulator(  # inside the try so a build that dies partway (an OOM here
+            # is exactly how this used to surface) still gets collected rather than adding to the
+            # pile
+            sim_config, render_config, engine_config, logging_config,
+            k_p=K_P, mu_front=mu, mu_rear=mu, terrain=terrain, spawn_pose=spawn_pose,
+        )
+        return sim.replay_graph_batch(setpoints, settle_steps)
+    finally:
+        # Drop the build and force a cyclic-GC pass, so its device memory comes back NOW rather
+        # than whenever CPython next happens to collect. Everything this function allocates on
+        # the GPU (newton Model, CollisionPipeline, the two states, the captured CUDA graph) sits
+        # in reference cycles, so refcounting alone never frees it -- only the cyclic collector
+        # does, and that collector is triggered by container-object COUNT, which is blind to the
+        # hundreds of MB of VRAM hanging off those few objects. A caller that rebuilds one
+        # simulator per chunk (the dataset generators) therefore piles dead simulators onto the
+        # GPU in a sawtooth: measured at num_worlds=64, 550 -> 966 MiB over five rebuilds before
+        # a collection happened to fire. max_triangle_pairs scales with num_worlds, so at
+        # num_worlds=512 one dead build is ~10x that and a long run OOMs a 24 GB card partway
+        # through. Both statements below are load-bearing and in this order: gc.collect() only
+        # helps once THIS frame's reference is gone. One collect per chunk costs milliseconds
+        # against a multi-second rollout.
+        sim = None
+        gc.collect()
 
 
 # --- helhest_stack: natively batched ForwardSimulator -------------------------------------------
