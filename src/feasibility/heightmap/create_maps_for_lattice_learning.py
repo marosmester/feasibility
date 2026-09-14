@@ -34,11 +34,8 @@ generate_dataset.py would glob those stale maps too.
 `base_rms` (off by default) adds a create_rough_terrain layer under boxes/walls/ramps maps, so
 steps and ramps are also seen on non-flat ground.
 
-Diagnostic column "spawn-blocked": the fraction of cells above generate_dataset.py's
-obstacle_height_threshold (median + 0.15 * (max - median)), re-computed here. That filter rejects
-spawn footprints above it, which means almost no spawns ON ramps, and on rough maps it can reject
-much of the ground. It is a known limitation of the dataset generator, not fixed here; this column
-makes it visible per map.
+The `category` key in each sidecar is read back by lattice_learning/spawn_sampling.py: `rough`
+maps are sampled uniformly, the others are targeted at trials whose arc meets terrain.
 
 CLI parameters:
     --seed INT         RNG seed; REQUIRED -- also names the default output subdirectory
@@ -117,7 +114,6 @@ BASE_ROUGH = {"cutoff_wavelength": 2.0, "min_wavelength": 0.6, "beta": 2.5}
 # Stable ids feed the per-map SeedSequence -- append new categories, never reorder.
 CATEGORY_IDS: dict[str, int] = {"boxes": 0, "walls": 1, "ramps": 2, "rough": 3}
 INDEX_WIDTH = 4
-SPAWN_THRESHOLD_FRACTION = 0.15  # == generate_dataset.py's OBSTACLE_MARGIN_FRACTION, re-derived
 
 
 def parse_ratios(text: str) -> dict[str, float]:
@@ -240,19 +236,11 @@ def to_plain(value: object) -> object:
     return value
 
 
-def spawn_blocked_fraction(H: np.ndarray, max_z: float) -> float:
-    """Share of cells above generate_dataset.py's obstacle_height_threshold -- see module docstring."""
-    baseline = float(np.median(H))
-    threshold = baseline + SPAWN_THRESHOLD_FRACTION * (max_z - baseline)
-    return float(np.count_nonzero(H > threshold)) / H.size
-
-
 def describe(category: str, name: str, hmap: HeightMapReader, params: dict) -> str:
     covered = float(np.count_nonzero(np.abs(hmap.H - np.median(hmap.H)) > GROUND_EPS)) / hmap.H.size
     return (
         f"{name:<14} {category:<5} features {params['n_features']:>2}  "
-        f"relief {hmap.H.max() - hmap.H.min():.3f} m  non-flat {covered:6.1%}  "
-        f"spawn-blocked {spawn_blocked_fraction(hmap.H, hmap.max_z):6.1%}"
+        f"relief {hmap.H.max() - hmap.H.min():.3f} m  non-flat {covered:6.1%}"
     )
 
 

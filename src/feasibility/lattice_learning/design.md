@@ -705,8 +705,7 @@ twin→ostrich diagnostic split of §1a.
 
 `valid = False` for: a non-finite ostrich pose; a settle at the arc endpoint that itself failed
 (`residual > resid_tol` or `clearance < clear_margin`) — those poses are `blocked` at inference and
-`d_hat` is never queried there; a spawn footprint on an obstacle
-(`generate_dataset_utils.obstacle_height_threshold`'s filter, re-derived locally); an implausible
+`d_hat` is never queried there; an implausible
 displacement, the analogue of `grid_learning/remask_dataset.py`'s `MAX_SPAWN_DISPLACEMENT`, here
 `||t1 - t0|| > 3 * ARC_LEN`; and — per §3c, since there is no `measured` channel to say so — **any
 pose whose patch would overhang the heightmap**, i.e. within `max(|x|, |y|)` of the patch corner from
@@ -727,10 +726,14 @@ ground) and `assets/surface/` for slope-and-turn cases the box series cannot pro
 `grid_learning_2` §1c, **terrain diversity is the binding constraint on generalisation** — more
 trials on the same maps buy less than more maps.
 
-Poses: continuous, not on a lattice. `spawn_mode="continuous"`-style rejection sampling against the
-obstacle-height filter and against the patch-overhang filter above, with the sampling square sized
-against the loaded map rather than a fixed `SPAWN_LIMIT` (these arcs are short, so a much larger
-fraction of each map is usable than `learning/` assumed).
+Poses: continuous, not on a lattice, with the sampling square sized against the loaded map rather
+than a fixed `SPAWN_LIMIT` (these arcs are short, so a much larger fraction of each map is usable
+than `learning/` assumed). (Revised: `spawn_sampling.py`.) Spawn pose and `kappa` are drawn together;
+a trial is kept iff the static settle is feasible at the spawn and at the nominal arc end and the
+patch does not overhang — the original obstacle-height filter forbade every ramp face and plateau
+and much of rough ground. On non-`rough` maps a fixed share `interact_frac` of trials is drawn from
+those whose arc meets terrain (plane-relative relief along the arc > `interact_relief`), since
+uniform sampling meets terrain on as few as 1–10% of trials on ramp maps.
 
 Cost per trial, at `OSTRICH_DT = 2.5e-2` (§2a): `settle_steps = 15` amortised per chunk (0.375 s,
 uncaptured), `W ≈ 15` warm-up (0.375 s), and `T = ARC_LEN/(V_NOM*OSTRICH_DT) = 20` recorded steps

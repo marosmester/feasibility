@@ -17,12 +17,12 @@ Three things this generator does that no sibling generator does, all from design
   characterization baseline). Kept a multiple of the twin's own dt even though this generator does
   not run the twin, so a future arc-vs-twin diagnostic pass can replay the same trials.
 * **The reference is the arc integrated from `t0_pose`, plus a static settle at its endpoint**
-  (section 1b) -- not the twin. `settle_batch()` below re-derives `costtogo.py`'s own
+  (section 1b) -- not the twin. `settle.settle_batch()` re-derives `costtogo.py`'s own
   `ForwardSimulator` settle convention (`n_steps=1`, zero command, row 0 of `derived` IS the
   static settle) rather than importing anything from `helhest.planning`, since that machinery is
   embedded in `CostToGo`'s captured-graph setup and isn't meant to be called standalone per trial.
-  This is the ONLY use of `helhest_stack`'s `ForwardSimulator` here -- a static, zero-command,
-  single-step settle at a given pose, not a dynamic rollout. The label itself only ever compares
+  That static, zero-command, single-step settle (here and in spawn validity) is the ONLY use of
+  `helhest_stack`'s `ForwardSimulator` -- never a dynamic rollout. The label itself only ever compares
   ostrich against this arc-plus-settle reference (`custom_dataset.py`); the twin's own dynamic
   trajectory over the arc is not simulated at all in this prototype. Section 1a's arc-vs-twin /
   twin-vs-ostrich diagnostic split is a possible FUTURE addition, not implemented here -- adding
@@ -34,12 +34,18 @@ Three things this generator does that no sibling generator does, all from design
 arc, at the arc's OWN (fixed) heading -- matching the kernel's own convention of indexing
 `blocked[..., t]` at the sweep's outer heading, not the locally-varying arc heading.
 
+Trial selection -- spawn pose AND kappa -- lives in this package's `spawn_sampling.py`
+(`sample_trials`): a spawn is valid iff the static settle there is feasible, and on targeted maps
+`+interact_frac` of the trials are drawn from those whose arc meets terrain (`arc_relief`, stored
+per row, together with a per-row `targeted` flag). Maps whose sidecar `category` is in
+`+untargeted_categories` (default: rough -- flat and low-amplitude rough ground) are sampled
+uniformly.
+
 Deliberately independent of `feasibility.learning`, `feasibility.grid_learning` and
-`feasibility.grid_learning_2` (design.md section 11a): the obstacle/footprint filter is
-re-derived here (as every sibling generator's own copy is) rather than imported.
-`feasibility.comparator` (the batch-rollout core, and `provenance`'s terrain/git embedding) and
-`feasibility.heightmap` are shared infrastructure and ARE imported; so are this package's own
-`arc.py`/`patch.py`, since the dataset schema is a contract between this generator and this
+`feasibility.grid_learning_2` (design.md section 11a). `feasibility.comparator` (the batch-rollout
+core, and `provenance`'s terrain/git embedding) and `feasibility.heightmap` are shared
+infrastructure and ARE imported; so are this package's own `arc.py`/`patch.py`/`settle.py`/
+`spawn_sampling.py`, since the dataset schema is a contract between this generator and this
 package's `model.py`/`custom_dataset.py`. `helhest`/`ostrich` are objects of study, imported
 directly.
 
@@ -71,13 +77,14 @@ config):
                          (default: 0.24, demos/navigate_partial_view.py's lat_coarsen=4 example)
     +n_theta=INT         the router's own heading bin count -- sets yaw_jitter = pi/this
                          (default: 24)
-    +near_obstacle_frac=FLOAT  fraction of each map's spawns biased towards the obstacle
-                         boundary rather than drawn uniformly over the map (default: 0.0, i.e.
-                         unbiased) -- see sample_spawn_poses' docstring; uniform sampling alone
-                         lands an arc's endpoint on the obstacle only 1-3% of the time
-    +near_obstacle_band=FLOAT  max distance in meters from the obstacle boundary a biased
-                         candidate is drawn from (default: 1.0)
-    +dry_run=BOOL        geometry/filter/count only -- no simulation, no output (default: false)
+    +interact_frac=FLOAT exact share of a targeted map's trials whose arc meets terrain, i.e.
+                         arc_relief > interact_relief (default: 0.5); null = uniform on every map
+    +interact_relief=FLOAT  m, plane-relative terrain relief along the arc that counts as meeting
+                         terrain (default: 0.05)
+    +untargeted_categories=[..]  sidecar categories sampled uniformly (default: [rough]; [] for
+                         none). Maps without a `category` key are targeted.
+    +dry_run=BOOL        trial sampling (settle on CPU) on every selected map, no ostrich, no
+                         output (default: false)
     Also accepts any standard Hydra config-group override against the "helhest" base config
     (engine=mujoco, simulation=..., logging=...); rendering is forced headless.
 
@@ -101,9 +108,6 @@ from ostrich import LoggingConfig
 from ostrich import RenderingConfig
 from ostrich import SimulationConfig
 
-from helhest import dynamics
-from helhest import friction as friction_mod
-from helhest.engine import ForwardSimulator
 from helhest.engine import RobotParams
 
 from feasibility.comparator.common import cmd_to_wheels
@@ -124,7 +128,14 @@ from feasibility.lattice_learning.patch import patch_overhangs
 from feasibility.lattice_learning.patch import PatchSpec
 from feasibility.lattice_learning.patch import patch_spec_to_attrs
 from feasibility.lattice_learning.patch import sample_patches
-from feasibility.lattice_learning.patch import WHEEL_CONTACTS_LOCAL
+from feasibility.lattice_learning.settle import settle_batch
+from feasibility.lattice_learning.settle import settle_feasible
+from feasibility.lattice_learning.spawn_sampling import DEFAULT_INTERACT_FRAC
+from feasibility.lattice_learning.spawn_sampling import DEFAULT_INTERACT_RELIEF
+from feasibility.lattice_learning.spawn_sampling import DEFAULT_UNTARGETED_CATEGORIES
+from feasibility.lattice_learning.spawn_sampling import map_category
+from feasibility.lattice_learning.spawn_sampling import sample_trials
+from feasibility.lattice_learning.spawn_sampling import SpawnBatch
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 
@@ -173,18 +184,6 @@ DEFAULT_CHUNK = 64  # trials per ostrich model build -- a tuning knob, not a har
 DEFAULT_ROUTER_CELL = 0.24  # m -- demos/navigate_partial_view.py's lat_coarsen=4 example (design.md
 # section 6a); only used to derive xy_jitter = this/2 (section 1c)
 DEFAULT_N_THETA = 24  # the router's own heading bin count; only used to derive yaw_jitter = pi/this
-DEFAULT_NEAR_OBSTACLE_FRAC = 0.0  # fraction of each map's spawns biased towards the obstacle
-# boundary instead of drawn uniformly -- 0.0 reproduces the original unbiased sampling exactly;
-# see sample_spawn_poses' docstring for why this knob exists (measured 1-3% "arc lands on the
-# obstacle" rate under uniform sampling, regardless of the obstacle's own size).
-DEFAULT_NEAR_OBSTACLE_BAND = 1.0  # m -- max distance from the obstacle boundary a biased
-# candidate is drawn from (see sample_spawn_poses)
-
-OBSTACLE_MARGIN_FRACTION = 0.15  # a footprint point counts as "on an obstacle" once its height
-# clears this fraction of the way from the terrain's median height to its max -- same convention
-# and same value as learning/generate_dataset_utils.py and grid_learning_2/generate_dataset.py's
-# own re-derivations (design.md section 11a): re-derived, not imported, but not re-tuned either.
-
 MAX_SPAWN_DISPLACEMENT = 3.0 * ARC_LEN  # m -- design.md section 7b: a final pose farther than
 # this from the arc's own origin t0_pose is an implausible/diverged solve, not a large-but-real
 # collision displacement (the arc only travels ARC_LEN=0.3m nominally).
@@ -217,178 +216,11 @@ def select_maps(maps_dir: pathlib.Path, n_maps: int, rng: np.random.Generator) -
     return [candidates[i] for i in rng.choice(len(candidates), size=n_maps, replace=False)]
 
 
-def obstacle_height_threshold(terrain: HeightMapReader) -> float:
-    """Height above which a footprint point counts as "on an obstacle" -- see
-    OBSTACLE_MARGIN_FRACTION."""
-    baseline = float(np.median(terrain.H))
-    return baseline + OBSTACLE_MARGIN_FRACTION * (terrain.max_z - baseline)
-
-
-def footprint_clear(terrain: HeightMapReader, poses: np.ndarray, threshold: float) -> np.ndarray:
-    """[n] bool -- True where `poses` [n, 3] = (x, y, yaw)'s wheel-contact + body-center footprint
-    (WHEEL_CONTACTS_LOCAL, patch.py's geometry) samples entirely below `threshold`."""
-    x, y, yaw = poses[:, 0], poses[:, 1], poses[:, 2]
-    c, s = np.cos(yaw), np.sin(yaw)
-    local_x = np.append(WHEEL_CONTACTS_LOCAL[:, 0], 0.0)
-    local_y = np.append(WHEEL_CONTACTS_LOCAL[:, 1], 0.0)
-    wx = x[:, None] + c[:, None] * local_x - s[:, None] * local_y
-    wy = y[:, None] + s[:, None] * local_x + c[:, None] * local_y
-    heights = np.asarray(terrain.sample(wx, wy), dtype=np.float64)
-    return heights.max(axis=1) <= threshold
-
-
-def _obstacle_boundary_points(terrain: HeightMapReader, threshold: float) -> np.ndarray:
-    """[k, 2] world (x, y) cell centers on the obstacle/flat-ground boundary (4-connected: an
-    obstacle cell -- H > threshold -- with at least one non-obstacle neighbor). Local
-    re-derivation of heightmap/create_large_box_obstacles.py's `accessible_frontier_score`
-    boundary mask (without its access-limit restriction, which is specific to grid_learning's
-    fixed lattice and irrelevant here) -- same re-derive-don't-import convention this module
-    already uses for `footprint_clear`/`obstacle_height_threshold`."""
-    obstacle = terrain.H > threshold
-    boundary = np.zeros_like(obstacle)
-    boundary[:-1, :] |= obstacle[:-1, :] & ~obstacle[1:, :]
-    boundary[1:, :] |= obstacle[1:, :] & ~obstacle[:-1, :]
-    boundary[:, :-1] |= obstacle[:, :-1] & ~obstacle[:, 1:]
-    boundary[:, 1:] |= obstacle[:, 1:] & ~obstacle[:, :-1]
-    ys_idx, xs_idx = np.nonzero(boundary)
-    x = terrain.x0 + (xs_idx + 0.5) * terrain.cell
-    y = terrain.y0 + (ys_idx + 0.5) * terrain.cell
-    return np.column_stack([x, y])
-
-
-def sample_spawn_poses(
-    terrain: HeightMapReader,
-    spec: PatchSpec,
-    n: int,
-    rng: np.random.Generator,
-    *,
-    near_obstacle_frac: float = 0.0,
-    near_obstacle_band: float = 1.0,
-) -> np.ndarray:
-    """`n` continuous (x, y, yaw) poses on `terrain`, rejection-sampled against the obstacle
-    footprint filter AND `spec`'s overhang radius (design.md section 7b/7c) so a valid row's patch
-    never needs `HeightMapReader.sample`'s clamp-at-the-edge fallback. The sampling square is
-    sized against THIS map's own extent, not a fixed SPAWN_LIMIT (design.md section 7c: a
-    0.3-0.6 m arc needs far less clearance than learning/'s 10x10 m spawn square).
-
-    `near_obstacle_frac` (0-1, default 0.0 -- exactly reproduces the old unbiased behaviour)
-    steers that fraction of `n` poses towards the obstacle instead of drawing them uniformly over
-    the whole map: measured empirically, uniform sampling only lands an arc's own endpoint on the
-    (single, small) obstacle 1-3% of the time, since that regime is gated by spawn-to-obstacle
-    PROXIMITY, not by obstacle size (see the create_rough_terrain_plus_boxes.py discussion this
-    knob comes from). Biased candidates are drawn within `near_obstacle_band` meters of a random
-    point on the obstacle's own boundary (`_obstacle_boundary_points`) and pass through the EXACT
-    SAME footprint_clear/patch_overhangs filters as a uniform candidate, so biasing can only
-    change which valid poses get sampled, never weaken validity. A map with no obstacle at all
-    (an all-flat threshold) falls back to uniform sampling for that share too."""
-    if not 0.0 <= near_obstacle_frac <= 1.0:
-        raise ValueError(f"near_obstacle_frac must be in [0, 1], got {near_obstacle_frac}")
-    margin = spec.reach + 0.1  # m, a little slack beyond the exact overhang radius
-    x_lo, x_hi = terrain.x0 + margin, terrain.x0 + terrain.nx * terrain.cell - margin
-    y_lo, y_hi = terrain.y0 + margin, terrain.y0 + terrain.ny * terrain.cell - margin
-    if x_hi <= x_lo or y_hi <= y_lo:
-        raise ValueError(
-            f"terrain is too small for a patch reach of {spec.reach:.2f} m with margin "
-            f"(extent {terrain.nx * terrain.cell:.2f} x {terrain.ny * terrain.cell:.2f} m)"
-        )
-    threshold = obstacle_height_threshold(terrain)
-    boundary_xy = (
-        _obstacle_boundary_points(terrain, threshold) if near_obstacle_frac > 0.0 else None
-    )
-
-    def propose_uniform(count: int) -> np.ndarray:
-        x = rng.uniform(x_lo, x_hi, size=count)
-        y = rng.uniform(y_lo, y_hi, size=count)
-        yaw = rng.uniform(0.0, 2.0 * np.pi, size=count)
-        return np.column_stack([x, y, yaw])
-
-    def propose_near_obstacle(count: int) -> np.ndarray:
-        if boundary_xy is None or len(boundary_xy) == 0:
-            return propose_uniform(count)  # no obstacle on this map -- nothing to bias towards
-        pick = rng.integers(0, len(boundary_xy), size=count)
-        r = rng.uniform(0.0, near_obstacle_band, size=count)
-        theta = rng.uniform(0.0, 2.0 * np.pi, size=count)
-        x = np.clip(boundary_xy[pick, 0] + r * np.cos(theta), x_lo, x_hi)
-        y = np.clip(boundary_xy[pick, 1] + r * np.sin(theta), y_lo, y_hi)
-        yaw = rng.uniform(0.0, 2.0 * np.pi, size=count)
-        return np.column_stack([x, y, yaw])
-
-    def accept(propose, count: int) -> np.ndarray:
-        accepted = np.empty((0, 3), dtype=np.float64)
-        for _ in range(20):  # bounded retries, same convention as generate_dataset_utils.py
-            missing = count - len(accepted)
-            if missing <= 0:
-                break
-            candidates = propose(2 * missing)
-            ok = footprint_clear(terrain, candidates, threshold) & ~patch_overhangs(
-                terrain, candidates, spec
-            )
-            accepted = np.concatenate([accepted, candidates[ok]])
-        return accepted[:count]
-
-    n_near = round(n * near_obstacle_frac)
-    near = accept(propose_near_obstacle, n_near) if n_near else np.empty((0, 3), dtype=np.float64)
-    uniform = accept(propose_uniform, n - n_near)
-    accepted = np.concatenate([near, uniform])
-    if len(accepted) < n:
-        raise ValueError(
-            f"sample_spawn_poses: only found {len(accepted)}/{n} clear poses "
-            f"({len(near)}/{n_near} near-obstacle, {len(uniform)}/{n - n_near} uniform) after 20 "
-            "rejection-sampling rounds each -- check the map's obstacle coverage / extent."
-        )
-    rng.shuffle(accepted)  # so chunk order never correlates with which regime a pose came from
-    return accepted
-
-
 def _quat_to_yaw(q: np.ndarray) -> np.ndarray:
     """[..., 4] (qx,qy,qz,qw) -> yaw [...] (rad) -- same formula as comparator.common's private
     `_quat_yaw`, re-derived here to avoid importing a leading-underscore symbol."""
     qx, qy, qz, qw = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
     return np.arctan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
-
-
-def settle_batch(
-    terrain: HeightMapReader, poses: np.ndarray, mu: float, device: str
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Static (zero-command) settle of the twin at `poses` [n, 3] = (x, y, yaw) -- design.md
-    section 1b's producer of (z, pitch, roll), and the ONLY use of `ForwardSimulator` in this
-    module (see the module docstring: no dynamic twin rollout is run here). `n_steps=1` + a
-    zeroed `target_wheel_omega` reproduces exactly `costtogo.py`'s own `settle_sim` convention:
-    row 0 of `derived` (the pre-step state) IS the static settle, independent of n_steps or
-    command (see costtogo.py's `_feasibility_kernel` comment "row 0 = the static settle").
-    Returns (derived [n, 3] = (z, pitch, roll), residual [n], clearance [n])."""
-    elevation, grid = terrain.to_hstack(device)
-    mu_xlim = (terrain.x0, terrain.x0 + (terrain.nx - 1) * terrain.cell)
-    mu_ylim = (terrain.y0, terrain.y0 + (terrain.ny - 1) * terrain.cell)
-    mu_field = friction_mod.uniform(mu, xlim=mu_xlim, ylim=mu_ylim, cell=terrain.cell)
-    n = poses.shape[0]
-    sim = ForwardSimulator(
-        dynamics.robot_params(), dynamics.execution_solver(), grid, batch_size=n, n_steps=1,
-        device=device,
-    )
-    sim.set_terrain(elevation)
-    sim.set_friction(mu_field)
-    sim.start_pose.assign(np.ascontiguousarray(poses, np.float32))
-    sim.target_wheel_omega.zero_()
-    sim.rollout_launch()
-    derived = sim.derived.numpy()[0]  # [n, 3]
-    residual = sim.residual.numpy()[0]  # [n]
-    clearance = sim.clearance.numpy()[0]  # [n]
-    return derived, residual, clearance
-
-
-def settle_feasible(
-    derived: np.ndarray, residual: np.ndarray, clearance: np.ndarray, robot: RobotParams
-) -> np.ndarray:
-    """[n] bool -- reproduces costtogo.py's `_feasibility_kernel` OR, in numpy: direction-aware
-    envelope (climb = nose-up = NEGATIVE pitch) plus residual/clearance thresholds."""
-    pitch, roll = derived[:, 1], derived[:, 2]
-    over_envelope = (
-        (np.abs(roll) > robot.max_roll)
-        | (pitch < -robot.max_pitch_up)
-        | (pitch > robot.max_pitch_down)
-    )
-    return ~(over_envelope | (residual > robot.resid_tol) | (clearance < robot.clear_margin))
 
 
 def swept_clear_batch(
@@ -425,22 +257,23 @@ def simulate_map(
     kappa_max: float,
     mu: float,
     device: str,
-    near_obstacle_frac: float = 0.0,
-    near_obstacle_band: float = 1.0,
-) -> dict[str, np.ndarray]:
+    interact_frac: float | None = None,
+    interact_relief: float = DEFAULT_INTERACT_RELIEF,
+) -> tuple[dict[str, np.ndarray], SpawnBatch]:
     """Replays `n` continuous (spawn pose, kappa) trials on ONE terrain, `chunk` at a time, and
     returns every per_variant/ostrich array design.md section 7b's schema needs (minus the
-    deferred hstack diagnostic -- see the module docstring). See the module docstring for the
-    warm-start / reference / swept_clear pieces this stitches together."""
+    deferred hstack diagnostic -- see the module docstring), plus the sampler's own summary.
+    Trials come from `spawn_sampling.sample_trials` (`interact_frac=None` = untargeted). See the
+    module docstring for the warm-start / reference / swept_clear pieces this stitches together."""
     robot = RobotParams()
-    spawn_pose = sample_spawn_poses(
-        terrain, spec, n, rng,
-        near_obstacle_frac=near_obstacle_frac, near_obstacle_band=near_obstacle_band,
-    )
-    kappa = rng.uniform(-kappa_max, kappa_max, size=n).astype(np.float32)
-
     w_o = round(warmup_s / OSTRICH_DT)
     T_o = w_o + T_RECORD_OSTRICH
+
+    trials = sample_trials(
+        terrain, spec, n, rng, kappa_max=kappa_max, lead=w_o * OSTRICH_DT * V_NOM, mu=mu,
+        device=device, interact_frac=interact_frac, interact_relief=interact_relief, robot=robot,
+    )
+    spawn_pose, kappa = trials.pose, trials.kappa
 
     t0_pose = np.zeros((n, 3), dtype=np.float64)
     belief_pose = np.zeros((n, 3), dtype=np.float64)
@@ -533,6 +366,7 @@ def simulate_map(
         belief_pose=belief_pose.astype(np.float32),
         patch=patch,
         kappa=kappa,
+        arc_relief=trials.arc_relief,
         arc_end_pose=arc_end_pose.astype(np.float32),
         ref_pose=ref_pose,
         valid=valid,
@@ -540,7 +374,7 @@ def simulate_map(
         ostrich_pose=ostrich_pose,
         ostrich_wheel_qd=ostrich_wheel_qd,
         ostrich_cmd=ostrich_cmd,
-    )
+    ), trials
 
 
 def _write_fields(group: h5py.Group, fields: dict[str, np.ndarray]) -> None:
@@ -606,9 +440,17 @@ def generate(cfg: DictConfig) -> None:
     device = str(cfg.get("device", "cuda:0"))
     router_cell = float(cfg.get("router_cell", DEFAULT_ROUTER_CELL))
     n_theta = int(cfg.get("n_theta", DEFAULT_N_THETA))
-    near_obstacle_frac = float(cfg.get("near_obstacle_frac", DEFAULT_NEAR_OBSTACLE_FRAC))
-    near_obstacle_band = float(cfg.get("near_obstacle_band", DEFAULT_NEAR_OBSTACLE_BAND))
+    interact_frac_cfg = cfg.get("interact_frac", DEFAULT_INTERACT_FRAC)
+    interact_frac = None if interact_frac_cfg is None else float(interact_frac_cfg)
+    interact_relief = float(cfg.get("interact_relief", DEFAULT_INTERACT_RELIEF))
+    untargeted_categories = tuple(
+        str(c) for c in cfg.get("untargeted_categories", DEFAULT_UNTARGETED_CATEGORIES)
+    )
     dry_run = bool(cfg.get("dry_run", False))
+
+    def map_interact_frac(stem: pathlib.Path) -> float | None:
+        """None (uniform draws) for maps whose sidecar category is untargeted, else the knob."""
+        return None if map_category(stem) in untargeted_categories else interact_frac
 
     spec = PatchSpec()
     xy_jitter = router_cell / 2.0  # design.md section 1c
@@ -621,6 +463,8 @@ def generate(cfg: DictConfig) -> None:
     print(f"[patch]    {spec.ny}x{spec.nx} cells @ {spec.cell} m, reference={spec.reference}")
     print(f"[jitter]   xy=+-{xy_jitter:.4f} m (router_cell={router_cell}), "
           f"yaw=+-{yaw_jitter:.4f} rad (n_theta={n_theta})")
+    print(f"[trials]   interact_frac={interact_frac} (arc_relief > {interact_relief} m), "
+          f"untargeted categories: {', '.join(untargeted_categories) or 'none'}")
 
     rng = np.random.default_rng(seed)
     map_paths = select_maps(maps_dir, n_maps, rng)
@@ -628,20 +472,21 @@ def generate(cfg: DictConfig) -> None:
     print(f"[maps]     {n_maps} from {maps_dir}, {trials_per_map} trial(s) each -> {n} rows")
 
     if dry_run:
-        # Cheap CPU-only self-check: spawn sampling + filters on a synthetic flat map, and on the
-        # first REAL map if one is available -- no ostrich rollout, no GPU kernel launched.
-        flat = HeightMapReader.flat(xlim=(-8.0, 8.0), ylim=(-8.0, 8.0))
-        flat_spawns = sample_spawn_poses(flat, spec, 16, rng)
-        assert flat_spawns.shape == (16, 3)
-        assert not patch_overhangs(flat, flat_spawns, spec).any(), "flat ground must never overhang"
-        real = HeightMapReader.load(map_paths[0])
-        real_spawns = sample_spawn_poses(real, spec, 16, rng)
-        threshold = obstacle_height_threshold(real)
-        assert footprint_clear(real, real_spawns, threshold).all()
-        assert not patch_overhangs(real, real_spawns, spec).any()
+        # CPU-only check: trial sampling (including its static settle, run on CPU) on every
+        # selected map -- no ostrich rollout, nothing written.
         assert T_RECORD_OSTRICH * OSTRICH_DT == ARC_DURATION_S
-        print(f"[dry-run]  {map_paths[0].name}: 16/16 sampled spawns clear + non-overhanging, "
-              "step-count/duration self-checks ok, nothing simulated")
+        lead = round(warmup_s / OSTRICH_DT) * OSTRICH_DT * V_NOM
+        for p in map_paths:
+            frac = map_interact_frac(p)
+            trials = sample_trials(
+                HeightMapReader.load(p), spec, trials_per_map, rng, kappa_max=kappa_max, lead=lead,
+                mu=mu, device="cpu", interact_frac=frac, interact_relief=interact_relief,
+            )
+            n_int = int((trials.arc_relief > interact_relief).sum())
+            short = f", {trials.shortfall} short" if trials.shortfall else ""
+            print(f"[dry-run]  {p.name}: {n_int}/{trials_per_map} interacting "
+                  f"({'targeted' if trials.targeted else 'untargeted'}{short})")
+        print("[dry-run]  sampling + step-count/duration self-checks ok, nothing simulated")
         return
 
     init_warp_device(device)
@@ -658,35 +503,41 @@ def generate(cfg: DictConfig) -> None:
 
     per_variant_fields: dict[str, list[np.ndarray]] = {}
     ostrich_fields: dict[str, list[np.ndarray]] = {}
-    map_index_all, map_path_all = [], []
+    map_index_all, map_path_all, targeted_all = [], [], []
     terrain_entries: list[tuple[pathlib.Path, HeightMapReader]] = []
 
     for m, p in enumerate(map_paths):
         print(f"[map {m + 1}/{n_maps}] {p.name}")
         terrain = HeightMapReader.load(p)
-        result = simulate_map(
+        result, trials = simulate_map(
             terrain, trials_per_map, rng, spec=spec, xy_jitter=xy_jitter, yaw_jitter=yaw_jitter,
             sim_config=sim_config, render_config=render_config, engine_config=engine_config,
             logging_config=logging_config, chunk=chunk, settle_steps=settle_steps,
             warmup_s=warmup_s, kappa_max=kappa_max, mu=mu, device=device,
-            near_obstacle_frac=near_obstacle_frac, near_obstacle_band=near_obstacle_band,
+            interact_frac=map_interact_frac(p), interact_relief=interact_relief,
         )
-        for key in ("spawn_pose", "t0_pose", "belief_pose", "patch", "kappa", "arc_end_pose",
-                    "ref_pose", "valid", "swept_clear"):
+        for key in ("spawn_pose", "t0_pose", "belief_pose", "patch", "kappa", "arc_relief",
+                    "arc_end_pose", "ref_pose", "valid", "swept_clear"):
             per_variant_fields.setdefault(key, []).append(result[key])
         for key in ("ostrich_pose", "ostrich_wheel_qd", "ostrich_cmd"):
             ostrich_fields.setdefault(key, []).append(result[key])
         map_index_all.append(np.full(trials_per_map, m, dtype=np.int64))
         map_path_all.extend([str(p)] * trials_per_map)
+        targeted_all.append(np.full(trials_per_map, trials.targeted, dtype=bool))
         terrain_entries.extend([(p, terrain)] * trials_per_map)
 
         n_valid = int(result["valid"].sum())
+        n_int = int((trials.arc_relief > interact_relief).sum())
+        short = f", {trials.shortfall} short of target" if trials.shortfall else ""
         print(f"    -> {n_valid}/{trials_per_map} valid, "
-              f"{int(result['swept_clear'].sum())}/{trials_per_map} swept-clear")
+              f"{int(result['swept_clear'].sum())}/{trials_per_map} swept-clear, "
+              f"{n_int}/{trials_per_map} interacting "
+              f"({'targeted' if trials.targeted else 'untargeted'}{short})")
 
     per_variant = {k: np.concatenate(v, axis=0) for k, v in per_variant_fields.items()}
     per_variant["map_index"] = np.concatenate(map_index_all, axis=0)
     per_variant["map_path"] = np.array(map_path_all)
+    per_variant["targeted"] = np.concatenate(targeted_all, axis=0)
     ostrich = {k.removeprefix("ostrich_"): np.concatenate(v, axis=1) for k, v in ostrich_fields.items()}
     ostrich["dt"] = OSTRICH_DT
     ostrich["t"] = np.arange(T_RECORD_OSTRICH, dtype=np.float32) * OSTRICH_DT
@@ -702,7 +553,10 @@ def generate(cfg: DictConfig) -> None:
             kappa_min=-kappa_max, kappa_max=kappa_max,
             warmup_s=warmup_s, settle_steps=settle_steps,
             xy_jitter=xy_jitter, yaw_jitter=yaw_jitter, router_cell=router_cell, n_theta=n_theta,
-            near_obstacle_frac=near_obstacle_frac, near_obstacle_band=near_obstacle_band,
+            # NaN = untargeted everywhere (an HDF5 attr cannot hold None)
+            interact_frac=np.nan if interact_frac is None else interact_frac,
+            interact_relief=interact_relief,
+            untargeted_categories=",".join(untargeted_categories),
             maps_dir=str(maps_dir), map_glob=MAP_GLOB,
             mu=mu, k_p=K_P,
             ostrich_dt=OSTRICH_DT,
