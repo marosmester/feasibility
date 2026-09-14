@@ -1,19 +1,22 @@
 """Generate a mixed batch of heightmaps for lattice_learning/generate_dataset.py, with set ratios.
 
-Four map categories, each built by a helper in this package (this script only samples, mixes and
-writes):
+Three map categories, each built by a helper in this package (this script only samples, mixes and
+writes), and each sampled by its own strategy in lattice_learning/spawn_sampling.py, which reads
+the sidecar `category` back:
 
-    boxes   create_large_box_obstacles.build_box_map, with height drawn per map from a
-            continuous range instead of that script's fixed 0.70 m
-    walls   create_curbs_and_walls.build_walls_map: curbs, thin walls, L-corners, wall-gaps
-    ramps   create_ramps.build_ramp_map: finite-width ramps, sharp kinks, side drop-offs
-    rough   create_rough_terrain.build_rough_terrain: exactly flat, or low-amplitude rough
+    category         builder                                   trials (spawn_sampling strategy)
+    ramps            create_ramps.build_ramp_map: 0.7 m tall,  `ramp`: head-on up a face, 75%
+                     finite-width ramps, rising face 5-80 deg  straight; ramp_deg per trial
+    curbs_and_walls  create_curbs_and_walls.build_walls_map:   `edge`: near an edge, half of them
+                     curbs, walls, L-corners, gaps, boxes,     running into it (climb up or drive
+                     0.2-1.0 m tall, 80 deg sides              down)
+    rough            create_rough_terrain.build_rough_terrain: `uniform`
+                     exactly flat, or low-amplitude rough
 
-Why these, and not create_large_box_obstacles.py's default 0.70 m boxes: helhest_stack's static
-settle already blocks poses on or against obstacles that tall, so the planner never looks up an
-edge cost there. The value is in terrain the settle calls feasible but a moving robot handles
-badly -- see lattice_learning/design.md. Flat/rough maps are the negatives the network must predict
-~0 on.
+The ramps span a continuous slope so the angle where ostrich and helhest_stack start to diverge
+can be read off; the curbs and walls go from edges a wheel can mount to ones none can; flat/rough
+maps are the negatives the network must predict ~0 on. On ramps and curbs_and_walls maps a trial's
+arc end need not be settle-feasible -- the dataset flags those rows `endpoint_blocked`.
 
 Ratios and every sampling range live in the CONFIG block below; edit them there, or override just
 the ratios with --ratios. Per-category counts use largest-remainder rounding, so they always sum
@@ -31,16 +34,14 @@ removes maps at the END of a category; every existing <category>_i<NNNN> regener
 The script refuses to write into a directory holding PNGs it would not produce, since
 generate_dataset.py would glob those stale maps too.
 
-`base_rms` (off by default) adds a create_rough_terrain layer under boxes/walls/ramps maps, so
-steps and ramps are also seen on non-flat ground.
-
-The `category` key in each sidecar is read back by lattice_learning/spawn_sampling.py: `rough`
-maps are sampled uniformly, the others are targeted at trials whose arc meets terrain.
+`base_rms` (off by default) adds a create_rough_terrain layer under ramps/curbs_and_walls maps, so
+steps and ramps are also seen on non-flat ground. It breaks the ramp sampler's "wheels on this
+face's surface" check (every ramp trial would fall back), so leave it off for ramps.
 
 CLI parameters:
     --seed INT         RNG seed; REQUIRED -- also names the default output subdirectory
     --n INT            total number of maps (default: 200)
-    --ratios STR       comma-separated category=weight, e.g. boxes=0.2,walls=0.3,ramps=0.3,rough=0.2
+    --ratios STR       comma-separated category=weight, e.g. ramps=1,curbs_and_walls=1,rough=1
                        (default: DEFAULT_RATIOS below); normalized, weights must be >= 0
     --extent FLOAT     full width/height of every square map in meters (default: 12.0)
     --cell FLOAT       grid resolution in meters (default: 0.1)
@@ -50,7 +51,7 @@ CLI parameters:
 Usage:
     python src/feasibility/heightmap/create_maps_for_lattice_learning.py --seed 0 --dry-run
     python src/feasibility/heightmap/create_maps_for_lattice_learning.py --seed 0 --n 400
-    python src/feasibility/heightmap/create_maps_for_lattice_learning.py --seed 0 --ratios walls=1,rough=1
+    python src/feasibility/heightmap/create_maps_for_lattice_learning.py --seed 0 --ratios ramps=1
     python src/feasibility/lattice_learning/generate_dataset.py +maps_dir=assets/lattice_maps/0
 """
 from __future__ import annotations
@@ -67,7 +68,6 @@ from feasibility.heightmap import HeightMapReader
 from feasibility.heightmap.create_curbs_and_walls import GROUND_EPS
 from feasibility.heightmap.create_curbs_and_walls import WallsConfig
 from feasibility.heightmap.create_curbs_and_walls import build_walls_map
-from feasibility.heightmap.create_large_box_obstacles import build_box_map
 from feasibility.heightmap.create_ramps import RampsConfig
 from feasibility.heightmap.create_ramps import build_ramp_map
 from feasibility.heightmap.create_rough_terrain import build_rough_terrain
@@ -77,26 +77,18 @@ ASSETS_DIR = REPO_ROOT / "assets" / "lattice_maps"
 
 # ================================ CONFIG ==========================================================
 
-DEFAULT_RATIOS: dict[str, float] = {"boxes": 0.2, "walls": 0.3, "ramps": 0.3, "rough": 0.2}
+DEFAULT_RATIOS: dict[str, float] = {"ramps": 1 / 3, "curbs_and_walls": 1 / 3, "rough": 1 / 3}
 
 DEFAULT_N = 200
 DEFAULT_EXTENT = 12.0  # m; generate_dataset.py spawns >= 2.1 m from the edge, leaving ~7.8 m square
 DEFAULT_CELL = 0.1  # m
 
-BOXES = {
-    "height": (0.05, 0.5),  # m, one height per map (build_box_map shares it across its boxes)
-    "incline_deg": 80.0,
-    "n_boxes": 4,  # upper bound
-    "max_area_fraction": 0.25,  # below build_box_map's 0.5 so spawn sampling keeps clear ground
-    "position_trials": 30,
+RAMPS = {
+    "config": RampsConfig(),  # every range lives in create_ramps.RampsConfig: 0.7 m, 5-80 deg
     "base_rms": (0.0, 0.0),  # m; upper bound > 0 adds a rough base layer
 }
-WALLS = {
-    "config": WallsConfig(),  # every range lives in create_curbs_and_walls.WallsConfig
-    "base_rms": (0.0, 0.0),
-}
-RAMPS = {
-    "config": RampsConfig(),  # every range lives in create_ramps.RampsConfig
+CURBS_AND_WALLS = {
+    "config": WallsConfig(),  # every range lives in create_curbs_and_walls.WallsConfig: 0.2-1.0 m
     "base_rms": (0.0, 0.0),
 }
 ROUGH = {
@@ -106,18 +98,20 @@ ROUGH = {
     "min_wavelength": 0.6,  # m
     "beta": 2.5,
 }
-# Rough-base spectrum under boxes/walls/ramps, when their base_rms is enabled.
+# Rough-base spectrum under ramps/curbs_and_walls, when their base_rms is enabled.
 BASE_ROUGH = {"cutoff_wavelength": 2.0, "min_wavelength": 0.6, "beta": 2.5}
 
 # =================================================================================================
 
-# Stable ids feed the per-map SeedSequence -- append new categories, never reorder.
-CATEGORY_IDS: dict[str, int] = {"boxes": 0, "walls": 1, "ramps": 2, "rough": 3}
+# Stable ids feed the per-map SeedSequence -- append new categories, never reorder or reuse an id.
+# Retired: 0 = boxes (create_large_box_obstacles.build_box_map), 1 = walls (0.05-0.5 m curbs and
+# walls, superseded by curbs_and_walls).
+CATEGORY_IDS: dict[str, int] = {"ramps": 2, "rough": 3, "curbs_and_walls": 4}
 INDEX_WIDTH = 4
 
 
 def parse_ratios(text: str) -> dict[str, float]:
-    """"boxes=0.2,walls=0.3" -> {"boxes": 0.2, "walls": 0.3, "ramps": 0.0, "rough": 0.0}."""
+    """"ramps=0.5,rough=0.5" -> {"ramps": 0.5, "rough": 0.5, "curbs_and_walls": 0.0}."""
     ratios = {name: 0.0 for name in CATEGORY_IDS}
     for item in text.split(","):
         name, sep, value = item.partition("=")
@@ -164,20 +158,11 @@ def add_rough_base(
     return combined, {"base_rms": rms, "base_rough_seed": rough_seed, **BASE_ROUGH}
 
 
-def build_boxes(rng: np.random.Generator, extent: float, cell: float) -> tuple[HeightMapReader, dict]:
-    height = float(rng.uniform(*BOXES["height"]))
-    hmap, params = build_box_map(
-        rng, height=height, extent=extent, cell=cell, incline_deg=BOXES["incline_deg"],
-        n_boxes=BOXES["n_boxes"], max_area_fraction=BOXES["max_area_fraction"],
-        position_trials=BOXES["position_trials"],
-    )
-    hmap, base = add_rough_base(hmap, BOXES["base_rms"], rng, extent, cell)
-    return hmap, {**params, **base, "n_features": len(params["boxes"])}
-
-
-def build_walls(rng: np.random.Generator, extent: float, cell: float) -> tuple[HeightMapReader, dict]:
-    hmap, params = build_walls_map(rng, WALLS["config"], extent, cell)
-    hmap, base = add_rough_base(hmap, WALLS["base_rms"], rng, extent, cell)
+def build_curbs_and_walls(
+    rng: np.random.Generator, extent: float, cell: float
+) -> tuple[HeightMapReader, dict]:
+    hmap, params = build_walls_map(rng, CURBS_AND_WALLS["config"], extent, cell)
+    hmap, base = add_rough_base(hmap, CURBS_AND_WALLS["base_rms"], rng, extent, cell)
     return hmap, {**params, **base, "n_features": len(params["features"])}
 
 
@@ -216,9 +201,8 @@ def build_rough(rng: np.random.Generator, extent: float, cell: float) -> tuple[H
 
 
 BUILDERS: dict[str, Callable[[np.random.Generator, float, float], tuple[HeightMapReader, dict]]] = {
-    "boxes": build_boxes,
-    "walls": build_walls,
     "ramps": build_ramps,
+    "curbs_and_walls": build_curbs_and_walls,
     "rough": build_rough,
 }
 
@@ -239,7 +223,7 @@ def to_plain(value: object) -> object:
 def describe(category: str, name: str, hmap: HeightMapReader, params: dict) -> str:
     covered = float(np.count_nonzero(np.abs(hmap.H - np.median(hmap.H)) > GROUND_EPS)) / hmap.H.size
     return (
-        f"{name:<14} {category:<5} features {params['n_features']:>2}  "
+        f"{name:<24} {category:<15} features {params['n_features']:>2}  "
         f"relief {hmap.H.max() - hmap.H.min():.3f} m  non-flat {covered:6.1%}"
     )
 
@@ -320,7 +304,7 @@ def main() -> None:
         "extent": args.extent,
         "cell": args.cell,
         "category_ids": CATEGORY_IDS,
-        "config": {"boxes": BOXES, "walls": WALLS, "ramps": RAMPS, "rough": ROUGH,
+        "config": {"ramps": RAMPS, "curbs_and_walls": CURBS_AND_WALLS, "rough": ROUGH,
                    "base_rough": BASE_ROUGH},
     }
     (out_dir / "manifest.yaml").write_text(yaml.safe_dump(to_plain(manifest), sort_keys=False))

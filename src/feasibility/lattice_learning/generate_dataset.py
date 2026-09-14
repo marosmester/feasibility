@@ -39,11 +39,28 @@ arc, at the arc's OWN (fixed) heading -- matching the kernel's own convention of
 `blocked[..., t]` at the sweep's outer heading, not the locally-varying arc heading.
 
 Trial selection -- spawn pose AND kappa -- lives in this package's `spawn_sampling.py`
-(`sample_trials`): a spawn is valid iff the static settle there is feasible, and on targeted maps
-`+interact_frac` of the trials are drawn from those whose arc meets terrain (`arc_relief`, stored
-per row, together with a per-row `targeted` flag). Maps whose sidecar `category` is in
-`+untargeted_categories` (default: rough -- flat and low-amplitude rough ground) are sampled
-uniformly.
+(`sample_map_trials`), with a strategy picked per map from its sidecar `category` (stored per row
+as `sampling`). Every strategy requires the static settle to be feasible at the spawn; `uniform`
+and `targeted` also require it at the nominal arc end, `ramp` and `edge` do not.
+  - `ramp`: maps in `+ramp_categories` (default: ramps). Every trial drives head-on up a ramp
+    face, `+ramp_straight_frac` of them straight, so divergence can be read against the face's
+    slope. Stored per row as `ramp_deg`, plus `ramp_s` = the arc origin's position along the face;
+    both are NaN for every other row.
+  - `edge`: maps in `+edge_categories` (default: curbs_and_walls, and the retired walls/boxes).
+    Arc origins within `+edge_band` of a height edge; `+interact_frac` of the trials run into it,
+    `+edge_down_frac` of those driving down, the rest climbing up.
+  - `uniform`: maps in `+untargeted_categories` (default: rough -- flat and low-amplitude rough
+    ground).
+  - `targeted` (any other map): uniform proposals, `+interact_frac` of the trials drawn from those
+    whose arc meets terrain.
+Every row stores `arc_relief`, `interact_dir` (+1 up / -1 down / 0 none) and a `targeted` flag.
+
+`valid` is the data-quality gate only: finite poses, a plausible displacement, a patch on the map.
+It does NOT include the static settle at the arc end -- that is stored separately per row as
+`endpoint_blocked` (True where helhest_stack's settle at the true arc end is infeasible, i.e. the
+planner would call the edge `blocked`), so custom_dataset.py's `drop_blocked_endpoints` can remove
+those rows. The root attr `valid_excludes_endpoint_settle` marks files written this way; older
+files folded the endpoint settle into `valid` and have no `endpoint_blocked` column.
 
 Deliberately independent of `feasibility.learning`, `feasibility.grid_learning` and
 `feasibility.grid_learning_2` (design.md section 11a). `feasibility.comparator` (the batch-rollout
@@ -81,12 +98,21 @@ config):
                          (default: 0.24, demos/navigate_partial_view.py's lat_coarsen=4 example)
     +n_theta=INT         the router's own heading bin count -- sets yaw_jitter = pi/this
                          (default: 24)
-    +interact_frac=FLOAT exact share of a targeted map's trials whose arc meets terrain, i.e.
-                         arc_relief > interact_relief (default: 0.5); null = uniform on every map
+    +interact_frac=FLOAT exact share of a targeted/edge map's trials whose arc meets terrain, i.e.
+                         arc_relief > interact_relief (default: 0.5); null = no interaction strata
     +interact_relief=FLOAT  m, plane-relative terrain relief along the arc that counts as meeting
                          terrain (default: 0.05)
     +untargeted_categories=[..]  sidecar categories sampled uniformly (default: [rough]; [] for
                          none). Maps without a `category` key are targeted.
+    +ramp_categories=[..]  sidecar categories whose trials all drive head-on up a ramp face
+                         (default: [ramps]; [] to target them instead)
+    +ramp_straight_frac=FLOAT  share of those trials driven straight, kappa = 0 (default: 0.75)
+    +ramp_yaw_jitter_deg=FLOAT mid-arc heading off the face's uphill axis, uniform +- (default: 5)
+    +edge_categories=[..]  sidecar categories sampled near height edges
+                         (default: [curbs_and_walls, walls, boxes]; [] to target them instead)
+    +edge_band=FLOAT     m, arc origins at most this far from an edge (default: 1.5)
+    +edge_facing_frac=FLOAT  share of edge proposals heading at the nearest edge (default: 0.7)
+    +edge_down_frac=FLOAT    share of an edge map's interacting trials driving down (default: 0.5)
     +dry_run=BOOL        trial sampling (settle on CPU) on every selected map, no ostrich, no
                          output (default: false)
     Also accepts any standard Hydra config-group override against the "helhest" base config
@@ -134,11 +160,19 @@ from feasibility.lattice_learning.patch import patch_spec_to_attrs
 from feasibility.lattice_learning.patch import sample_patches
 from feasibility.lattice_learning.settle import settle_batch
 from feasibility.lattice_learning.settle import settle_feasible
+from feasibility.lattice_learning.spawn_sampling import DEFAULT_EDGE_BAND
+from feasibility.lattice_learning.spawn_sampling import DEFAULT_EDGE_CATEGORIES
+from feasibility.lattice_learning.spawn_sampling import DEFAULT_EDGE_DOWN_FRAC
+from feasibility.lattice_learning.spawn_sampling import DEFAULT_EDGE_FACING_FRAC
 from feasibility.lattice_learning.spawn_sampling import DEFAULT_INTERACT_FRAC
 from feasibility.lattice_learning.spawn_sampling import DEFAULT_INTERACT_RELIEF
+from feasibility.lattice_learning.spawn_sampling import DEFAULT_RAMP_CATEGORIES
+from feasibility.lattice_learning.spawn_sampling import DEFAULT_RAMP_STRAIGHT_FRAC
+from feasibility.lattice_learning.spawn_sampling import DEFAULT_RAMP_YAW_JITTER_DEG
 from feasibility.lattice_learning.spawn_sampling import DEFAULT_UNTARGETED_CATEGORIES
-from feasibility.lattice_learning.spawn_sampling import map_category
-from feasibility.lattice_learning.spawn_sampling import sample_trials
+from feasibility.lattice_learning.spawn_sampling import map_metadata
+from feasibility.lattice_learning.spawn_sampling import sample_map_trials
+from feasibility.lattice_learning.spawn_sampling import SamplingPolicy
 from feasibility.lattice_learning.spawn_sampling import SpawnBatch
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
@@ -269,21 +303,22 @@ def simulate_map(
     kappa_max: float,
     mu: float,
     device: str,
-    interact_frac: float | None = None,
-    interact_relief: float = DEFAULT_INTERACT_RELIEF,
+    meta: dict,
+    policy: SamplingPolicy,
 ) -> tuple[dict[str, np.ndarray], SpawnBatch]:
     """Replays `n` continuous (spawn pose, kappa) trials on ONE terrain, `chunk` at a time, and
     returns every per_variant/ostrich array design.md section 7b's schema needs (minus the
     deferred hstack diagnostic -- see the module docstring), plus the sampler's own summary.
-    Trials come from `spawn_sampling.sample_trials` (`interact_frac=None` = untargeted). See the
-    module docstring for the warm-start / reference / swept_clear pieces this stitches together."""
+    Trials come from `spawn_sampling.sample_map_trials`, whose strategy the map's sidecar `meta`
+    and `policy` select. See the module docstring for the warm-start / reference / swept_clear
+    pieces this stitches together."""
     robot = RobotParams()
     w_o = round(warmup_s / OSTRICH_DT)
     T_o = w_o + T_RECORD_OSTRICH
 
-    trials = sample_trials(
-        terrain, spec, n, rng, kappa_max=kappa_max, lead=w_o * OSTRICH_DT * V_NOM, mu=mu,
-        device=device, interact_frac=interact_frac, interact_relief=interact_relief, robot=robot,
+    trials = sample_map_trials(
+        terrain, meta, spec, n, rng, kappa_max=kappa_max, lead=w_o * OSTRICH_DT * V_NOM, mu=mu,
+        device=device, policy=policy, robot=robot,
     )
     spawn_pose, kappa = trials.pose, trials.kappa
     # The same static settle sample_trials accepted each spawn on (helhest_stack is bit-exact), kept
@@ -298,6 +333,7 @@ def simulate_map(
     ref_pose = np.zeros((n, 7), dtype=np.float32)
     patch = np.zeros((n, spec.ny * spec.nx), dtype=np.float32)
     valid = np.zeros(n, dtype=bool)
+    endpoint_blocked = np.zeros(n, dtype=bool)
     swept_clear = np.zeros(n, dtype=bool)
 
     ostrich_pose = np.zeros((T_RECORD_OSTRICH, n, 7), dtype=np.float32)
@@ -362,7 +398,9 @@ def simulate_map(
         settle_ok = settle_feasible(endpoint_derived, endpoint_residual, endpoint_clearance, robot)
         displacement_ok = displacement <= MAX_SPAWN_DISPLACEMENT
         overhang_ok = ~patch_overhangs(terrain, belief_chunk, spec)
-        valid_chunk = finite & settle_ok & displacement_ok & overhang_ok
+        # the endpoint settle is NOT part of valid -- stored as endpoint_blocked instead, see the
+        # module docstring
+        valid_chunk = finite & displacement_ok & overhang_ok
 
         sl = slice(start, end)
         t0_pose[sl] = t0_xyyaw
@@ -371,6 +409,7 @@ def simulate_map(
         ref_pose[sl] = ref_pose_chunk
         patch[sl] = patch_chunk
         valid[sl] = valid_chunk
+        endpoint_blocked[sl] = ~settle_ok
         swept_clear[sl] = swept_clear_chunk
 
         ostrich_pose[:, sl] = pose_log[w_o:]
@@ -381,6 +420,8 @@ def simulate_map(
 
         n_bad = int((~valid_chunk).sum())
         bad = f", {n_bad} invalid" if n_bad else ""
+        n_blocked = int((~settle_ok).sum())
+        bad += f", {n_blocked} endpoint-blocked" if n_blocked else ""
         print(f"    trials {start}..{end - 1} ({b}) done in {time.time() - t0_chunk_t:.1f}s{bad}")
 
     return dict(
@@ -391,9 +432,14 @@ def simulate_map(
         patch=patch,
         kappa=kappa,
         arc_relief=trials.arc_relief,
+        interact_dir=trials.interact_dir,
+        ramp_deg=trials.ramp_deg,
+        ramp_s=trials.ramp_s,
+        sampling=np.full(n, trials.strategy),
         arc_end_pose=arc_end_pose.astype(np.float32),
         ref_pose=ref_pose,
         valid=valid,
+        endpoint_blocked=endpoint_blocked,
         swept_clear=swept_clear,
         ostrich_pose=ostrich_pose,
         ostrich_wheel_qd=ostrich_wheel_qd,
@@ -416,6 +462,22 @@ def _write_fields(group: h5py.Group, fields: dict[str, np.ndarray]) -> None:
             group.create_dataset(name, data=arr)
         else:
             group.create_dataset(name, data=arr, compression="gzip", compression_opts=4)
+
+
+def describe_trials(trials: SpawnBatch, n: int, interact_relief: float) -> str:
+    """One-line summary of a map's sampled trials, for the per-map progress print."""
+    short = f", {trials.shortfall} short" if trials.shortfall else ""
+    n_up, n_down = int((trials.interact_dir > 0).sum()), int((trials.interact_dir < 0).sum())
+    text = f"{n_up + n_down}/{n} interacting ({n_up} up, {n_down} down; {trials.strategy}{short})"
+    n_blocked = int((~trials.endpoint_feasible).sum())
+    if n_blocked:
+        text += f", {n_blocked} nominal arc ends blocked"
+    on_ramp = np.isfinite(trials.ramp_deg)
+    if on_ramp.any():
+        text += (f", {int(on_ramp.sum())}/{n} up a ramp face at "
+                 f"{np.nanmin(trials.ramp_deg):.1f}-{np.nanmax(trials.ramp_deg):.1f} deg, "
+                 f"{int((trials.kappa[on_ramp] == 0).sum())} straight")
+    return text
 
 
 def write_arc_dataset(
@@ -472,11 +534,20 @@ def generate(cfg: DictConfig) -> None:
     untargeted_categories = tuple(
         str(c) for c in cfg.get("untargeted_categories", DEFAULT_UNTARGETED_CATEGORIES)
     )
+    ramp_categories = tuple(str(c) for c in cfg.get("ramp_categories", DEFAULT_RAMP_CATEGORIES))
+    policy = SamplingPolicy(
+        interact_frac=interact_frac,
+        interact_relief=interact_relief,
+        untargeted_categories=untargeted_categories,
+        ramp_categories=ramp_categories,
+        ramp_straight_frac=float(cfg.get("ramp_straight_frac", DEFAULT_RAMP_STRAIGHT_FRAC)),
+        ramp_yaw_jitter_deg=float(cfg.get("ramp_yaw_jitter_deg", DEFAULT_RAMP_YAW_JITTER_DEG)),
+        edge_categories=tuple(str(c) for c in cfg.get("edge_categories", DEFAULT_EDGE_CATEGORIES)),
+        edge_band=float(cfg.get("edge_band", DEFAULT_EDGE_BAND)),
+        edge_facing_frac=float(cfg.get("edge_facing_frac", DEFAULT_EDGE_FACING_FRAC)),
+        edge_down_frac=float(cfg.get("edge_down_frac", DEFAULT_EDGE_DOWN_FRAC)),
+    )
     dry_run = bool(cfg.get("dry_run", False))
-
-    def map_interact_frac(stem: pathlib.Path) -> float | None:
-        """None (uniform draws) for maps whose sidecar category is untargeted, else the knob."""
-        return None if map_category(stem) in untargeted_categories else interact_frac
 
     spec = PatchSpec()
     xy_jitter = router_cell / 2.0  # design.md section 1c
@@ -491,6 +562,14 @@ def generate(cfg: DictConfig) -> None:
           f"yaw=+-{yaw_jitter:.4f} rad (n_theta={n_theta})")
     print(f"[trials]   interact_frac={interact_frac} (arc_relief > {interact_relief} m), "
           f"untargeted categories: {', '.join(untargeted_categories) or 'none'}")
+    print(f"[ramps]    categories: {', '.join(ramp_categories) or 'none'} -- head-on up a face, "
+          f"{policy.ramp_straight_frac:.0%} straight, heading +-{policy.ramp_yaw_jitter_deg} deg")
+    print(f"[edges]    categories: {', '.join(policy.edge_categories) or 'none'} -- origins within "
+          f"{policy.edge_band} m of an edge, {policy.edge_facing_frac:.0%} facing it, "
+          f"{policy.edge_down_frac:.0%} of interacting trials driving down")
+    print(f"[validity] no arc-end settle check when sampling: "
+          f"{', '.join(policy.spawn_only_strategies) or 'none'}; every row stores endpoint_blocked, "
+          f"never folded into valid")
 
     rng = np.random.default_rng(seed)
     map_paths = select_maps(maps_dir, n_maps, rng)
@@ -503,15 +582,11 @@ def generate(cfg: DictConfig) -> None:
         assert T_RECORD_OSTRICH * OSTRICH_DT == ARC_DURATION_S
         lead = round(warmup_s / OSTRICH_DT) * OSTRICH_DT * V_NOM
         for p in map_paths:
-            frac = map_interact_frac(p)
-            trials = sample_trials(
-                HeightMapReader.load(p), spec, trials_per_map, rng, kappa_max=kappa_max, lead=lead,
-                mu=mu, device="cpu", interact_frac=frac, interact_relief=interact_relief,
+            trials = sample_map_trials(
+                HeightMapReader.load(p), map_metadata(p), spec, trials_per_map, rng,
+                kappa_max=kappa_max, lead=lead, mu=mu, device="cpu", policy=policy,
             )
-            n_int = int((trials.arc_relief > interact_relief).sum())
-            short = f", {trials.shortfall} short" if trials.shortfall else ""
-            print(f"[dry-run]  {p.name}: {n_int}/{trials_per_map} interacting "
-                  f"({'targeted' if trials.targeted else 'untargeted'}{short})")
+            print(f"[dry-run]  {p.name}: {describe_trials(trials, trials_per_map, interact_relief)}")
         print("[dry-run]  sampling + step-count/duration self-checks ok, nothing simulated")
         return
 
@@ -540,10 +615,11 @@ def generate(cfg: DictConfig) -> None:
             sim_config=sim_config, render_config=render_config, engine_config=engine_config,
             logging_config=logging_config, chunk=chunk, settle_steps=settle_steps,
             warmup_s=warmup_s, kappa_max=kappa_max, mu=mu, device=device,
-            interact_frac=map_interact_frac(p), interact_relief=interact_relief,
+            meta=map_metadata(p), policy=policy,
         )
         for key in ("spawn_pose", "spawn_zpr", "t0_pose", "belief_pose", "patch", "kappa", "arc_relief",
-                    "arc_end_pose", "ref_pose", "valid", "swept_clear"):
+                    "interact_dir", "ramp_deg", "ramp_s", "sampling", "arc_end_pose", "ref_pose",
+                    "valid", "endpoint_blocked", "swept_clear"):
             per_variant_fields.setdefault(key, []).append(result[key])
         for key in ("ostrich_pose", "ostrich_wheel_qd", "ostrich_cmd",
                     "ostrich_preroll_pose", "ostrich_preroll_wheel_qd"):
@@ -554,12 +630,10 @@ def generate(cfg: DictConfig) -> None:
         terrain_entries.extend([(p, terrain)] * trials_per_map)
 
         n_valid = int(result["valid"].sum())
-        n_int = int((trials.arc_relief > interact_relief).sum())
-        short = f", {trials.shortfall} short of target" if trials.shortfall else ""
         print(f"    -> {n_valid}/{trials_per_map} valid, "
+              f"{int(result['endpoint_blocked'].sum())}/{trials_per_map} endpoint-blocked, "
               f"{int(result['swept_clear'].sum())}/{trials_per_map} swept-clear, "
-              f"{n_int}/{trials_per_map} interacting "
-              f"({'targeted' if trials.targeted else 'untargeted'}{short})")
+              f"{describe_trials(trials, trials_per_map, interact_relief)}")
 
     per_variant = {k: np.concatenate(v, axis=0) for k, v in per_variant_fields.items()}
     per_variant["map_index"] = np.concatenate(map_index_all, axis=0)
@@ -587,6 +661,15 @@ def generate(cfg: DictConfig) -> None:
             interact_frac=np.nan if interact_frac is None else interact_frac,
             interact_relief=interact_relief,
             untargeted_categories=",".join(untargeted_categories),
+            ramp_categories=",".join(ramp_categories),
+            ramp_straight_frac=policy.ramp_straight_frac,
+            ramp_yaw_jitter_deg=policy.ramp_yaw_jitter_deg,
+            edge_categories=",".join(policy.edge_categories),
+            edge_band=policy.edge_band,
+            edge_facing_frac=policy.edge_facing_frac,
+            edge_down_frac=policy.edge_down_frac,
+            spawn_only_strategies=",".join(policy.spawn_only_strategies),
+            valid_excludes_endpoint_settle=True,
             maps_dir=str(maps_dir), map_glob=MAP_GLOB,
             mu=mu, k_p=K_P,
             ostrich_dt=OSTRICH_DT,
@@ -602,7 +685,9 @@ def generate(cfg: DictConfig) -> None:
     n_swept = int(per_variant["swept_clear"].sum())
     print("=" * 60)
     print(f"[summary]  {n} trials across {n_maps} maps")
+    n_blocked = int((per_variant["valid"] & per_variant["endpoint_blocked"]).sum())
     print(f"  valid       {n_valid:>7d}  ({100 * n_valid / n:5.1f}%)")
+    print(f"  of which endpoint_blocked {n_blocked:>5d}  -- custom_dataset.py drop_blocked_endpoints")
     print(f"  swept_clear {n_swept:>7d}  ({100 * n_swept / n:5.1f}%)  -- reporting split only")
     print("=" * 60)
 

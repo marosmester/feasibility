@@ -18,9 +18,13 @@ regresses it, and importing it from `model.py` means `model.py` runs and self-ch
 dataset file exists.
 
 A row's `valid` flag (design.md section 7b) marks the generator's own data-quality gate -- a
-non-finite pose, a failed endpoint settle, an implausible displacement, or an overhanging patch --
-so a `False` row carries no usable label and `__init__` drops it (`learning/custom_dataset.py`'s
-non-finite-row precedent). `swept_clear` is kept as a per-row column on every SURVIVING row
+non-finite pose, an implausible displacement, or an overhanging patch -- so a `False` row carries
+no usable label and `__init__` drops it (`learning/custom_dataset.py`'s non-finite-row precedent).
+`endpoint_blocked` (helhest_stack's static settle at the arc end is infeasible -- the planner
+would call that edge `blocked`) is NOT part of `valid` in current files: ramps and
+curbs_and_walls maps deliberately drive into wall-like faces and tall edges. Those rows are kept by
+default; `drop_blocked_endpoints=True` removes them. Files without that column (written before the
+split) folded the endpoint settle into `valid`, so they read as all-False. `swept_clear` is kept as a per-row column on every SURVIVING row
 instead: design.md section 8 is explicit that it is a REPORTING split ("train on everything
 [valid]; report on the `swept_clear` subset"), not a second training filter -- the settle's own
 `blocked` is heading-quantised and conservative, and its boundary is exactly where `d_hat` should
@@ -99,7 +103,13 @@ class ArcDivergenceDataset(Dataset):
     design.md section 7c's ~200k-trial budget at 24x28 float32 patches is a few hundred MB, not a
     per-map elevation grid."""
 
-    def __init__(self, path: pathlib.Path, *, device: str | torch.device = "cpu") -> None:
+    def __init__(
+        self,
+        path: pathlib.Path,
+        *,
+        device: str | torch.device = "cpu",
+        drop_blocked_endpoints: bool = False,
+    ) -> None:
         self.source = pathlib.Path(path)
         with h5py.File(self.source, "r") as f:
             self.attrs = dict(f.attrs)
@@ -109,6 +119,11 @@ class ArcDivergenceDataset(Dataset):
             ref_pose = f["ref_pose"][()].astype(np.float64)  # [n, 7]
             valid = f["valid"][()].astype(bool)  # [n]
             swept_clear = f["swept_clear"][()].astype(bool)  # [n]
+            endpoint_blocked = (
+                f["endpoint_blocked"][()].astype(bool)
+                if "endpoint_blocked" in f
+                else np.zeros(len(valid), dtype=bool)
+            )  # [n]
             map_index = f["map_index"][()].astype(np.int64)  # [n]
             map_path = [p.decode() if isinstance(p, bytes) else p for p in f["map_path"][()]]
             ostrich_final = f["ostrich/pose"][-1].astype(np.float64)  # [n, 7]
@@ -133,6 +148,10 @@ class ArcDivergenceDataset(Dataset):
         n_dropped = int((~keep).sum())
         if n_dropped:
             print(f"[dataset] {self.source.name}: dropping {n_dropped}/{len(keep)} invalid row(s)")
+        if drop_blocked_endpoints:
+            n_blocked = int((keep & endpoint_blocked).sum())
+            keep = keep & ~endpoint_blocked
+            print(f"[dataset] {self.source.name}: dropping {n_blocked} endpoint-blocked valid row(s)")
 
         self.patch = (
             torch.from_numpy(patch[keep].reshape(-1, ny, nx)).unsqueeze(1).to(device)
@@ -140,6 +159,7 @@ class ArcDivergenceDataset(Dataset):
         self.kappa = torch.from_numpy(kappa[keep]).to(device)
         self.y = torch.from_numpy(y[keep]).to(device)
         self.swept_clear = torch.from_numpy(swept_clear[keep]).to(device)
+        self.endpoint_blocked = torch.from_numpy(endpoint_blocked[keep]).to(device)
         self.map_index = torch.from_numpy(map_index[keep]).to(device)
         self.map_path = [p for p, k in zip(map_path, keep) if k]
         self.TARGET_NAMES = TARGET_NAMES
@@ -234,6 +254,7 @@ def _write_synthetic(path: pathlib.Path, n_maps: int = 3, rows_per_map: int = 8)
 
     valid = rng.random(n) > 0.1
     swept_clear = rng.random(n) > 0.2
+    endpoint_blocked = rng.random(n) > 0.7
 
     with h5py.File(path, "w") as f:
         for name, value in patch_spec_to_attrs(spec).items():
@@ -246,6 +267,7 @@ def _write_synthetic(path: pathlib.Path, n_maps: int = 3, rows_per_map: int = 8)
         f.create_dataset("ref_pose", data=ref_pose.astype(np.float32))
         f.create_dataset("valid", data=valid)
         f.create_dataset("swept_clear", data=swept_clear)
+        f.create_dataset("endpoint_blocked", data=endpoint_blocked)
         f.create_dataset("map_index", data=map_index)
         f.create_dataset(
             "map_path", data=np.array([f"synthetic/map_{m}" for m in map_index], dtype="S32")
@@ -313,5 +335,17 @@ if __name__ == "__main__":
             print("[self-test] synthetic labels reduce to the known (offset, 0) answer")
             print(f"[swept_clear] {int(ds.swept_clear.sum())}/{len(ds)} rows marked swept-clear "
                   "(reporting-only, design.md section 8)")
+
+        # --- drop_blocked_endpoints removes exactly the valid, endpoint-blocked rows ------------
+        with h5py.File(path, "r") as f:
+            valid_np = f["valid"][()].astype(bool)
+            blocked_np = (f["endpoint_blocked"][()].astype(bool) if "endpoint_blocked" in f
+                          else np.zeros(len(valid_np), dtype=bool))
+        strict = ArcDivergenceDataset(path, drop_blocked_endpoints=True)
+        assert len(ds) == int(valid_np.sum()), (len(ds), int(valid_np.sum()))
+        assert len(strict) == int((valid_np & ~blocked_np).sum())
+        assert not strict.endpoint_blocked.any()
+        print(f"[endpoint_blocked] {int(ds.endpoint_blocked.sum())}/{len(ds)} valid rows blocked; "
+              f"drop_blocked_endpoints keeps {len(strict)}")
 
     print("all self-checks ok")

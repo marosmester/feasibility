@@ -62,11 +62,13 @@ CLI parameters:
     --device STR     device for re-settling the arc endpoint when breaking down `valid` into its
                      four component checks (see below) (default: cuda:0)
 
-Every invocation also prints a breakdown of the stored `valid` flag into the four conditions
-generate_dataset.py's simulate_map ANDs together (design.md section 7b) -- `finite`, `settle_ok`
-(a real settle re-run AT THE ARC'S OWN ENDPOINT, the only one of the four needing a device),
-`displacement_ok`, `overhang_ok` -- so an INVALID row's actual cause is visible instead of just
-the combined flag. If the recomputed AND doesn't match the file's stored `valid`, that's flagged
+Every invocation also prints a breakdown of the stored `valid` flag into the conditions
+generate_dataset.py's simulate_map ANDs together (design.md section 7b) -- `finite`,
+`displacement_ok`, `overhang_ok`, and `settle_ok` (a real settle re-run AT THE ARC'S OWN
+ENDPOINT, the only one needing a device) -- so an INVALID row's actual cause is visible instead of
+just the combined flag. Files with the root attr `valid_excludes_endpoint_settle` store
+`settle_ok` separately as `endpoint_blocked` (shown as BLOCKED-END) and leave it out of `valid`;
+older files folded it in, and the recomputed AND follows whichever the file did. If the recomputed AND doesn't match the file's stored `valid`, that's flagged
 as a WARNING rather than trusted silently, since it would mean generation-time inputs (mu, robot
 params, terrain) drifted from what this script re-derives them as.
 
@@ -171,6 +173,11 @@ class Trial:
     wheel_theta: np.ndarray  # [P, 3]
     n_settle: int  # leading rows of play_t that are settle (0 if the file has no pre-roll)
     n_warmup: int  # rows after those that are warm-up
+    ramp_deg: float = float("nan")  # slope of the ramp face driven up, NaN = not a ramp trial
+    ramp_s: float = float("nan")  # m, arc origin's front axle along that face from its foot
+    endpoint_blocked: bool | None = None  # None = file predates the column (folded into valid)
+    interact_dir: int = 0  # +1 climbing up / -1 driving down / 0 not interacting
+    sampling: str = ""  # the spawn_sampling strategy that drew the trial, "" = not stored
 
 
 def load_trial(path: pathlib.Path, i: int, arc_only: bool = False) -> Trial:
@@ -194,6 +201,11 @@ def load_trial(path: pathlib.Path, i: int, arc_only: bool = False) -> Trial:
             kappa=float(f["kappa"][i]),
             valid=bool(f["valid"][i]),
             swept_clear=bool(f["swept_clear"][i]),
+            ramp_deg=float(f["ramp_deg"][i]) if "ramp_deg" in f else float("nan"),
+            ramp_s=float(f["ramp_s"][i]) if "ramp_s" in f else float("nan"),
+            endpoint_blocked=bool(f["endpoint_blocked"][i]) if "endpoint_blocked" in f else None,
+            interact_dir=int(f["interact_dir"][i]) if "interact_dir" in f else 0,
+            sampling=f["sampling"].asstr()[i] if "sampling" in f else "",
             t0_pose=f["t0_pose"][i].astype(np.float64),
             belief_pose=f["belief_pose"][i].astype(np.float64),
             arc_end_pose=f["arc_end_pose"][i].astype(np.float64),
@@ -217,6 +229,11 @@ def report_trial(trial: Trial, n: int, device: str) -> None:
 
     flags = "valid" if trial.valid else "INVALID"
     flags += "  swept_clear" if trial.swept_clear else ""
+    flags += "  BLOCKED-END" if trial.endpoint_blocked else ""
+    flags += f"  sampling={trial.sampling}" if trial.sampling else ""
+    flags += {1: "  climbs UP", -1: "  drives DOWN"}.get(trial.interact_dir, "")
+    if np.isfinite(trial.ramp_deg):
+        flags += f"  ramp {trial.ramp_deg:.1f} deg @ s={trial.ramp_s:+.2f} m"
     print(
         f"[trial {trial.index}/{n - 1}]  map={trial.map_path} (map_index={trial.map_index})  "
         f"kappa={trial.kappa:+.3f} 1/m  {flags}"
@@ -248,12 +265,17 @@ def report_trial(trial: Trial, n: int, device: str) -> None:
         trial.terrain, trial.arc_end_pose[None], float(trial.attrs["mu"]), device
     )
     settle_ok = bool(settle_feasible(derived, residual, clearance, RobotParams())[0])
-    recomputed_valid = finite and settle_ok and displacement_ok and overhang_ok
+    settle_in_valid = not bool(trial.attrs.get("valid_excludes_endpoint_settle", False))
+    recomputed_valid = finite and displacement_ok and overhang_ok and (settle_ok or not settle_in_valid)
+    if trial.endpoint_blocked is not None and trial.endpoint_blocked == settle_ok:
+        print(f"  WARNING: recomputed settle_ok={settle_ok} contradicts the file's "
+              f"endpoint_blocked={trial.endpoint_blocked}")
 
     print(
-        f"  valid breakdown: finite={finite}  settle_ok={settle_ok}  "
+        f"  valid breakdown: finite={finite}  "
         f"displacement_ok={displacement_ok} ({displacement:.4f} m <= {MAX_SPAWN_DISPLACEMENT:.4f} m)  "
-        f"overhang_ok={overhang_ok}"
+        f"overhang_ok={overhang_ok}  settle_ok={settle_ok}"
+        + ("" if settle_in_valid else " (stored as endpoint_blocked, not part of valid)")
     )
     if not settle_ok:
         _, pitch, roll = derived[0]

@@ -1,18 +1,20 @@
-"""Curbs, thin walls, L-corners and wall-gaps of continuous height, for lattice_learning's maps.
+"""Curbs, thin walls, L-corners, wall-gaps and boxes of continuous height, for lattice_learning's
+`curbs_and_walls` maps.
 
-The obstacles this series exists for are the ones helhest_stack's static settle does NOT already
-block: a 0.7 m box (create_large_box_obstacles.py's default) rolls the settled body far past the
-15 deg envelope, so the planner never queries an edge cost there. Heights in the 0.05-0.5 m band
-(~0.15-1.4 wheel radii) are where the settle says "standing here is fine" but a wheel mounting the
-edge during a turn may climb, bounce or scrub -- see lattice_learning/design.md. Boxes are NOT
-built here; create_large_box_obstacles.build_box_map covers them.
+Every feature is steep-sided (80 deg) and 0.2-1.0 m tall (~0.6-2.9 wheel radii), from an edge a
+wheel may still mount to one no wheel can. lattice_learning's spawn_sampling.py samples these maps
+with its `edge` strategy: every trial starts near an edge and half of them run into one, climbing
+up or driving down, with the arc end NOT required to be settle-feasible -- so the tall end of the
+range shows what ostrich does when helhest_stack says `blocked`.
 
 A map is K features, each drawn independently -- its own height, yaw and kind:
 
-    curb    one long, low-ish rectangle
+    curb    one long rectangle, 0.3-0.8 m wide (a step up onto it, then straight off again)
     wall    one long, thin rectangle
     corner  two walls meeting at a right angle (an L), the sampled center is the corner point
     gap     two parallel walls with a clear passage between them, about the robot's width
+    box     a rectangle with both sides >= 1.5 m, so the whole robot fits on top -- the only kind
+            a trial can drive DOWN from
 
 Every rectangle is create_large_box_obstacles.build_rect_obstacle (with its `yaw`), and layers
 combine with an elementwise MAXIMUM: the union of solid extrusions standing on flat ground, which
@@ -23,11 +25,11 @@ Wall thickness is floored at 0.15 m on purpose. lattice_learning's patch samples
 network while ostrich still hits it; the __main__ check below asserts a minimum-thickness wall is
 always seen.
 
-Feature centers are drawn inside |x|, |y| <= extent/2 - PLACEMENT_MARGIN. lattice_learning's
-generate_dataset.py keeps spawn poses PatchSpec.reach + 0.1 = 2.1 m from the map edge, and its
-near-obstacle bias draws within 1.0 m of an obstacle boundary, so a feature placed 1.1 m from the
-edge is still reachable. Re-derived, not imported: heightmap/ is shared infrastructure and must
-not depend on an experiment tree.
+Feature centers are drawn inside |x|, |y| <= extent/2 - PLACEMENT_MARGIN. lattice_learning keeps
+spawn poses ~2.5 m from the map edge (patch reach + warm-up lead) and its edge strategy starts
+trials up to 1.5 m from an edge, so a feature placed 1.1 m from the edge is still reachable.
+Re-derived, not imported: heightmap/ is shared infrastructure and must not depend on an
+experiment tree.
 
 `build_walls_map` does no file IO -- create_maps_for_lattice_learning.py composes it and owns the
 output layout. Running this module directly is its smoke test.
@@ -59,7 +61,7 @@ PLACEMENT_MARGIN = 1.1  # m, feature centers stay this far inside the grid edge 
 MAX_FEATURE_ATTEMPTS = 50  # draws per feature before the map stops growing
 GROUND_EPS = 1e-6  # m, a cell above this counts as covered by a feature
 
-FEATURE_KINDS = ("curb", "wall", "corner", "gap")
+FEATURE_KINDS = ("curb", "wall", "corner", "gap", "box")
 
 # (w, d, cx, cy, yaw) of one rectangle in world coordinates, w along its own rotated x axis
 Rect = tuple[float, float, float, float, float]
@@ -69,16 +71,17 @@ Rect = tuple[float, float, float, float, float]
 class WallsConfig:
     """Sampling ranges for build_walls_map; every (lo, hi) pair is a uniform draw."""
 
-    height: tuple[float, float] = (0.05, 0.5)  # m, per feature
-    n_features: tuple[int, int] = (4, 10)  # inclusive; an UPPER bound once the area budget binds
-    kind_weights: tuple[float, float, float, float] = (0.25, 0.3, 0.25, 0.2)  # FEATURE_KINDS order
+    height: tuple[float, float] = (0.2, 1.0)  # m, per feature
+    n_features: tuple[int, int] = (3, 8)  # inclusive; an UPPER bound once the area budget binds
+    kind_weights: tuple[float, ...] = (0.2, 0.2, 0.2, 0.15, 0.25)  # FEATURE_KINDS order
     curb_length: tuple[float, float] = (2.0, 6.0)  # m
-    curb_width: tuple[float, float] = (0.25, 0.5)  # m
+    curb_width: tuple[float, float] = (0.3, 0.8)  # m
     wall_length: tuple[float, float] = (1.5, 5.0)  # m, also each corner arm / gap wall
     wall_thickness: tuple[float, float] = (0.15, 0.25)  # m, >= 0.15 so the 0.125 m patch sees it
     gap_width: tuple[float, float] = (1.1, 1.8)  # m, clear passage between the two gap walls
+    box_side: tuple[float, float] = (1.5, 4.0)  # m, each side; >= 1.5 so the robot fits on top
     incline_deg: float = 80.0  # side slope; sharp, but no single-cell mesh sliver
-    max_area_fraction: float = 0.25  # of the whole map, keeps clear ground for spawn sampling
+    max_area_fraction: float = 0.3  # of the whole map, keeps clear ground for spawn sampling
 
 
 def grid_axes(extent: float, cell: float) -> np.ndarray:
@@ -106,6 +109,9 @@ def feature_rects(
     if kind == "curb":
         length, width = rng.uniform(*cfg.curb_length), rng.uniform(*cfg.curb_width)
         return [place(length, width, 0.0, 0.0)], {"length": length, "width": width}
+    if kind == "box":
+        side_x, side_y = rng.uniform(*cfg.box_side), rng.uniform(*cfg.box_side)
+        return [place(side_x, side_y, 0.0, 0.0)], {"side_x": side_x, "side_y": side_y}
     thickness = rng.uniform(*cfg.wall_thickness)
     if kind == "wall":
         length = rng.uniform(*cfg.wall_length)
@@ -189,6 +195,7 @@ def build_walls_map(
                     "yaw": float(yaw),
                     "center": [float(cx), float(cy)],
                     **{k: float(v) for k, v in shape.items()},
+                    "rects": [[float(v) for v in r] for r in rects],  # (w, d, cx, cy, yaw) each
                 }
             )
             break
@@ -247,6 +254,18 @@ if __name__ == "__main__":
     assert hmap.H.max() <= max(heights) + 1e-12, "max-merge produced a taller-than-any feature"
     assert all(cfg.height[0] <= h <= cfg.height[1] for h in heights)
     assert params["area_fraction"] <= cfg.max_area_fraction
+
+    # --- kinds over many maps: every kind appears, every box top fits the robot -----------------
+    seen: dict[str, int] = {k: 0 for k in FEATURE_KINDS}
+    for i in range(40):
+        _, p = build_walls_map(np.random.default_rng([args.seed, i]), cfg, args.extent, args.cell)
+        for f in p["features"]:
+            seen[f["kind"]] += 1
+            assert cfg.height[0] <= f["height"] <= cfg.height[1]
+            if f["kind"] == "box":
+                assert min(f["side_x"], f["side_y"]) >= cfg.box_side[0]
+    assert all(seen.values()), seen
+    print(f"[kinds] 40 maps: {seen}")
     again, _ = build_walls_map(np.random.default_rng(args.seed), cfg, args.extent, args.cell)
     assert np.array_equal(hmap.H, again.H), "same seed must reproduce the same map"
     kinds = ", ".join(f"{f['kind']}@{f['height']:.2f}m" for f in params["features"])
