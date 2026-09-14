@@ -190,12 +190,15 @@ def build_rect_obstacle(
     d: float,
     cx: float,
     cy: float,
+    yaw: float = 0.0,
 ) -> HeightMapReader:
     """Flat ground except one rectangular frustum centered at (cx, cy): flat top at `height`
     over a w x d footprint (independent half-extents, so w != d / non-square is fine), linear
     ramp down to ground on all four sides via Euclidean distance to the footprint rectangle,
     sloped at `incline_deg` -- generalizes create_box_obstacles.py's build_box_obstacle (which
-    hardcodes one shared half-extent for a square footprint)."""
+    hardcodes one shared half-extent for a square footprint). `yaw` (rad, CCW) rotates the
+    footprint about its center, `w` lying along the rotated x axis; the yaw=0 default is
+    bit-identical to the axis-aligned original (cos 0 = 1, sin 0 = 0 exactly)."""
     half = extent / 2.0
     ramp_width = height / np.tan(np.radians(incline_deg))
     nx = int(round(extent / cell)) + 1
@@ -204,9 +207,12 @@ def build_rect_obstacle(
     ys = -half + (np.arange(ny) + 0.5) * cell
     X, Y = np.meshgrid(xs, ys)  # [ny, nx], row=y, col=x
 
+    c, s = np.cos(yaw), np.sin(yaw)
+    local_x = c * (X - cx) + s * (Y - cy)
+    local_y = -s * (X - cx) + c * (Y - cy)
     hx, hy = w / 2.0, d / 2.0
-    dx = np.maximum(0.0, np.abs(X - cx) - hx)
-    dy = np.maximum(0.0, np.abs(Y - cy) - hy)
+    dx = np.maximum(0.0, np.abs(local_x) - hx)
+    dy = np.maximum(0.0, np.abs(local_y) - hy)
     dist = np.hypot(dx, dy)
     H = height * np.clip(1.0 - dist / ramp_width, 0.0, 1.0)
     return HeightMapReader(H, origin=(-half, -half), cell=cell)
@@ -326,28 +332,54 @@ def choose_best_layout(
     return best_H, best_boxes
 
 
+def build_box_map(
+    rng: np.random.Generator,
+    height: float = DEFAULT_HEIGHT,
+    extent: float = DEFAULT_EXTENT,
+    cell: float = DEFAULT_CELL,
+    incline_deg: float = DEFAULT_INCLINE_DEG,
+    n_boxes: int = DEFAULT_N_BOXES_UPPER,
+    max_area_fraction: float = DEFAULT_MAX_AREA_FRACTION,
+    position_trials: int = DEFAULT_POSITION_TRIALS,
+) -> tuple[HeightMapReader, dict]:
+    """One whole map -- sample_rect_sizes then choose_best_layout -- plus a flat params dict for
+    a .yaml sidecar. No file IO, so other generators (create_maps_for_lattice_learning.py) can
+    compose it; main() below is just this in a loop, consuming `rng` in the same order."""
+    sizes = sample_rect_sizes(rng, n_boxes, incline_deg, height, max_area_fraction, extent)
+    hmap, boxes = choose_best_layout(
+        sizes, extent, incline_deg, height, cell, DEFAULT_ACCESS_LIMIT, rng, position_trials
+    )
+    params = {
+        "height": float(height),
+        "incline_deg": float(incline_deg),
+        "n_boxes_upper": int(n_boxes),
+        "max_area_fraction": float(max_area_fraction),
+        "boxes": [[float(v) for v in box] for box in boxes],
+        "area_fraction": float(np.count_nonzero(hmap.H > 1e-6)) / hmap.H.size,
+        "frontier_cells": accessible_frontier_score(hmap.H, cell, extent, DEFAULT_ACCESS_LIMIT),
+    }
+    return hmap, params
+
+
 def main() -> None:
     args = parse_args()
     (ASSETS_DIR / str(args.seed)).mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(args.seed)
 
     for i in range(args.n):
-        sizes = sample_rect_sizes(
-            rng, args.n_boxes, args.incline_deg, args.height, args.max_area_fraction, args.extent
+        H, params = build_box_map(
+            rng, args.height, args.extent, args.cell, args.incline_deg, args.n_boxes,
+            args.max_area_fraction, args.position_trials,
         )
-        H, boxes = choose_best_layout(
-            sizes, args.extent, args.incline_deg, args.height, args.cell,
-            DEFAULT_ACCESS_LIMIT, rng, args.position_trials,
-        )
-        score = accessible_frontier_score(H.H, args.cell, args.extent, DEFAULT_ACCESS_LIMIT)
-        area_fraction = float(np.count_nonzero(H.H > 1e-6)) / H.H.size
+        boxes = params["boxes"]
         path = large_box_batch_path(i, args.seed, args.height)
         H.save(path)
         box_desc = " ".join(f"({w:.1f}x{d:.1f} @ x={cx:.2f},y={cy:.2f})" for w, d, cx, cy in boxes)
         print(
             f"saved {path}.png / {path}.yaml  "
-            f"({len(boxes)}/{args.n_boxes} box(es) {box_desc}, area {area_fraction:.1%}, "
-            f"frontier {score} cells, height {args.height:.2f} m, extent {args.extent:.1f} m)"
+            f"({len(boxes)}/{args.n_boxes} box(es) {box_desc}, area {params['area_fraction']:.1%}, "
+            f"frontier {params['frontier_cells']} cells, height {args.height:.2f} m, "
+            f"extent {args.extent:.1f} m)"
         )
 
 
