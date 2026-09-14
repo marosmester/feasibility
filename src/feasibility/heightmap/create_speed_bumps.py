@@ -16,7 +16,7 @@ the same incline angle instead of the same ramp width -- a fixed ramp width woul
 bumps steeper than short ones.
 
 CLI parameters:
-    --cell FLOAT          grid resolution in meters (default: 0.05)
+    --cell FLOAT          grid resolution in meters (default: 0.1)
     --incline-deg FLOAT   ramp incline angle in degrees, shared by every bump height in the
                            series (default: 80.0)
 
@@ -44,7 +44,7 @@ YLIM = (-3.0, 3.0)
 BUMP_X0 = 2.0  # m, leading (near) edge of the bump's flat top
 BUMP_WIDTH = 0.4  # m, extent of the flat top along X (direction of travel)
 
-DEFAULT_CELL = 0.05  # m, grid resolution
+DEFAULT_CELL = 0.1  # m, grid resolution
 DEFAULT_INCLINE_DEG = 80.0  # deg, ramp slope shared by every height in the series
 
 BUMP_HEIGHTS =  (0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70)  # m, one heightmap per height

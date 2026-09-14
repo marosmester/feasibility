@@ -49,7 +49,7 @@ CLI parameters:
                                 matching create_large_box_obstacles.py's default -- leaves a
                                 healthy clear margin past PatchSpec's ~2.5 m reach even with a
                                 box present)
-    --cell FLOAT                grid resolution in meters (default: 0.05)
+    --cell FLOAT                grid resolution in meters (default: 0.1)
     --incline-deg FLOAT         obstacle ramp incline angle in degrees (default: 75.0)
     --cutoff-wavelength FLOAT   longest rough-terrain wavelength let through, in meters -- see
                                 create_rough_terrain.py's module docstring (default: 3.0)
@@ -83,7 +83,7 @@ ASSETS_DIR = REPO_ROOT / "assets" / "rough_box"
 
 DEFAULT_HEIGHT = 0.70  # m -- same platform-scale obstacle height every box generator uses
 DEFAULT_EXTENT = 10.0  # m, full width/height of the square grid
-DEFAULT_CELL = 0.05  # m, grid resolution
+DEFAULT_CELL = 0.1  # m, grid resolution
 DEFAULT_INCLINE_DEG = 75.0  # deg, obstacle ramp slope
 DEFAULT_N_BOXES = 1  # "one random block obstacle" -- see module docstring
 DEFAULT_MAX_AREA_FRACTION = 0.12  # far below large_box_random's 0.5 -- see module docstring

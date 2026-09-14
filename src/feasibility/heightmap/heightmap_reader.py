@@ -52,7 +52,7 @@ class HeightMapReader:
         cls,
         xlim: tuple[float, float] = (-2.0, 6.0),
         ylim: tuple[float, float] = (-3.0, 3.0),
-        cell: float = 0.05,
+        cell: float = 0.1,
     ) -> "HeightMapReader":
         """Zero-elevation grid, no file needed -- keeps callers runnable with
         no terrain asset, matching both demos' historical flat-ground default."""

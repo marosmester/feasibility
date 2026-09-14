@@ -13,7 +13,7 @@ asset defined the same way (create_speed_bumps.py's bumps included).
 
 Grid handling: BASE_PATH's grid is always the output grid. When OVERLAY_PATH shares the exact
 same origin/cell/shape (the common case -- create_rough_terrain.py and create_box_obstacles.py's
-centered series both default to a 16x16 m grid at cell=0.05, origin (-8, -8)), the two arrays
+centered series both default to a 16x16 m grid at cell=0.1, origin (-8, -8)), the two arrays
 are added directly, no interpolation. Otherwise the overlay is bilinearly resampled onto the
 base's own cell centers via HeightMapReader.sample(), which CLAMPS outside its own grid -- since
 the centered box series' footprint is small relative to its 16 m grid and decays to exactly 0

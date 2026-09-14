@@ -43,7 +43,7 @@ CLI parameters:
     --ratios STR       comma-separated category=weight, e.g. boxes=0.2,walls=0.3,ramps=0.3,rough=0.2
                        (default: DEFAULT_RATIOS below); normalized, weights must be >= 0
     --extent FLOAT     full width/height of every square map in meters (default: 12.0)
-    --cell FLOAT       grid resolution in meters (default: 0.05)
+    --cell FLOAT       grid resolution in meters (default: 0.1)
     --out-dir PATH     output directory (default: assets/lattice_maps/<seed>)
     --dry-run          print counts and build one example per category, write nothing
 
@@ -81,7 +81,7 @@ DEFAULT_RATIOS: dict[str, float] = {"boxes": 0.2, "walls": 0.3, "ramps": 0.3, "r
 
 DEFAULT_N = 200
 DEFAULT_EXTENT = 12.0  # m; generate_dataset.py spawns >= 2.1 m from the edge, leaving ~7.8 m square
-DEFAULT_CELL = 0.05  # m
+DEFAULT_CELL = 0.1  # m
 
 BOXES = {
     "height": (0.05, 0.5),  # m, one height per map (build_box_map shares it across its boxes)

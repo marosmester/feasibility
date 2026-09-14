@@ -1,3 +1,15 @@
+"""Interactive keyboard-controlled ostrich demo (I/J/K/L drive the Helhest Junior).
+
+By default spawns on a hardcoded stairs/ramp/boulders scene. Pass `+map=<path>` to
+drive on a loaded heightmap instead (PNG+YAML pair, with or without extension) --
+e.g. any of assets/lattice_maps/<seed>/*:
+
+    python demos/ostrich_keyboard.py +map=assets/lattice_maps/0/ramps_i0004
+    python demos/ostrich_keyboard.py +map=assets/lattice_maps/0/boxes_i0002 +spawn_yaw=1.57
+    python demos/ostrich_keyboard.py +map=assets/lattice_maps/0/rough_i0003 +mesh_stride=2
+
+Spawn defaults to the map's own center; override with +spawn_x=/+spawn_y=/+spawn_yaw=.
+"""
 import os
 import pathlib
 from typing import override
@@ -22,6 +34,8 @@ try:
     from demos.helhest_common import create_helhest_junior_model
 except ModuleNotFoundError:
     from helhest_common import create_helhest_junior_model
+
+from feasibility.heightmap import HeightMapReader
 
 os.environ["PYOPENGL_PLATFORM"] = "glx"
 
@@ -84,11 +98,21 @@ class HelhestJuniorControlSimulator(InteractiveSimulator):
         k_p: float = 50.0,
         k_d: float = 0.1,
         friction: float = 0.7,
+        terrain: HeightMapReader | None = None,
+        spawn_pose: tuple[float, float, float] = (0.0, 0.0, 0.0),
+        mesh_stride: int = 1,
+        mesh_max_rise: float | None = None,
     ):
         self.control_mode = control_mode
         self.k_p = k_p
         self.k_d = k_d
         self.friction = friction
+        # When set, build_model() loads this heightmap as the ground instead of the
+        # hardcoded stairs/ramp/boulders scene -- see `+map=` on the CLI.
+        self.terrain = terrain
+        self.spawn_pose = spawn_pose
+        self.mesh_stride = mesh_stride
+        self.mesh_max_rise = mesh_max_rise
         self.left_indices_cpu = []
         self.right_indices_cpu = []
         super().__init__(
@@ -217,13 +241,17 @@ class HelhestJuniorControlSimulator(InteractiveSimulator):
 
     def build_model(self) -> newton.Model:
         self.builder.rigid_gap = 1.0
-        # --- 1. Ground ---
         ground_cfg = newton.ModelBuilder.ShapeConfig(
             mu=0.3,
             ke=4e4,
             kd=4e3,
             kf=1e3,
         )
+
+        if self.terrain is not None:
+            return self._build_model_from_heightmap(ground_cfg)
+
+        # --- 1. Ground ---
         self.builder.add_ground_plane(cfg=ground_cfg)
 
         # Obstacle 1: Stairs (Stepped boxes)
@@ -308,6 +336,40 @@ class HelhestJuniorControlSimulator(InteractiveSimulator):
 
         return self.builder.finalize_replicated(num_worlds=self.simulation_config.num_worlds)
 
+    def _build_model_from_heightmap(
+        self, ground_cfg: newton.ModelBuilder.ShapeConfig
+    ) -> newton.Model:
+        """`+map=` path: ground is a loaded HeightMapReader instead of the hardcoded
+        stairs/ramp/boulders scene. Mesh goes in a separate global builder (shape_world=-1)
+        the same way ostrich_speed_bump.py's OstrichSpeedBumpSimulator does it, so it's
+        stored once and broadphase-tested against every world rather than duplicated."""
+        globals_builder = newton.ModelBuilder()
+        globals_builder.add_shape_mesh(
+            body=-1,
+            mesh=self.terrain.to_ostrich_mesh(
+                stride=self.mesh_stride, max_rise_per_tile=self.mesh_max_rise
+            ),
+            cfg=ground_cfg,
+        )
+
+        spawn_x, spawn_y, spawn_yaw = self.spawn_pose
+        spawn_z = float(self.terrain.sample(spawn_x, spawn_y)) + 0.5
+        spawn_q = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), spawn_yaw)
+
+        create_helhest_junior_model(
+            self.builder,
+            xform=wp.transform(wp.vec3(spawn_x, spawn_y, spawn_z), spawn_q),
+            control_mode=self.control_mode,
+            k_p=self.k_p,
+            k_d=self.k_d,
+            friction_left_right=self.friction,
+            friction_rear=self.friction * 0.5,  # Keep rear wheel slippery
+        )
+
+        return self.builder.finalize_replicated(
+            num_worlds=self.simulation_config.num_worlds, global_builder=globals_builder
+        )
+
 
 @hydra.main(config_path=str(CONFIG_PATH), config_name="helhest", version_base=None)
 def helhest_junior_control_example(cfg: DictConfig):
@@ -319,6 +381,25 @@ def helhest_junior_control_example(cfg: DictConfig):
     # Force GL viewer
     render_config.vis_type = "gl"
 
+    # `+map=<path>` (with or without extension, e.g. one of assets/lattice_maps/<seed>/*)
+    # swaps the hardcoded stairs/ramp/boulders scene for a loaded HeightMapReader. Spawn
+    # defaults to the map's own center; override with +spawn_x=/+spawn_y=/+spawn_yaw=.
+    map_path = cfg.get("map", None)
+    terrain = None
+    spawn_pose = (0.0, 0.0, 0.0)
+    mesh_stride = int(cfg.get("mesh_stride", 1))
+    mesh_max_rise_cfg = cfg.get("mesh_max_rise", None)
+    mesh_max_rise = None if mesh_max_rise_cfg is None else float(mesh_max_rise_cfg)
+    if map_path is not None:
+        terrain = HeightMapReader.load(map_path)
+        default_x = terrain.x0 + terrain.cell * terrain.nx / 2.0
+        default_y = terrain.y0 + terrain.cell * terrain.ny / 2.0
+        spawn_pose = (
+            float(cfg.get("spawn_x", default_x)),
+            float(cfg.get("spawn_y", default_y)),
+            float(cfg.get("spawn_yaw", 0.0)),
+        )
+
     simulator = HelhestJuniorControlSimulator(
         sim_config,
         render_config,
@@ -328,6 +409,10 @@ def helhest_junior_control_example(cfg: DictConfig):
         k_p=cfg.control.k_p,
         k_d=cfg.control.k_d,
         friction=cfg.friction_coeff,
+        terrain=terrain,
+        spawn_pose=spawn_pose,
+        mesh_stride=mesh_stride,
+        mesh_max_rise=mesh_max_rise,
     )
     simulator.run()
 

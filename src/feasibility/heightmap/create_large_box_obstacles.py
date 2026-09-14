@@ -72,7 +72,7 @@ CLI parameters:
     --max-area-fraction FLOAT   max total obstacle+ramp footprint as a fraction of the map's
                                 area (default: 0.5)
     --extent FLOAT              full width/height in meters of the square grid (default: 10.0)
-    --cell FLOAT                grid resolution in meters (default: 0.05)
+    --cell FLOAT                grid resolution in meters (default: 0.1)
     --incline-deg FLOAT          ramp incline angle in degrees, shared by every obstacle
                                 (default: 75.0)
     --position-trials INT        number of random placement candidates scored per map, the
@@ -97,7 +97,7 @@ ASSETS_DIR = REPO_ROOT / "assets" / "large_box_random"
 
 DEFAULT_HEIGHT = 0.70  # m, shared by every obstacle on every map -- see module docstring
 DEFAULT_EXTENT = 10.0  # m, full width/height of the square grid
-DEFAULT_CELL = 0.05  # m, grid resolution
+DEFAULT_CELL = 0.1  # m, grid resolution
 DEFAULT_INCLINE_DEG = 75.0  # deg, ramp slope shared by every obstacle -- see create_box_obstacles.py's rationale
 
 SIZE_MIN, SIZE_MAX, SIZE_STEP = 0.5, 6.0, 0.5  # m, width/depth drawn independently from this range

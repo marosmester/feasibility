@@ -91,7 +91,7 @@ other seed gets its own directory rather than overwriting or intermixing with it
 unaffected (it draws no randomness, so it keeps writing flat into assets/box_centered/).
 
 CLI parameters:
-    --cell FLOAT          grid resolution in meters (default: 0.05)
+    --cell FLOAT          grid resolution in meters (default: 0.1)
     --incline-deg FLOAT   ramp incline angle in degrees, shared by every obstacle height in the
                            series (default: 75.0)
     --extent FLOAT        full width/height in meters of the square grid (default: 10.0)
@@ -141,7 +141,7 @@ BOX_SIZE = 1.5  # m, footprint extent along BOTH X and Y (square)
 BOX_CX = BOX_X0 + BOX_SIZE / 2.0  # m, footprint center X
 BOX_CY = (YLIM[0] + YLIM[1]) / 2.0  # m, footprint center Y -- centered in the grid
 
-DEFAULT_CELL = 0.05  # m, grid resolution
+DEFAULT_CELL = 0.1  # m, grid resolution
 DEFAULT_INCLINE_DEG = 75.0  # deg, ramp slope shared by every height in the series -- see module docstring
 
 BOX_HEIGHTS = (0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80)  # m, one heightmap per height

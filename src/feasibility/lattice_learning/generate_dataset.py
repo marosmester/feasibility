@@ -10,7 +10,11 @@ Three things this generator does that no sibling generator does, all from design
 * **Warm start (section 2).** Every trial is entered already moving at V_NOM: `warmup_s` seconds
   of CAPTURED, commanded ostrich rollout are prepended to the setpoint array and sliced off the
   returned log -- `t0_pose` (ostrich's actual pose row `w_o - 1`) is the arc's true origin, not
-  the nominal spawn.
+  the nominal spawn. Ostrich spawns at helhest_stack's static-settle pose at the spawn, stored as
+  `spawn_zpr` (absolute z incl. `SPAWN_CLEARANCE`, pitch, roll) -- NOT the level `+0.5 m` spawn
+  the other generators use, which ejects the robot when a wheel starts inside a step. The sliced-off pre-roll (the `settle_steps` zero-command drop, then the
+  warm-up) is still stored, as `ostrich/preroll_pose`/`preroll_wheel_qd` with negative
+  `ostrich/preroll_t`, for `gl_replay_arc.py` to show; nothing in training reads it.
 * **`OSTRICH_DT` is re-pinned to 2.5e-2 s** (section 2a), the finest `dt = 0.1/k` that divides
   both `ARC_LEN/V_NOM = 0.5 s` and the twin's `DT = 0.1 s` exactly -- overridden in code on
   `sim_config`, never in `examples/conf/simulation/helhest.yaml` (shared with `submodule_test/`'s
@@ -188,6 +192,14 @@ MAX_SPAWN_DISPLACEMENT = 3.0 * ARC_LEN  # m -- design.md section 7b: a final pos
 # this from the arc's own origin t0_pose is an implausible/diverged solve, not a large-but-real
 # collision displacement (the arc only travels ARC_LEN=0.3m nominally).
 
+SPAWN_CLEARANCE = 0.03  # m -- ostrich spawns at helhest_stack's static-settle pose (z, pitch, roll)
+# at the spawn (x, y, yaw), lifted this far along world z. Replaces comparator.common's level
+# `terrain(axle center) + 0.5` spawn, which put a wheel INSIDE any step higher than 0.15 m under it
+# and got the robot ejected in the first settle step (M50_R16_seed0 trials 42/44: 0.15-0.18 m of
+# overlap, 4.5-5.7 m/s). The margin covers the two models' small geometry differences (yaw-binned
+# cylinder envelope vs. ostrich's collision cylinder, bilinear grid vs. the triangulated mesh) and
+# keeps the drop short (~0.77 m/s landing vs ~1.7 m/s from the old 0.15 m fall).
+
 SWEPT_SAMPLES = 6  # points sampled along the arc's own curve for the swept_clear reporting split
 # (design.md section 7b/8) -- each is settled and checked against the SAME feasibility criterion
 # costtogo.py's _feasibility_kernel uses, at the arc's OWN fixed heading (matching
@@ -274,6 +286,11 @@ def simulate_map(
         device=device, interact_frac=interact_frac, interact_relief=interact_relief, robot=robot,
     )
     spawn_pose, kappa = trials.pose, trials.kappa
+    # The same static settle sample_trials accepted each spawn on (helhest_stack is bit-exact), kept
+    # this time as ostrich's starting pose -- see SPAWN_CLEARANCE.
+    spawn_derived, _, _ = settle_batch(terrain, spawn_pose, mu, device)
+    spawn_zpr = spawn_derived.astype(np.float64)
+    spawn_zpr[:, 0] += SPAWN_CLEARANCE
 
     t0_pose = np.zeros((n, 3), dtype=np.float64)
     belief_pose = np.zeros((n, 3), dtype=np.float64)
@@ -286,6 +303,9 @@ def simulate_map(
     ostrich_pose = np.zeros((T_RECORD_OSTRICH, n, 7), dtype=np.float32)
     ostrich_wheel_qd = np.zeros((T_RECORD_OSTRICH, n, 3), dtype=np.float32)
     ostrich_cmd = np.zeros((T_RECORD_OSTRICH, n, 3), dtype=np.float32)
+    # Viewer-only: the settle drop followed by the warm-up, i.e. everything before the arc.
+    ostrich_preroll_pose = np.zeros((settle_steps + w_o, n, 7), dtype=np.float32)
+    ostrich_preroll_wheel_qd = np.zeros((settle_steps + w_o, n, 3), dtype=np.float32)
 
     for start in range(0, n, chunk):
         end = min(start + chunk, n)
@@ -302,9 +322,10 @@ def simulate_map(
 
         ostrich_setpoints = np.tile(wheels_chunk[None], (T_o, 1, 1))  # [T_o, b, 3]
 
-        pose_log, wheel_qd_o = run_ostrich_batch(
+        pose_log, wheel_qd_o, settle_pose, settle_wheel_qd = run_ostrich_batch(
             sim_config, render_config, engine_config, logging_config, terrain,
-            ostrich_setpoints, mu, spawn_chunk, settle_steps,
+            ostrich_setpoints, mu, spawn_chunk, settle_steps, record_settle=True,
+            spawn_zpr=spawn_zpr[start:end],
         )
         t0_xyyaw = np.column_stack(
             [pose_log[w_o - 1, :, 0], pose_log[w_o - 1, :, 1], _quat_to_yaw(pose_log[w_o - 1, :, 3:7])]
@@ -355,6 +376,8 @@ def simulate_map(
         ostrich_pose[:, sl] = pose_log[w_o:]
         ostrich_wheel_qd[:, sl] = wheel_qd_o[w_o:]
         ostrich_cmd[:, sl] = ostrich_setpoints[w_o:]
+        ostrich_preroll_pose[:, sl] = np.concatenate([settle_pose, pose_log[:w_o]], axis=0)
+        ostrich_preroll_wheel_qd[:, sl] = np.concatenate([settle_wheel_qd, wheel_qd_o[:w_o]], axis=0)
 
         n_bad = int((~valid_chunk).sum())
         bad = f", {n_bad} invalid" if n_bad else ""
@@ -362,6 +385,7 @@ def simulate_map(
 
     return dict(
         spawn_pose=spawn_pose.astype(np.float32),
+        spawn_zpr=spawn_zpr.astype(np.float32),
         t0_pose=t0_pose.astype(np.float32),
         belief_pose=belief_pose.astype(np.float32),
         patch=patch,
@@ -374,6 +398,8 @@ def simulate_map(
         ostrich_pose=ostrich_pose,
         ostrich_wheel_qd=ostrich_wheel_qd,
         ostrich_cmd=ostrich_cmd,
+        ostrich_preroll_pose=ostrich_preroll_pose,
+        ostrich_preroll_wheel_qd=ostrich_preroll_wheel_qd,
     ), trials
 
 
@@ -516,10 +542,11 @@ def generate(cfg: DictConfig) -> None:
             warmup_s=warmup_s, kappa_max=kappa_max, mu=mu, device=device,
             interact_frac=map_interact_frac(p), interact_relief=interact_relief,
         )
-        for key in ("spawn_pose", "t0_pose", "belief_pose", "patch", "kappa", "arc_relief",
+        for key in ("spawn_pose", "spawn_zpr", "t0_pose", "belief_pose", "patch", "kappa", "arc_relief",
                     "arc_end_pose", "ref_pose", "valid", "swept_clear"):
             per_variant_fields.setdefault(key, []).append(result[key])
-        for key in ("ostrich_pose", "ostrich_wheel_qd", "ostrich_cmd"):
+        for key in ("ostrich_pose", "ostrich_wheel_qd", "ostrich_cmd",
+                    "ostrich_preroll_pose", "ostrich_preroll_wheel_qd"):
             ostrich_fields.setdefault(key, []).append(result[key])
         map_index_all.append(np.full(trials_per_map, m, dtype=np.int64))
         map_path_all.extend([str(p)] * trials_per_map)
@@ -541,6 +568,9 @@ def generate(cfg: DictConfig) -> None:
     ostrich = {k.removeprefix("ostrich_"): np.concatenate(v, axis=1) for k, v in ostrich_fields.items()}
     ostrich["dt"] = OSTRICH_DT
     ostrich["t"] = np.arange(T_RECORD_OSTRICH, dtype=np.float32) * OSTRICH_DT
+    n_preroll = settle_steps + round(warmup_s / OSTRICH_DT)
+    # Negative times, so preroll_t continues straight into t (the arc's first step is t=0).
+    ostrich["preroll_t"] = (np.arange(n_preroll, dtype=np.float32) - n_preroll) * OSTRICH_DT
 
     tag = f"{maps_dir.parent.name}{maps_dir.name}" if maps_dir.name.isdigit() else maps_dir.name
     out_path = OUT_DIR / f"dataset_arc_{tag}_M{n_maps}_R{trials_per_map}_seed{seed}.h5"
@@ -551,7 +581,7 @@ def generate(cfg: DictConfig) -> None:
             # guard trio -- see arc.py; kept literal here so this file has no import-time
             # dependency beyond arc.py's already-imported constants
             kappa_min=-kappa_max, kappa_max=kappa_max,
-            warmup_s=warmup_s, settle_steps=settle_steps,
+            warmup_s=warmup_s, settle_steps=settle_steps, spawn_clearance=SPAWN_CLEARANCE,
             xy_jitter=xy_jitter, yaw_jitter=yaw_jitter, router_cell=router_cell, n_theta=n_theta,
             # NaN = untargeted everywhere (an HDF5 attr cannot hold None)
             interact_frac=np.nan if interact_frac is None else interact_frac,

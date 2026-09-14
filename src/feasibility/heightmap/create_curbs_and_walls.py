@@ -35,7 +35,7 @@ output layout. Running this module directly is its smoke test.
 CLI parameters:
     --seed INT       RNG seed for the example map (default: 0)
     --extent FLOAT   full width/height of the square grid in meters (default: 12.0)
-    --cell FLOAT     grid resolution in meters (default: 0.05)
+    --cell FLOAT     grid resolution in meters (default: 0.1)
     --out PATH       if given, save the example map to this stem (.png/.yaml)
 
 Usage:
@@ -54,7 +54,7 @@ from feasibility.heightmap import HeightMapReader
 from feasibility.heightmap.create_large_box_obstacles import build_rect_obstacle
 
 DEFAULT_EXTENT = 12.0  # m
-DEFAULT_CELL = 0.05  # m
+DEFAULT_CELL = 0.1  # m
 PLACEMENT_MARGIN = 1.1  # m, feature centers stay this far inside the grid edge -- module docstring
 MAX_FEATURE_ATTEMPTS = 50  # draws per feature before the map stops growing
 GROUND_EPS = 1e-6  # m, a cell above this counts as covered by a feature

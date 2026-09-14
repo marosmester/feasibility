@@ -33,7 +33,7 @@ output layout. Running this module directly is its smoke test.
 CLI parameters:
     --seed INT       RNG seed for the example map (default: 0)
     --extent FLOAT   full width/height of the square grid in meters (default: 12.0)
-    --cell FLOAT     grid resolution in meters (default: 0.05)
+    --cell FLOAT     grid resolution in meters (default: 0.1)
     --out PATH       if given, save the example map to this stem (.png/.yaml)
 
 Usage:
@@ -54,7 +54,7 @@ from feasibility.heightmap.create_curbs_and_walls import PLACEMENT_MARGIN
 from feasibility.heightmap.create_curbs_and_walls import grid_axes
 
 DEFAULT_EXTENT = 12.0  # m
-DEFAULT_CELL = 0.05  # m
+DEFAULT_CELL = 0.1  # m
 MAX_RAMP_ATTEMPTS = 50  # draws per ramp before the map stops growing
 
 

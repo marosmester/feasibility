@@ -233,13 +233,21 @@ class HelhestBatchSimulator(HelhestJuniorReplaySimulator):
     each world its own spawn -- a dataset generator's per-world batch, all N worlds sharing one
     terrain. Either way the robot is built once, at identity, and _apply_spawn_poses places each
     world afterwards; the batch-kernel machinery (_batch_control_kernel etc.) was already generic
-    to N > 1, so nothing below the model build needed to change."""
+    to N > 1, so nothing below the model build needed to change.
+
+    `spawn_zpr` (optional, [N, 3] = absolute base z, pitch, roll) replaces the default level
+    spawn at `terrain(x, y) + 0.5`. That default samples the terrain only at the base origin (the
+    front-axle center), so a wheel over ground more than 0.15 m higher starts INSIDE the terrain
+    and ostrich's contact solve ejects the robot in one step. A caller that knows a resting pose
+    (e.g. helhest_stack's static settle, same body frame and Rz@Ry@Rx convention) passes it here,
+    lifted by its own clearance."""
 
     def __init__(
         self,
         *args,
         terrain: HeightMapReader,
         spawn_pose: tuple[float, float, float] | np.ndarray,
+        spawn_zpr: np.ndarray | None = None,
         **kwargs,
     ):
         self.terrain = terrain
@@ -249,6 +257,11 @@ class HelhestBatchSimulator(HelhestJuniorReplaySimulator):
         if spawn_pose_arr.ndim == 1:
             spawn_pose_arr = spawn_pose_arr[None, :]
         self.spawn_poses = spawn_pose_arr  # [N, 3] (x, y, yaw)
+        self.spawn_zpr = None if spawn_zpr is None else np.asarray(spawn_zpr, dtype=np.float64).reshape(-1, 3)
+        if self.spawn_zpr is not None and self.spawn_zpr.shape[0] != self.spawn_poses.shape[0]:
+            raise ValueError(
+                f"spawn_zpr has {self.spawn_zpr.shape[0]} rows but spawn_pose has {self.spawn_poses.shape[0]}"
+            )
         super().__init__(*args, **kwargs)
         num_worlds = self.simulation_config.num_worlds
         self.dofs_per_world = self.model.joint_dof_count // num_worlds
@@ -337,8 +350,13 @@ class HelhestBatchSimulator(HelhestJuniorReplaySimulator):
 
         for w in range(num_worlds):
             x, y, yaw = (float(v) for v in self.spawn_poses[w])
-            z = float(self.terrain.sample(x, y)) + 0.5
-            spawn_xf = wp.transform(wp.vec3(x, y, z), wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), yaw))
+            if self.spawn_zpr is None:
+                z = float(self.terrain.sample(x, y)) + 0.5
+                quat = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), yaw)
+            else:
+                z, pitch, roll = (float(v) for v in self.spawn_zpr[w])
+                quat = wp.quat(*(float(q) for q in euler_zyx_to_quat_xyzw(yaw, pitch, roll)))
+            spawn_xf = wp.transform(wp.vec3(x, y, z), quat)
 
             joint_idx = w * joints_per_world + local_free_idx
             qi = int(joint_q_start_np[joint_idx])
@@ -381,27 +399,36 @@ class HelhestBatchSimulator(HelhestJuniorReplaySimulator):
             dt=self.clock.dt,
         )
         self._copy_state(self.current_state, self.next_state)
+        self._log_step(self._step_buf, self._T, self._pose_log, self._wheel_log)
+
+    def _log_step(
+        self, step_buf: wp.array, T: int, pose_log: wp.array, wheel_log: wp.array
+    ) -> None:
+        """Write current_state's chassis pose and wheel velocities into row step_buf[0] of the
+        given logs, then advance step_buf. Capturable; also called uncaptured during settle."""
         wp.launch(
             _batch_log_pose_kernel,
             dim=self.simulation_config.num_worlds,
-            inputs=[self.current_state.body_q, self._step_buf, self._T, self._pose_log, self.bodies_per_world, 0],
+            inputs=[self.current_state.body_q, step_buf, T, pose_log, self.bodies_per_world, 0],
             device=self.model.device,
         )
         newton.eval_ik(self.model, self.current_state, self._jq, self._jqd)
         wp.launch(
             _batch_log_wheel_kernel,
             dim=self.simulation_config.num_worlds,
-            inputs=[self._jqd, self._step_buf, self._T, self._wheel_log, self.dofs_per_world, WHEEL_DOF_OFFSET],
+            inputs=[self._jqd, step_buf, T, wheel_log, self.dofs_per_world, WHEEL_DOF_OFFSET],
             device=self.model.device,
         )
-        wp.launch(_advance_kernel, dim=1, inputs=[self._step_buf], device=self.model.device)
+        wp.launch(_advance_kernel, dim=1, inputs=[step_buf], device=self.model.device)
 
     def replay_graph_batch(
-        self, setpoints: np.ndarray, settle_steps: int | None = None
-    ) -> tuple[np.ndarray, np.ndarray]:
+        self, setpoints: np.ndarray, settle_steps: int | None = None, record_settle: bool = False
+    ) -> tuple[np.ndarray, ...]:
         """CUDA-graph batched replay: settle at zero velocity (uncaptured), then capture one
         physics step covering ALL worlds and launch it T times with no Python in the loop.
-        `setpoints` is [T, num_worlds, 3]. Returns pose [T, num_worlds, 7], wheel_qd [T, num_worlds, 3]."""
+        `setpoints` is [T, num_worlds, 3]. Returns pose [T, num_worlds, 7], wheel_qd [T, num_worlds, 3];
+        with `record_settle` also the settle phase's own pose [S, num_worlds, 7] and wheel_qd
+        [S, num_worlds, 3], one row per settle step."""
         T, num_worlds, _ = setpoints.shape
         assert num_worlds == self.simulation_config.num_worlds
         self._T = T
@@ -412,6 +439,10 @@ class HelhestBatchSimulator(HelhestJuniorReplaySimulator):
         self._jq = wp.zeros_like(self.model.joint_q)
         self._jqd = wp.zeros_like(self.model.joint_qd)
         settle_steps = self._resolve_settle_steps(settle_steps)
+        if record_settle:
+            settle_step_buf = wp.zeros(1, dtype=wp.int32, device=self.model.device)
+            settle_pose_log = wp.zeros((settle_steps, num_worlds, 7), dtype=wp.float32, device=self.model.device)
+            settle_wheel_log = wp.zeros((settle_steps, num_worlds, 3), dtype=wp.float32, device=self.model.device)
 
         # Settle on the ground (uncaptured, zero command -- target_velocities only ever
         # addresses world 0's dofs, but joint_target_vel starts zero-initialized for every
@@ -419,6 +450,8 @@ class HelhestBatchSimulator(HelhestJuniorReplaySimulator):
         self.target_velocities.zero_()
         for _ in range(settle_steps):
             self._single_physics_step(0)
+            if record_settle:
+                self._log_step(settle_step_buf, settle_steps, settle_pose_log, settle_wheel_log)
 
         self._step_buf.zero_()
         with wp.ScopedCapture() as capture:
@@ -428,6 +461,11 @@ class HelhestBatchSimulator(HelhestJuniorReplaySimulator):
         for _ in range(T):
             wp.capture_launch(graph)
         wp.synchronize()
+        if record_settle:
+            return (
+                self._pose_log.numpy(), self._wheel_log.numpy(),
+                settle_pose_log.numpy(), settle_wheel_log.numpy(),
+            )
         return self._pose_log.numpy(), self._wheel_log.numpy()
 
 
@@ -441,9 +479,17 @@ def run_ostrich_batch(
     mu: float,
     spawn_pose: tuple[float, float, float] | np.ndarray,
     settle_steps: int | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
+    record_settle: bool = False,
+    spawn_zpr: np.ndarray | None = None,
+) -> tuple[np.ndarray, ...]:
     """`spawn_pose` is either one (x, y, yaw) shared by every world (setpoints' W dimension must
     then be 1) or an [N, 3] array giving each world its own -- see HelhestBatchSimulator.
+    `spawn_zpr` [N, 3] (absolute z, pitch, roll) overrides the level `terrain + 0.5` spawn; None
+    keeps it, see HelhestBatchSimulator.
+
+    `record_settle=True` additionally returns the settle phase's pose [S, N, 7] and wheel_qd
+    [S, N, 3] (see `HelhestBatchSimulator.replay_graph_batch`); the default keeps the two-array
+    return every existing caller unpacks.
 
     `settle_steps` is the pre-roll the robot spends dropping onto the terrain at zero command
     before recording starts; None keeps _resolve_settle_steps' `max(60, 0.5s/dt)` default. That
@@ -462,8 +508,9 @@ def run_ostrich_batch(
             # pile
             sim_config, render_config, engine_config, logging_config,
             k_p=K_P, mu_front=mu, mu_rear=mu, terrain=terrain, spawn_pose=spawn_pose,
+            spawn_zpr=spawn_zpr,
         )
-        return sim.replay_graph_batch(setpoints, settle_steps)
+        return sim.replay_graph_batch(setpoints, settle_steps, record_settle)
     finally:
         # Drop the build and force a cyclic-GC pass, so its device memory comes back NOW rather
         # than whenever CPython next happens to collect. Everything this function allocates on

@@ -59,7 +59,7 @@ self-describing the same way comparator/provenance.py's HDF5 runs are.
 
 CLI parameters:
     --extent FLOAT             full width/height of the square grid, in meters (default: 16.0)
-    --cell FLOAT                grid resolution in meters (default: 0.05)
+    --cell FLOAT                grid resolution in meters (default: 0.1)
     --cutoff-wavelength FLOAT   longest wavelength let through, in meters -- longer features are
                                  hills and are suppressed entirely (default: 3.0)
     --min-wavelength FLOAT      shortest wavelength let through, in meters -- caps slope
@@ -90,7 +90,7 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 ASSETS_DIR = REPO_ROOT / "assets" / "rough"
 
 DEFAULT_EXTENT = 16.0  # m, square grid -- matches create_box_obstacles.py's centered series
-DEFAULT_CELL = 0.05  # m, grid resolution -- matches every other create_*.py default
+DEFAULT_CELL = 0.1  # m, grid resolution -- matches every other create_*.py default
 DEFAULT_CUTOFF_WAVELENGTH = 3.0  # m, longest wavelength let through -- see module docstring
 DEFAULT_MIN_WAVELENGTH = 0.6  # m, shortest wavelength let through -- caps slope divergence
 DEFAULT_BETA = 2.5  # power-spectrum slope S(k) ~ k^-beta
