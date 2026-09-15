@@ -95,7 +95,8 @@ config):
                          design.md section 2's "measured quantity"; NOT independently re-measured
                          in this checkout, see DEFAULT_WARMUP_S's comment
     +settle_steps=INT    ostrich steps dropping onto the terrain at zero command, paid once per
-                         chunk, BEFORE the (uncaptured) warm-up window begins  (default: 15)
+                         chunk, BEFORE the warm-up window begins -- run as zero-setpoint rows of
+                         the same captured rollout (default: 15)
     +chunk=INT           trials per ostrich model build                    (default: 64)
     +mu=FLOAT            ground friction                                   (default: 0.8)
     +device=STR          torch/warp device for ostrich AND the settle      (default: "cuda:0")
@@ -370,11 +371,19 @@ def simulate_map(
 
         ostrich_setpoints = np.tile(wheels_chunk[None], (T_o, 1, 1))  # [T_o, b, 3]
 
-        pose_log, wheel_qd_o, settle_pose, settle_wheel_qd = run_ostrich_batch(
+        # The settle rides in the CAPTURED rollout as `settle_steps` leading rows of zero wheel
+        # speed, instead of run_ostrich_batch's own uncaptured settle loop (settle_steps=0 skips
+        # it). Same physics per step -- collide, zero wheel target, solve -- but replayed as a
+        # CUDA graph: ~6.5 ms/step instead of ~0.6 s/step of Python kernel launches, which made
+        # the settle ~2/3 of every map's wall time. Sliced back apart right below.
+        settle_setpoints = np.zeros((settle_steps, b, 3), dtype=np.float32)
+        full_pose, full_wheel_qd = run_ostrich_batch(
             sim_config, render_config, engine_config, logging_config, terrain,
-            ostrich_setpoints, mu, spawn_chunk, settle_steps, record_settle=True,
-            spawn_zpr=spawn_zpr[start:end],
+            np.concatenate([settle_setpoints, ostrich_setpoints], axis=0), mu, spawn_chunk,
+            settle_steps=0, spawn_zpr=spawn_zpr[start:end],
         )
+        settle_pose, pose_log = full_pose[:settle_steps], full_pose[settle_steps:]
+        settle_wheel_qd, wheel_qd_o = full_wheel_qd[:settle_steps], full_wheel_qd[settle_steps:]
         t0_xyyaw = np.column_stack(
             [pose_log[w_o - 1, :, 0], pose_log[w_o - 1, :, 1], _quat_to_yaw(pose_log[w_o - 1, :, 3:7])]
         )  # [b, 3] -- the arc's true origin (design.md section 1c)

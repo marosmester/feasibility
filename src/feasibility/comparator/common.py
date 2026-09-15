@@ -16,14 +16,17 @@ per build).
 
 from __future__ import annotations
 
+import functools
 import gc
 import pathlib
 from dataclasses import dataclass
 
 import examples
+import examples.helhest_junior.common as helhest_junior_common
 import hydra
 import newton
 import numpy as np
+import openmesh
 import warp as wp
 from examples.helhest_junior.common import create_helhest_junior_model
 from examples.helhest_junior.common import HelhestJuniorConfig
@@ -157,6 +160,36 @@ def euler_zyx_to_quat_xyzw(yaw: np.ndarray, pitch: np.ndarray, roll: np.ndarray)
     qy = cr * sp * cy + sr * cp * sy
     qz = cr * cp * sy - sr * sp * cy
     return np.stack([qx, qy, qz, qw], axis=-1).astype(np.float32)
+
+
+# --- wheel mesh: parsed once per process, not once per model build ------------------------------
+
+
+@functools.cache
+def _wheel_mesh_arrays() -> tuple[np.ndarray, np.ndarray]:
+    """(points, flat triangle indices) of the Helhest wheel mesh -- the same parse and scale as
+    ostrich's `examples/helhest_junior/common.py:_load_wheel_mesh`, which re-reads the .obj with
+    openmesh on every `create_helhest_junior_model` call: ~1.4 s per build, paid by every chunk of
+    every dataset generator. Only the arrays are cached; each build still gets its own fresh
+    `newton.Mesh` (below), since a Mesh can own device buffers tied to a model that
+    `run_ostrich_batch` tears down and collects after every chunk."""
+    wheel_m = openmesh.read_trimesh(
+        str(helhest_junior_common.ASSETS_DIR.joinpath("helhest/wheel2.obj"))
+    )
+    points = np.array(wheel_m.points()) * HelhestJuniorConfig.WHEEL_MESH_SCALE
+    indices = np.array(wheel_m.face_vertex_indices(), dtype=np.int32).flatten()
+    return points, indices
+
+
+def _load_wheel_mesh_cached() -> newton.Mesh:
+    points, indices = _wheel_mesh_arrays()
+    return newton.Mesh(points, indices)
+
+
+# Patched in from here rather than edited inside the ostrich submodule: create_helhest_junior_model
+# looks `_load_wheel_mesh` up in its own module's globals at call time, so this reaches every
+# build made from this interpreter (comparator, dataset generators, submodule_test).
+helhest_junior_common._load_wheel_mesh = _load_wheel_mesh_cached
 
 
 # --- ostrich: single-world replicated model, CUDA-graph-captured rollout, one build per
