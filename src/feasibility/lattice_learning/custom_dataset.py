@@ -3,7 +3,16 @@ one sample is a single body-frame terrain patch plus ONE scalar curvature comman
 is the ostrich-vs-(arc+settle) final-pose SE(3) error (design.md sections 1, 7b) --
 
     x = (patch [1, 24, 28], kappa [])
-    y = (e_pos, e_rot)          -- computed HERE from ref_pose and ostrich/pose[-1], not stored
+    y = (e_pos, e_rot)                       -- label_mode="pos_rot" (default)
+      = (e_pos, e_roll, e_pitch, e_yaw)      -- label_mode="pos_rpy"
+
+Always computed HERE from `ref_pose` and `ostrich/pose[-1]`, not stored in the file -- `e_rot` is
+the single geodesic rotation-error scalar (`se3_errors`, trace formula), `(e_roll, e_pitch,
+e_yaw)` is the same `T_err = T1^-1 @ T2` decomposed per-axis instead (`rpy_errors`, Euler
+extraction) -- a diagnostic breakdown of the one number `e_rot` already gives, not an independent
+measurement, so the two don't sum to the same total. Both are non-negative (`rpy_errors` takes
+`abs()` of each Euler angle) to match `model.TargetTransform`'s log1p pipeline, which assumes a
+non-negative target.
 
 Deliberately independent of `learning/`, `grid_learning/` and `grid_learning_2/` (design.md
 section 11a): `se3_error` is re-derived below rather than imported -- ~10 lines of closed-form
@@ -38,6 +47,7 @@ CLI parameters:
     path             dataset_arc_*.h5 path -- omit to run the offline self-test instead, which
                      writes a small synthetic file to a temp dir and reads it back
     --batch-size     rows per batch (default: 32)
+    --label-mode     pos_rot (default, (e_pos, e_rot)) | pos_rpy ((e_pos, e_roll, e_pitch, e_yaw))
 
 Usage:
     python src/feasibility/lattice_learning/custom_dataset.py                # synthetic self-test
@@ -94,10 +104,40 @@ def se3_errors(T1: np.ndarray, T2: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return pos_error, rot_error
 
 
+def matrix_to_euler_zyx(R: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """[..., 3, 3] rotation matrix -> (yaw, pitch, roll), each [...] rad -- the inverse of
+    `comparator.common.euler_zyx_to_quat_xyzw`'s `R = Rz(yaw) @ Ry(pitch) @ Rx(roll)` convention
+    (re-derived here rather than imported, per this module's independence stance). Standard
+    Tait-Bryan extraction; gimbal-locks at pitch = +-90 deg like any ZYX decomposition, which
+    `rpy_errors` below inherits."""
+    pitch = np.arcsin(np.clip(-R[..., 2, 0], -1.0, 1.0))
+    roll = np.arctan2(R[..., 2, 1], R[..., 2, 2])
+    yaw = np.arctan2(R[..., 1, 0], R[..., 0, 0])
+    return yaw, pitch, roll
+
+
+def rpy_errors(T1: np.ndarray, T2: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """[..., 4, 4], [..., 4, 4] -> (roll_error, pitch_error, yaw_error), each [...] rad -- the
+    per-axis breakdown of `se3_errors`' single `rot_error` scalar: same `T_err = T1^-1 @ T2`
+    convention, decomposed via `matrix_to_euler_zyx` instead of collapsed through the trace
+    formula. Absolute value, like `rot_error`, so all three feed the same non-negative log1p
+    target pipeline (`model.TargetTransform`) rather than a signed directional error."""
+    T_err = np.linalg.inv(T1) @ T2
+    yaw, pitch, roll = matrix_to_euler_zyx(T_err[..., :3, :3])
+    return np.abs(roll), np.abs(pitch), np.abs(yaw)
+
+
+LABEL_MODES = ("pos_rot", "pos_rpy")
+POS_RPY_NAMES = ("e_pos", "e_roll", "e_pitch", "e_yaw")
+
+
 class ArcDivergenceDataset(Dataset):
     """One sample per VALID row of a dataset_arc_*.h5: x = (patch [1, ny, nx], kappa []),
-    y = (e_pos, e_rot) [2]. `swept_clear` [bool] and `map_index`/`map_path` survive alongside
-    (design.md section 8's reporting split and section 11a's map-level split, respectively).
+    y = (e_pos, e_rot) [2] (`label_mode="pos_rot"`, default) or
+    (e_pos, e_roll, e_pitch, e_yaw) [4] (`label_mode="pos_rpy"`) -- see the module docstring for
+    how the two relate. `self.TARGET_NAMES` names whichever columns `y` actually holds.
+    `swept_clear` [bool] and `map_index`/`map_path` survive alongside (design.md section 8's
+    reporting split and section 11a's map-level split, respectively).
 
     Reads the whole file into memory eagerly -- h5py handles are not fork-safe, and even
     design.md section 7c's ~200k-trial budget at 24x28 float32 patches is a few hundred MB, not a
@@ -109,7 +149,10 @@ class ArcDivergenceDataset(Dataset):
         *,
         device: str | torch.device = "cpu",
         drop_blocked_endpoints: bool = False,
+        label_mode: str = "pos_rot",
     ) -> None:
+        if label_mode not in LABEL_MODES:
+            raise ValueError(f"label_mode must be one of {LABEL_MODES}, got {label_mode!r}")
         self.source = pathlib.Path(path)
         with h5py.File(self.source, "r") as f:
             self.attrs = dict(f.attrs)
@@ -141,8 +184,15 @@ class ArcDivergenceDataset(Dataset):
                 f"patch_* attrs ({ny}x{nx}={ny * nx}) -- file written by an incompatible PatchSpec"
             )
 
-        e_pos, e_rot = se3_errors(pose_to_se3(ref_pose), pose_to_se3(ostrich_final))
-        y = np.stack([e_pos, e_rot], axis=-1).astype(np.float32)  # [n, 2]
+        T_ref, T_final = pose_to_se3(ref_pose), pose_to_se3(ostrich_final)
+        e_pos, e_rot = se3_errors(T_ref, T_final)
+        if label_mode == "pos_rot":
+            y = np.stack([e_pos, e_rot], axis=-1).astype(np.float32)  # [n, 2]
+            target_names = TARGET_NAMES
+        else:
+            e_roll, e_pitch, e_yaw = rpy_errors(T_ref, T_final)
+            y = np.stack([e_pos, e_roll, e_pitch, e_yaw], axis=-1).astype(np.float32)  # [n, 4]
+            target_names = POS_RPY_NAMES
 
         keep = valid
         n_dropped = int((~keep).sum())
@@ -162,7 +212,8 @@ class ArcDivergenceDataset(Dataset):
         self.endpoint_blocked = torch.from_numpy(endpoint_blocked[keep]).to(device)
         self.map_index = torch.from_numpy(map_index[keep]).to(device)
         self.map_path = [p for p, k in zip(map_path, keep) if k]
-        self.TARGET_NAMES = TARGET_NAMES
+        self.label_mode = label_mode
+        self.TARGET_NAMES = target_names
 
     def __len__(self) -> int:
         return self.patch.shape[0]
@@ -198,8 +249,9 @@ def split_dataset_by_map(
 
 
 def valid_targets(ds: ArcDivergenceDataset, indices: list[int]) -> torch.Tensor:
-    """[n, 2] physical (e_pos, e_rot) over the given rows -- what `model.TargetTransform.fit`
-    must be handed. A named helper (rather than `ds.y[indices]` at the call site) purely for
+    """[n, len(ds.TARGET_NAMES)] physical targets (`ds.label_mode`-dependent) over the given rows
+    -- what `model.TargetTransform.fit` must be handed. A named helper (rather than
+    `ds.y[indices]` at the call site) purely for
     interface parity with `grid_learning_2/custom_dataset.py`'s `valid_targets`, whose `mask`
     argument this module has no analogue for: every row already surviving `__init__`'s `valid`
     filter has a real, usable target, so this is a plain index. Callers pass
@@ -284,6 +336,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("path", type=pathlib.Path, nargs="?", help="dataset_arc_*.h5 path")
     parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--label-mode", type=str, default="pos_rot", choices=LABEL_MODES)
     args = parser.parse_args()
 
     # --- an identity-pose pair must reduce to exactly (0, 0) ------------------------------------
@@ -294,6 +347,25 @@ if __name__ == "__main__":
     assert np.allclose(pos_e, 0.0) and np.allclose(rot_e, 0.0), (pos_e, rot_e)
     print("[se3] identity-pose pair -> (e_pos, e_rot) = (0, 0) ok")
 
+    roll_e, pitch_e, yaw_e = rpy_errors(T, T)
+    assert np.allclose([roll_e, pitch_e, yaw_e], 0.0), (roll_e, pitch_e, yaw_e)
+    print("[rpy] identity-pose pair -> (e_roll, e_pitch, e_yaw) = (0, 0, 0) ok")
+
+    # --- a pure single-axis yaw rotation must decompose entirely onto e_yaw, matching e_rot -------
+    yaw = np.array([0.4], dtype=np.float64)
+    q_yaw = np.stack(
+        [np.zeros_like(yaw), np.zeros_like(yaw), np.sin(yaw / 2), np.cos(yaw / 2)], axis=-1
+    )
+    yawed_pose = np.zeros((1, 7), dtype=np.float64)
+    yawed_pose[:, 3:] = q_yaw
+    _, rot_e_yaw = se3_errors(T[:1], pose_to_se3(yawed_pose))
+    roll_e_yaw, pitch_e_yaw, yaw_e_yaw = rpy_errors(T[:1], pose_to_se3(yawed_pose))
+    assert np.allclose(roll_e_yaw, 0.0) and np.allclose(pitch_e_yaw, 0.0), (roll_e_yaw, pitch_e_yaw)
+    assert np.allclose(yaw_e_yaw, np.abs(yaw)) and np.allclose(yaw_e_yaw, rot_e_yaw), (
+        yaw_e_yaw, rot_e_yaw
+    )
+    print("[rpy] pure-yaw rotation -> e_yaw == e_rot, e_roll == e_pitch == 0 ok")
+
     with tempfile.TemporaryDirectory() as tmp:
         path = args.path
         if path is None:
@@ -302,12 +374,13 @@ if __name__ == "__main__":
             print(f"[self-test] wrote synthetic file {path.name}")
 
         train_loader, val_loader, ds, train_subset, val_subset = make_dataloaders(
-            path, batch_size=args.batch_size
+            path, batch_size=args.batch_size, label_mode=args.label_mode
         )
         (patch, kappa), y = next(iter(train_loader))
         print(
             f"{len(ds)} valid rows ({len(train_subset)} train / {len(val_subset)} val), "
-            f"patch {tuple(patch.shape)}, kappa {tuple(kappa.shape)}, y {tuple(y.shape)}"
+            f"patch {tuple(patch.shape)}, kappa {tuple(kappa.shape)}, y {tuple(y.shape)} "
+            f"({', '.join(ds.TARGET_NAMES)})"
         )
 
         # --- the split must be by map: no map may appear on both sides -------------------------
@@ -318,23 +391,40 @@ if __name__ == "__main__":
 
         # --- valid_targets selects exactly the given (train-only) rows -------------------------
         fit_rows = valid_targets(ds, train_subset.indices)
-        assert fit_rows.shape == (len(train_subset), 2)
+        assert fit_rows.shape == (len(train_subset), len(ds.TARGET_NAMES))
         assert (fit_rows >= 0).all(), "a negative physical error escaped the SE(3) reduction"
-        print(
-            f"[targets] {fit_rows.shape[0]} train rows, e_pos in "
-            f"[{fit_rows[:, 0].min():.4f}, {fit_rows[:, 0].max():.4f}] m, e_rot in "
-            f"[{fit_rows[:, 1].min():.4f}, {fit_rows[:, 1].max():.4f}] rad"
+        ranges = ", ".join(
+            f"{name} in [{fit_rows[:, i].min():.4f}, {fit_rows[:, i].max():.4f}]"
+            for i, name in enumerate(ds.TARGET_NAMES)
         )
+        print(f"[targets] {fit_rows.shape[0]} train rows, {ranges}")
 
         if args.path is None:
-            # synthetic labels are pure x-translations, so e_pos is the offset and e_rot is 0
-            assert torch.allclose(ds.y[:, 1], torch.zeros_like(ds.y[:, 1]), atol=1e-5), (
-                "identity-rotation poses must give e_rot = 0"
-            )
+            if args.label_mode == "pos_rot":
+                # synthetic labels are pure x-translations, so e_pos is the offset, e_rot is 0
+                assert torch.allclose(ds.y[:, 1], torch.zeros_like(ds.y[:, 1]), atol=1e-5), (
+                    "identity-rotation poses must give e_rot = 0"
+                )
+            else:
+                assert torch.allclose(ds.y[:, 1:], torch.zeros_like(ds.y[:, 1:]), atol=1e-5), (
+                    "identity-rotation poses must give (e_roll, e_pitch, e_yaw) = 0"
+                )
             assert ds.y[:, 0].max() <= 0.5 + 1e-4, ds.y[:, 0].max()
-            print("[self-test] synthetic labels reduce to the known (offset, 0) answer")
+            print(f"[self-test] synthetic labels ({args.label_mode}) reduce to the known "
+                  "(offset, 0, ...) answer")
             print(f"[swept_clear] {int(ds.swept_clear.sum())}/{len(ds)} rows marked swept-clear "
                   "(reporting-only, design.md section 8)")
+
+            # --- the OTHER label_mode must self-test cleanly too, regardless of --label-mode ----
+            other_mode = "pos_rpy" if args.label_mode == "pos_rot" else "pos_rot"
+            ds_other = ArcDivergenceDataset(path, label_mode=other_mode)
+            assert ds_other.y.shape == (len(ds_other), len(ds_other.TARGET_NAMES))
+            assert tuple(ds_other.TARGET_NAMES) == (
+                POS_RPY_NAMES if other_mode == "pos_rpy" else TARGET_NAMES
+            )
+            assert torch.allclose(ds_other.y[:, 1:], torch.zeros_like(ds_other.y[:, 1:]), atol=1e-5)
+            print(f"[label_mode] {other_mode} also builds cleanly: y {tuple(ds_other.y.shape)} "
+                  f"({', '.join(ds_other.TARGET_NAMES)})")
 
         # --- drop_blocked_endpoints removes exactly the valid, endpoint-blocked rows ------------
         with h5py.File(path, "r") as f:

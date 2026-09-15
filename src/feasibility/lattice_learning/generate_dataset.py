@@ -5,6 +5,11 @@ patch plus ONE scalar curvature command, replayed as the router's OWN forward-ar
     x = (patch [24, 28] @ 0.125 m, kappa)      -- v = V_NOM, L = ARC_LEN are PINNED, not sampled
     y = (e_pos, e_rot)  -- ostrich vs. the ARC-PLUS-SETTLE reference, computed by custom_dataset.py
 
+Also writes `v_drive`/`wz_drive` (comparator.common's own naming for the commanded body twist)
+alongside `kappa` per row -- v_drive = V_NOM (constant, PINNED not sampled) and wz_drive = V_NOM *
+kappa -- so a future (v, omega)-input model variant can read them directly instead of
+recomputing wz_drive from kappa and the pinned V_NOM.
+
 Three things this generator does that no sibling generator does, all from design.md:
 
 * **Warm start (section 2).** Every trial is entered already moving at V_NOM: `warmup_s` seconds
@@ -321,6 +326,13 @@ def simulate_map(
         device=device, policy=policy, robot=robot,
     )
     spawn_pose, kappa = trials.pose, trials.kappa
+    # (v_drive, wz_drive) restated alongside kappa for a future (v, omega)-input model
+    # (comparator.common's own ScenarioSpec/Trial naming for the commanded body twist) --
+    # v_drive is pinned at V_NOM today (see the module docstring), not sampled, but is still
+    # written per-row rather than left to the root attr v_nom so the schema stays self-contained
+    # and stays correct for free if v is ever sampled instead of pinned.
+    v_drive = np.full(n, V_NOM, dtype=np.float32)
+    wz_drive = (V_NOM * kappa).astype(np.float32)
     # The same static settle sample_trials accepted each spawn on (helhest_stack is bit-exact), kept
     # this time as ostrich's starting pose -- see SPAWN_CLEARANCE.
     spawn_derived, _, _ = settle_batch(terrain, spawn_pose, mu, device)
@@ -431,6 +443,8 @@ def simulate_map(
         belief_pose=belief_pose.astype(np.float32),
         patch=patch,
         kappa=kappa,
+        v_drive=v_drive,
+        wz_drive=wz_drive,
         arc_relief=trials.arc_relief,
         interact_dir=trials.interact_dir,
         ramp_deg=trials.ramp_deg,
@@ -617,9 +631,9 @@ def generate(cfg: DictConfig) -> None:
             warmup_s=warmup_s, kappa_max=kappa_max, mu=mu, device=device,
             meta=map_metadata(p), policy=policy,
         )
-        for key in ("spawn_pose", "spawn_zpr", "t0_pose", "belief_pose", "patch", "kappa", "arc_relief",
-                    "interact_dir", "ramp_deg", "ramp_s", "sampling", "arc_end_pose", "ref_pose",
-                    "valid", "endpoint_blocked", "swept_clear"):
+        for key in ("spawn_pose", "spawn_zpr", "t0_pose", "belief_pose", "patch", "kappa", "v_drive",
+                    "wz_drive", "arc_relief", "interact_dir", "ramp_deg", "ramp_s", "sampling",
+                    "arc_end_pose", "ref_pose", "valid", "endpoint_blocked", "swept_clear"):
             per_variant_fields.setdefault(key, []).append(result[key])
         for key in ("ostrich_pose", "ostrich_wheel_qd", "ostrich_cmd",
                     "ostrich_preroll_pose", "ostrich_preroll_wheel_qd"):

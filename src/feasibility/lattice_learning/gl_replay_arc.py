@@ -26,8 +26,8 @@ Unlike `grid_learning/gl_replay_grid.py`'s lattice stepper (one dataset row = on
 no trajectory to interpolate), `dataset_arc_*.h5` gives each trial a real time series, so this
 viewer is a continuous single-trajectory replay like `gl_replay.py`'s own (`--id`/`--speed`/
 `--loop`). Keys N / P (or RIGHT / LEFT) step to the next / previous trial, wrapping around: the
-new trial's status block (e_pos, e_rot, valid breakdown) is printed and its playback restarts from
-t=0. The model is rebuilt (terrain mesh + both robots, via ViewerGL.set_model, same pattern as
+new trial's brief status line (e_pos, e_rot, valid, endpoint) is printed and its playback restarts
+from t=0. The model is rebuilt (terrain mesh + both robots, via ViewerGL.set_model, same pattern as
 `plotting/terrain_browser.py`) only when the new trial is on a different map; within one map only
 the joint_q and the arc guide line change. The rebuild runs in the render loop, never inside the
 key callback, and the camera is kept across switches (F re-frames). There is no `--which` either: this schema has no `hstack/` group (the
@@ -61,15 +61,17 @@ CLI parameters:
                      +dry_run and gl_replay_grid.py's --dry-run
     --device STR     device for re-settling the arc endpoint when breaking down `valid` into its
                      four component checks (see below) (default: cuda:0)
+    --rot-display    rot (default) prints e_rot (rad + deg); rpy prints the per-axis
+                     (roll, pitch, yaw) error triplet in degrees instead (custom_dataset.rpy_errors)
 
-Every invocation also prints a breakdown of the stored `valid` flag into the conditions
-generate_dataset.py's simulate_map ANDs together (design.md section 7b) -- `finite`,
-`displacement_ok`, `overhang_ok`, and `settle_ok` (a real settle re-run AT THE ARC'S OWN
-ENDPOINT, the only one needing a device) -- so an INVALID row's actual cause is visible instead of
-just the combined flag. Files with the root attr `valid_excludes_endpoint_settle` store
-`settle_ok` separately as `endpoint_blocked` (shown as BLOCKED-END) and leave it out of `valid`;
-older files folded it in, and the recomputed AND follows whichever the file did. If the recomputed AND doesn't match the file's stored `valid`, that's flagged
-as a WARNING rather than trusted silently, since it would mean generation-time inputs (mu, robot
+Every invocation prints one brief per-trial line -- trial index, `e_pos`, a rotation-error term
+(`--rot-display`: `e_rot`, or the (roll, pitch, yaw) triplet), VALID/INVALID, and whether the arc
+endpoint is settle-feasible (`endpoint=OK`) or not (`endpoint=BLOCKED`).
+Endpoint feasibility still comes from a real settle re-run AT THE ARC'S OWN ENDPOINT (the only
+piece needing a device) against the file's stored `endpoint_blocked` where present, or the
+recomputed `settle_ok` for older files that fold it into `valid` instead (design.md section 7b).
+A WARNING line (only printed when it fires) flags either a stored/recomputed endpoint mismatch or
+a recomputed-vs-stored `valid` mismatch, since that would mean generation-time inputs (mu, robot
 params, terrain) drifted from what this script re-derives them as.
 
 Usage:
@@ -97,6 +99,7 @@ from feasibility.heightmap import HeightMapReader
 from feasibility.lattice_learning.arc import ARC_LEN
 from feasibility.lattice_learning.arc import integrate_arc
 from feasibility.lattice_learning.custom_dataset import pose_to_se3
+from feasibility.lattice_learning.custom_dataset import rpy_errors
 from feasibility.lattice_learning.custom_dataset import se3_errors
 from feasibility.lattice_learning.generate_dataset import MAX_SPAWN_DISPLACEMENT
 from feasibility.lattice_learning.patch import patch_overhangs
@@ -221,44 +224,33 @@ def load_trial(path: pathlib.Path, i: int, arc_only: bool = False) -> Trial:
         )
 
 
-def report_trial(trial: Trial, n: int, device: str) -> None:
-    """Print the trial's status line, its (e_pos, e_rot) and the `valid` breakdown."""
-    t, ostrich_pose, t0_pose, ref_pose = trial.t, trial.ostrich_pose, trial.t0_pose, trial.ref_pose
-    e_pos, e_rot = se3_errors(pose_to_se3(ref_pose), pose_to_se3(ostrich_pose[-1]))
+def report_trial(trial: Trial, n: int, device: str, rot_display: str = "rot") -> None:
+    """Print one brief line: trial index, e_pos, a rotation-error term, VALID/INVALID, endpoint
+    OK/BLOCKED. `rot_display="rot"` (default) shows the single `e_rot` scalar; `"rpy"` shows the
+    per-axis (roll, pitch, yaw) error triplet in degrees instead (`custom_dataset.rpy_errors`)."""
+    ostrich_pose, t0_pose, ref_pose = trial.ostrich_pose, trial.t0_pose, trial.ref_pose
+    T_ref, T_final = pose_to_se3(ref_pose), pose_to_se3(ostrich_pose[-1])
+    e_pos, e_rot = se3_errors(T_ref, T_final)
     e_pos, e_rot = float(e_pos), float(e_rot)
-
-    flags = "valid" if trial.valid else "INVALID"
-    flags += "  swept_clear" if trial.swept_clear else ""
-    flags += "  BLOCKED-END" if trial.endpoint_blocked else ""
-    flags += f"  sampling={trial.sampling}" if trial.sampling else ""
-    flags += {1: "  climbs UP", -1: "  drives DOWN"}.get(trial.interact_dir, "")
-    if np.isfinite(trial.ramp_deg):
-        flags += f"  ramp {trial.ramp_deg:.1f} deg @ s={trial.ramp_s:+.2f} m"
-    print(
-        f"[trial {trial.index}/{n - 1}]  map={trial.map_path} (map_index={trial.map_index})  "
-        f"kappa={trial.kappa:+.3f} 1/m  {flags}"
-    )
-    print(
-        f"  e_pos={e_pos:.4f} m  e_rot={e_rot:.4f} rad ({np.degrees(e_rot):.2f} deg)   "
-        f"ostrich duration={t[-1]:.3f}s ({len(t)} steps @ dt={t[1] - t[0]:.4f}s)"
-    )
-    if trial.n_settle or trial.n_warmup:
-        play_t, s, w = trial.play_t, trial.n_settle, trial.n_warmup
-        print(
-            f"  playback: settle t=[{play_t[0]:.3f}, {play_t[s - 1]:.3f}]s ({s} steps, zero command)  "
-            f"warmup t=[{play_t[s]:.3f}, {play_t[s + w - 1]:.3f}]s ({w} steps)  arc t=[0, {t[-1]:.3f}]s"
+    if rot_display == "rpy":
+        e_roll, e_pitch, e_yaw = (float(v) for v in rpy_errors(T_ref, T_final))
+        rot_str = (
+            f"roll={np.degrees(e_roll):.2f} pitch={np.degrees(e_pitch):.2f} "
+            f"yaw={np.degrees(e_yaw):.2f} deg"
         )
+    else:
+        rot_str = f"e_rot={e_rot:.2f} rad ({np.degrees(e_rot):.2f} deg)"
 
     # `valid`'s own four ANDed conditions (generate_dataset.py's simulate_map, design.md section
-    # 7b), recomputed from the file's stored fields so an INVALID row's actual cause is visible
-    # instead of just the combined flag. Three are cheap (pure numpy over already-loaded arrays);
-    # `settle_ok` needs a real settle re-run at the arc's own endpoint (the same one generation
-    # did), so it is the only one that needs Warp initialized and a device.
+    # 7b), recomputed from the file's stored fields. Three are cheap (pure numpy over
+    # already-loaded arrays); `settle_ok` needs a real settle re-run at the arc's own endpoint
+    # (the same one generation did), so it is the only one that needs Warp initialized and a
+    # device -- kept even though only the WARNING path prints it, since it also drives the
+    # endpoint OK/BLOCKED status for files predating the `endpoint_blocked` column.
     finite = bool(
         np.isfinite(ostrich_pose[-1]).all() and np.isfinite(t0_pose).all() and np.isfinite(ref_pose).all()
     )
-    displacement = float(np.linalg.norm(ostrich_pose[-1, :2] - t0_pose[:2]))
-    displacement_ok = displacement <= MAX_SPAWN_DISPLACEMENT
+    displacement_ok = float(np.linalg.norm(ostrich_pose[-1, :2] - t0_pose[:2])) <= MAX_SPAWN_DISPLACEMENT
     spec = patch_spec_from_attrs(trial.attrs)
     overhang_ok = not bool(patch_overhangs(trial.terrain, trial.belief_pose[None], spec)[0])
     derived, residual, clearance = settle_batch(
@@ -267,23 +259,15 @@ def report_trial(trial: Trial, n: int, device: str) -> None:
     settle_ok = bool(settle_feasible(derived, residual, clearance, RobotParams())[0])
     settle_in_valid = not bool(trial.attrs.get("valid_excludes_endpoint_settle", False))
     recomputed_valid = finite and displacement_ok and overhang_ok and (settle_ok or not settle_in_valid)
+    blocked = (not settle_ok) if trial.endpoint_blocked is None else trial.endpoint_blocked
+
+    print(
+        f"[trial {trial.index}/{n - 1}]  e_pos={e_pos:.4f} m  {rot_str}  "
+        f"{'VALID' if trial.valid else 'INVALID'}  endpoint={'BLOCKED' if blocked else 'OK'}"
+    )
     if trial.endpoint_blocked is not None and trial.endpoint_blocked == settle_ok:
         print(f"  WARNING: recomputed settle_ok={settle_ok} contradicts the file's "
               f"endpoint_blocked={trial.endpoint_blocked}")
-
-    print(
-        f"  valid breakdown: finite={finite}  "
-        f"displacement_ok={displacement_ok} ({displacement:.4f} m <= {MAX_SPAWN_DISPLACEMENT:.4f} m)  "
-        f"overhang_ok={overhang_ok}  settle_ok={settle_ok}"
-        + ("" if settle_in_valid else " (stored as endpoint_blocked, not part of valid)")
-    )
-    if not settle_ok:
-        _, pitch, roll = derived[0]
-        print(
-            f"    settle @ arc_end_pose: pitch={np.degrees(pitch):.2f} deg roll={np.degrees(roll):.2f} deg  "
-            f"residual={residual[0]:.4g} (tol {RobotParams().resid_tol:.4g})  "
-            f"clearance={clearance[0]:.4f} m (margin {RobotParams().clear_margin:.4f} m)"
-        )
     if recomputed_valid != trial.valid:
         print(
             f"  WARNING: recomputed valid={recomputed_valid} does not match the file's stored "
@@ -350,6 +334,7 @@ def main() -> None:
     ap.add_argument("--arc-only", action="store_true", help="skip the stored settle + warm-up, play only the arc")
     ap.add_argument("--dry-run", action="store_true", help="validate + print stats only, no GL viewer")
     ap.add_argument("--device", type=str, default="cuda:0", help="torch/warp device for re-settling the arc endpoint to break down `valid` (default: cuda:0, matching generate_dataset.py)")
+    ap.add_argument("--rot-display", type=str, default="rot", choices=("rot", "rpy"), help="rot (default) prints e_rot; rpy prints the (roll, pitch, yaw) error triplet in degrees instead")
     args = ap.parse_args()
 
     with h5py.File(args.file, "r") as f:
@@ -360,7 +345,7 @@ def main() -> None:
     wp.init()
     index = args.id
     trial = load_trial(args.file, index, args.arc_only)
-    report_trial(trial, n, args.device)
+    report_trial(trial, n, args.device, args.rot_display)
 
     if args.dry_run:
         print("[dry-run]  loaded + validated, nothing rendered")
@@ -400,7 +385,7 @@ def main() -> None:
             index = (index + pending["step"]) % n
             pending["step"] = 0
             trial_next = load_trial(args.file, index, args.arc_only)
-            report_trial(trial_next, n, args.device)
+            report_trial(trial_next, n, args.device, args.rot_display)
             if trial_next.map_index == trial.map_index:
                 place_trial(scene, trial_next)
             else:
