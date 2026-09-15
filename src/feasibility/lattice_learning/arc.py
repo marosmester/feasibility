@@ -42,6 +42,13 @@ def primitive_kappas(min_turn_radius: float = MIN_TURN_RADIUS) -> tuple[float, f
     return (-1.0 / r, -1.0 / (2.0 * r), 0.0, 1.0 / (2.0 * r), 1.0 / r)
 
 
+def twist_from_kappa(kappa: np.ndarray, v: float = V_NOM) -> tuple[np.ndarray, np.ndarray]:
+    """[n] curvature (1/m) -> the commanded body twist (v_drive [n] m/s, wz_drive [n] rad/s) for
+    travel at speed `v` along it: wz = v * kappa. float32, the dataset's own column dtype."""
+    kappa = np.asarray(kappa, dtype=np.float32)
+    return np.full(kappa.shape, v, dtype=np.float32), (v * kappa).astype(np.float32)
+
+
 def integrate_arc(pose: np.ndarray, kappa: np.ndarray | float, length: np.ndarray | float) -> np.ndarray:
     """Exact endpoint(s) of a constant-curvature arc: starting at body pose(s) `pose` = (x, y,
     yaw) [..., 3], turning at curvature `kappa` (1/m, +left) over `length` metres of travel.

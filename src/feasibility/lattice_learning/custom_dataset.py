@@ -2,7 +2,8 @@
 one sample is a single body-frame terrain patch plus ONE scalar curvature command, and its label
 is the ostrich-vs-(arc+settle) final-pose SE(3) error (design.md sections 1, 7b) --
 
-    x = (patch [1, 24, 28], kappa [])
+    x = (patch [1, 24, 28], kappa [1])       -- command_mode="kappa" (default)
+      = (patch [1, 24, 28], (v, wz) [2])     -- command_mode="v_wz", from v_drive/wz_drive
     y = (e_pos, e_rot)                       -- label_mode="pos_rot" (default)
       = (e_pos, e_roll, e_pitch, e_yaw)      -- label_mode="pos_rpy"
 
@@ -21,7 +22,7 @@ SE(3) algebra that never changes, checked against a known rotation in `__main__`
 even need directly; `generate_dataset.py` is the one that writes through
 `comparator.provenance`.
 
-`TARGET_NAMES` and `TargetTransform`/`Normalizer` come from `model.py` (the opposite of
+`LABEL_NAMES` (per label mode) and `TargetTransform`/`Normalizer` come from `model.py` (the opposite of
 `learning/`'s arrangement, design.md section 11a): the target space belongs to the network that
 regresses it, and importing it from `model.py` means `model.py` runs and self-checks before any
 dataset file exists.
@@ -48,6 +49,8 @@ CLI parameters:
                      writes a small synthetic file to a temp dir and reads it back
     --batch-size     rows per batch (default: 32)
     --label-mode     pos_rot (default, (e_pos, e_rot)) | pos_rpy ((e_pos, e_roll, e_pitch, e_yaw))
+    --command-mode   kappa (default) | v_wz ((v_drive, wz_drive); derived from kappa and the
+                     v_nom attr for files that predate those columns)
 
 Usage:
     python src/feasibility/lattice_learning/custom_dataset.py                # synthetic self-test
@@ -66,7 +69,12 @@ from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
 from torch.utils.data import Subset
 
-from feasibility.lattice_learning.model import TARGET_NAMES
+from feasibility.lattice_learning.arc import twist_from_kappa
+from feasibility.lattice_learning.arc import V_NOM
+from feasibility.lattice_learning.model import COMMAND_COLUMNS
+from feasibility.lattice_learning.model import COMMAND_MODES
+from feasibility.lattice_learning.model import LABEL_MODES
+from feasibility.lattice_learning.model import LABEL_NAMES
 from feasibility.lattice_learning.patch import N_CHANNELS
 from feasibility.lattice_learning.patch import patch_spec_from_attrs
 from feasibility.lattice_learning.patch import patch_spec_to_attrs
@@ -127,10 +135,6 @@ def rpy_errors(T1: np.ndarray, T2: np.ndarray) -> tuple[np.ndarray, np.ndarray, 
     return np.abs(roll), np.abs(pitch), np.abs(yaw)
 
 
-LABEL_MODES = ("pos_rot", "pos_rpy")
-POS_RPY_NAMES = ("e_pos", "e_roll", "e_pitch", "e_yaw")
-
-
 class ArcDivergenceDataset(Dataset):
     """One sample per VALID row of a dataset_arc_*.h5: x = (patch [1, ny, nx], kappa []),
     y = (e_pos, e_rot) [2] (`label_mode="pos_rot"`, default) or
@@ -150,15 +154,19 @@ class ArcDivergenceDataset(Dataset):
         device: str | torch.device = "cpu",
         drop_blocked_endpoints: bool = False,
         label_mode: str = "pos_rot",
+        command_mode: str = "kappa",
     ) -> None:
         if label_mode not in LABEL_MODES:
             raise ValueError(f"label_mode must be one of {LABEL_MODES}, got {label_mode!r}")
+        if command_mode not in COMMAND_MODES:
+            raise ValueError(f"command_mode must be one of {COMMAND_MODES}, got {command_mode!r}")
         self.source = pathlib.Path(path)
         with h5py.File(self.source, "r") as f:
             self.attrs = dict(f.attrs)
             self.git = dict(f["git"].attrs) if "git" in f else {}
             patch = f["patch"][()].astype(np.float32)  # [n, ny*nx]
             kappa = f["kappa"][()].astype(np.float32)  # [n]
+            columns = {c: f[c][()].astype(np.float32) for c in COMMAND_COLUMNS[command_mode] if c in f}
             ref_pose = f["ref_pose"][()].astype(np.float64)  # [n, 7]
             valid = f["valid"][()].astype(bool)  # [n]
             swept_clear = f["swept_clear"][()].astype(bool)  # [n]
@@ -170,6 +178,15 @@ class ArcDivergenceDataset(Dataset):
             map_index = f["map_index"][()].astype(np.int64)  # [n]
             map_path = [p.decode() if isinstance(p, bytes) else p for p in f["map_path"][()]]
             ostrich_final = f["ostrich/pose"][-1].astype(np.float64)  # [n, 7]
+
+        self.v_nom = float(self.attrs.get("v_nom", V_NOM))
+        if len(columns) < len(COMMAND_COLUMNS[command_mode]):
+            # Only the twist can be missing: files written before generate_dataset.py stored it.
+            # v was pinned at the file's own v_nom then, so it is exactly recoverable from kappa.
+            columns["v_drive"], columns["wz_drive"] = twist_from_kappa(kappa, self.v_nom)
+            print(f"[dataset] {self.source.name}: no v_drive/wz_drive columns, derived from "
+                  f"kappa at v_nom={self.v_nom}")
+        command = np.stack([columns[c] for c in COMMAND_COLUMNS[command_mode]], axis=-1)  # [n, C]
 
         self.patch_spec = patch_spec_from_attrs(self.attrs)
         ny, nx = self.patch_spec.ny, self.patch_spec.nx
@@ -186,13 +203,10 @@ class ArcDivergenceDataset(Dataset):
 
         T_ref, T_final = pose_to_se3(ref_pose), pose_to_se3(ostrich_final)
         e_pos, e_rot = se3_errors(T_ref, T_final)
-        if label_mode == "pos_rot":
-            y = np.stack([e_pos, e_rot], axis=-1).astype(np.float32)  # [n, 2]
-            target_names = TARGET_NAMES
-        else:
-            e_roll, e_pitch, e_yaw = rpy_errors(T_ref, T_final)
-            y = np.stack([e_pos, e_roll, e_pitch, e_yaw], axis=-1).astype(np.float32)  # [n, 4]
-            target_names = POS_RPY_NAMES
+        errors = dict(e_pos=e_pos, e_rot=e_rot)
+        if label_mode == "pos_rpy":
+            errors["e_roll"], errors["e_pitch"], errors["e_yaw"] = rpy_errors(T_ref, T_final)
+        y = np.stack([errors[n] for n in LABEL_NAMES[label_mode]], axis=-1).astype(np.float32)  # [n, K]
 
         keep = valid
         n_dropped = int((~keep).sum())
@@ -206,20 +220,22 @@ class ArcDivergenceDataset(Dataset):
         self.patch = (
             torch.from_numpy(patch[keep].reshape(-1, ny, nx)).unsqueeze(1).to(device)
         )  # [m, 1, ny, nx]
-        self.kappa = torch.from_numpy(kappa[keep]).to(device)
+        self.kappa = torch.from_numpy(kappa[keep]).to(device)  # [m], in every mode: baselines use it
+        self.command = torch.from_numpy(command[keep]).to(device)  # [m, C], what the model is fed
+        self.command_mode = command_mode
         self.y = torch.from_numpy(y[keep]).to(device)
         self.swept_clear = torch.from_numpy(swept_clear[keep]).to(device)
         self.endpoint_blocked = torch.from_numpy(endpoint_blocked[keep]).to(device)
         self.map_index = torch.from_numpy(map_index[keep]).to(device)
         self.map_path = [p for p, k in zip(map_path, keep) if k]
         self.label_mode = label_mode
-        self.TARGET_NAMES = target_names
+        self.TARGET_NAMES = LABEL_NAMES[label_mode]
 
     def __len__(self) -> int:
         return self.patch.shape[0]
 
     def __getitem__(self, idx: int) -> tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
-        return (self.patch[idx], self.kappa[idx]), self.y[idx]
+        return (self.patch[idx], self.command[idx]), self.y[idx]
 
 
 def split_dataset_by_map(
@@ -285,11 +301,14 @@ def make_dataloaders(
     return train_loader, val_loader, ds, train_subset, val_subset
 
 
-def _write_synthetic(path: pathlib.Path, n_maps: int = 3, rows_per_map: int = 8) -> None:
+def _write_synthetic(
+    path: pathlib.Path, n_maps: int = 3, rows_per_map: int = 8, with_twist: bool = True
+) -> None:
     """Write a minimal dataset_arc_*.h5 for the self-test below, pinning the schema this module
     reads before generate_dataset.py has ever run in this environment. `ref_pose` is a pure
     translation (identity rotation) at a known offset from `ostrich/pose[-1]`, so the SE(3)
-    reduction has a known answer: e_pos == the offset, e_rot == 0."""
+    reduction has a known answer: e_pos == the offset, e_rot == 0. `with_twist=False` omits
+    `v_drive`/`wz_drive`, like files written before the generator stored them."""
     rng = np.random.default_rng(0)
     spec = PatchSpec()
     n = n_maps * rows_per_map
@@ -316,6 +335,10 @@ def _write_synthetic(path: pathlib.Path, n_maps: int = 3, rows_per_map: int = 8)
         f.attrs["min_turn_radius"] = 0.5
         f.create_dataset("patch", data=patch)
         f.create_dataset("kappa", data=kappa)
+        if with_twist:
+            v_drive, wz_drive = twist_from_kappa(kappa, 0.6)
+            f.create_dataset("v_drive", data=v_drive)
+            f.create_dataset("wz_drive", data=wz_drive)
         f.create_dataset("ref_pose", data=ref_pose.astype(np.float32))
         f.create_dataset("valid", data=valid)
         f.create_dataset("swept_clear", data=swept_clear)
@@ -337,6 +360,7 @@ if __name__ == "__main__":
     parser.add_argument("path", type=pathlib.Path, nargs="?", help="dataset_arc_*.h5 path")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--label-mode", type=str, default="pos_rot", choices=LABEL_MODES)
+    parser.add_argument("--command-mode", type=str, default="kappa", choices=COMMAND_MODES)
     args = parser.parse_args()
 
     # --- an identity-pose pair must reduce to exactly (0, 0) ------------------------------------
@@ -374,12 +398,14 @@ if __name__ == "__main__":
             print(f"[self-test] wrote synthetic file {path.name}")
 
         train_loader, val_loader, ds, train_subset, val_subset = make_dataloaders(
-            path, batch_size=args.batch_size, label_mode=args.label_mode
+            path, batch_size=args.batch_size, label_mode=args.label_mode,
+            command_mode=args.command_mode,
         )
-        (patch, kappa), y = next(iter(train_loader))
+        (patch, command), y = next(iter(train_loader))
         print(
             f"{len(ds)} valid rows ({len(train_subset)} train / {len(val_subset)} val), "
-            f"patch {tuple(patch.shape)}, kappa {tuple(kappa.shape)}, y {tuple(y.shape)} "
+            f"patch {tuple(patch.shape)}, command ({args.command_mode}) {tuple(command.shape)}, "
+            f"y {tuple(y.shape)} "
             f"({', '.join(ds.TARGET_NAMES)})"
         )
 
@@ -420,11 +446,23 @@ if __name__ == "__main__":
             ds_other = ArcDivergenceDataset(path, label_mode=other_mode)
             assert ds_other.y.shape == (len(ds_other), len(ds_other.TARGET_NAMES))
             assert tuple(ds_other.TARGET_NAMES) == (
-                POS_RPY_NAMES if other_mode == "pos_rpy" else TARGET_NAMES
+                LABEL_NAMES[other_mode]
             )
             assert torch.allclose(ds_other.y[:, 1:], torch.zeros_like(ds_other.y[:, 1:]), atol=1e-5)
             print(f"[label_mode] {other_mode} also builds cleanly: y {tuple(ds_other.y.shape)} "
                   f"({', '.join(ds_other.TARGET_NAMES)})")
+
+            # --- command_mode: v_wz is the stored twist, and a file without those columns
+            # derives the identical twist from kappa + v_nom --------------------------------------
+            ds_vwz = ArcDivergenceDataset(path, command_mode="v_wz")
+            assert ds_vwz.command.shape == (len(ds_vwz), 2)
+            assert torch.allclose(ds_vwz.command[:, 1], 0.6 * ds_vwz.kappa, atol=1e-5)
+            legacy = pathlib.Path(tmp) / "dataset_arc_synthetic_notwist.h5"
+            _write_synthetic(legacy, with_twist=False)
+            ds_legacy = ArcDivergenceDataset(legacy, command_mode="v_wz")
+            assert torch.allclose(ds_legacy.command, ds_vwz.command, atol=1e-6)
+            print(f"[command_mode] v_wz command {tuple(ds_vwz.command.shape)} matches the stored "
+                  "twist, and is derived identically for a file without v_drive/wz_drive")
 
         # --- drop_blocked_endpoints removes exactly the valid, endpoint-blocked rows ------------
         with h5py.File(path, "r") as f:

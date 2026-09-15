@@ -24,6 +24,11 @@ re-derive the arguments, only the arithmetic.
           v
     y_hat [B,2] in log1p / standardised space
 
+`command_mode="v_wz"` swaps the command input for the (v_drive, wz_drive) body twist [B, 2]
+(encoder Linear 4->64->64, see `command_features`); the trunk is untouched either way.
+`label_mode="pos_rpy"` swaps the output for (e_pos, e_roll, e_pitch, e_yaw) [B, 4], one head per
+column (see LABEL_NAMES); again only the head changes.
+
 Three things this module is NOT allowed to get wrong, each with its own `__main__` self-check
 (design.md section 8):
 
@@ -49,6 +54,10 @@ CLI parameters:
     --base-width INT      trunk channel unit; layer widths are 1x/2x/3x this (default: 32)
     --embed-dim INT       command-embedding width, also the FiLM input width (default: 64)
     --head-fusion STR     film | concat -- design.md section 5b's ablation (default: film)
+    --command-mode STR    kappa | v_wz -- encoder input: curvature, or the (v_drive, wz_drive)
+                          twist; see COMMAND_MODES (default: kappa)
+    --label-mode STR      pos_rot | pos_rpy -- output (e_pos, e_rot) or (e_pos, e_roll, e_pitch,
+                          e_yaw); see LABEL_NAMES (default: pos_rot)
 
 Usage:
     python src/feasibility/lattice_learning/model.py     # shape / RF / equivalence / causality checks
@@ -63,11 +72,22 @@ import torch
 import torch.nn as nn
 
 from feasibility.lattice_learning.arc import KAPPA_MAX
+from feasibility.lattice_learning.arc import V_NOM
 from feasibility.lattice_learning.patch import N_CHANNELS
 from feasibility.lattice_learning.patch import PatchSpec
 
-TARGET_NAMES = ("e_pos", "e_rot")
-OUT_DIM = len(TARGET_NAMES)  # 2
+# What the net regresses, one head per column in this order. "pos_rot" (default): the geodesic
+# rotation error as one scalar. "pos_rpy": the same T_err's per-axis |Euler| errors instead
+# (custom_dataset.rpy_errors). Every column is a non-negative magnitude, so TargetTransform's log1p
+# applies unchanged and the y-mirror leaves every label as it is (a mirror flips the SIGN of the roll
+# and yaw errors, never their size). e_pos is column 0 in every mode -- train.py's top-decile subset
+# relies on it.
+LABEL_NAMES: dict[str, tuple[str, ...]] = {
+    "pos_rot": ("e_pos", "e_rot"),
+    "pos_rpy": ("e_pos", "e_roll", "e_pitch", "e_yaw"),
+}
+LABEL_MODES = tuple(LABEL_NAMES)
+assert all(names[0] == "e_pos" for names in LABEL_NAMES.values())
 
 DEFAULT_BASE_WIDTH = 32  # trunk channel unit -- the single scaling knob (design.md section 5b)
 DEFAULT_EMBED_DIM = 64  # command encoder width, also FiLM's input width
@@ -75,10 +95,24 @@ DEFAULT_GEOMETRY_CHANNELS = 256  # width of the terrain code c
 DEFAULT_SQUEEZE_CHANNELS = 24  # channel count feeding the geometry layer
 DEFAULT_HEAD_WIDTH = 256  # head trunk width
 
-# (kappa/K, |kappa|/K, sign(kappa)) -- design.md section 4b. |kappa| sets how far the rim sweeps,
-# the sign sets which way; handing the net the split explicitly saves it building a V-shape out of
-# a monotone input.
-N_CMD_FEATURES = 3
+# What the command encoder is fed. "kappa" (default): one scalar curvature per row, design.md
+# section 4b. "v_wz": the commanded body twist (v_drive, wz_drive) generate_dataset.py stores
+# alongside kappa. Note v_drive is PINNED at V_NOM in every file generate_dataset.py writes today, so
+# "v_wz" carries the same information as "kappa" until v is actually sampled -- it exists so a
+# (v, omega)-input model can be trained and checkpointed without a schema change later.
+#
+# A command is always [B, C], C = len(COMMAND_COLUMNS[mode]), the dataset file columns it is read
+# from in that order. MIRROR_SIGN is the command half of the y-mirror symmetry (design.md section
+# 7c): a mirrored turn is the opposite turn at the same speed.
+COMMAND_COLUMNS: dict[str, tuple[str, ...]] = {"kappa": ("kappa",), "v_wz": ("v_drive", "wz_drive")}
+COMMAND_MODES = tuple(COMMAND_COLUMNS)
+MIRROR_SIGN: dict[str, tuple[float, ...]] = {"kappa": (-1.0,), "v_wz": (1.0, -1.0)}
+WZ_MAX = V_NOM * KAPPA_MAX  # rad/s, the yaw rate of the tightest arc at the pinned speed
+
+# kappa: (kappa/K, |kappa|/K, sign(kappa)) -- design.md section 4b. |kappa| sets how far the rim
+# sweeps, the sign sets which way; handing the net the split explicitly saves it building a V-shape
+# out of a monotone input. v_wz: (v/V_NOM, wz/WZ_MAX, |wz|/WZ_MAX, sign(wz)), the same split on wz.
+N_CMD_FEATURES = {"kappa": 3, "v_wz": 4}
 
 # (channel multiplier of base_width, stride) per trunk block -- design.md section 5b's table,
 # literally: 6 blocks, two stride-2 downsamples (total stride 4), channels 1x -> 1x -> 2x -> 2x ->
@@ -120,10 +154,21 @@ def receptive_field(plan: tuple[tuple[int, int], ...] = TRUNK_PLAN, kernel: int 
     return rf
 
 
-def command_features(kappa: torch.Tensor, kappa_max: float = KAPPA_MAX) -> torch.Tensor:
-    """[...] curvature (1/m) -> [..., 3] = (kappa/K, |kappa|/K, sign(kappa)) -- design.md 4b."""
-    k = kappa / kappa_max
-    return torch.stack([k, k.abs(), torch.sign(kappa)], dim=-1)
+def command_features(command: torch.Tensor, command_mode: str = "kappa") -> torch.Tensor:
+    """[B, C] command -> [B, N_CMD_FEATURES[command_mode]] encoder input.
+
+        "kappa": [B, 1] curvature (1/m) -> (kappa/K, |kappa|/K, sign(kappa)) -- design.md 4b
+        "v_wz":  [B, 2] (v m/s, wz rad/s) -> (v/V_NOM, wz/WZ_MAX, |wz|/WZ_MAX, sign(wz))"""
+    if command_mode == "kappa":
+        k = command / KAPPA_MAX
+        return torch.cat([k, k.abs(), torch.sign(command)], dim=-1)
+    w = command[:, 1:] / WZ_MAX
+    return torch.cat([command[:, :1] / V_NOM, w, w.abs(), torch.sign(w)], dim=-1)
+
+
+def mirror_command(command: torch.Tensor, command_mode: str = "kappa") -> torch.Tensor:
+    """[B, C] command -> its y-mirror image: kappa -> -kappa, (v, wz) -> (v, -wz)."""
+    return command * command.new_tensor(MIRROR_SIGN[command_mode])
 
 
 @dataclasses.dataclass(frozen=True)
@@ -148,7 +193,7 @@ class Normalizer:
 
 @dataclasses.dataclass(frozen=True)
 class TargetTransform:
-    """Physical (e_pos m, e_rot rad) <-> log1p/standardized model space:
+    """Physical errors (m, rad), one column per LABEL_NAMES entry <-> log1p/standardized model space:
 
         forward:  y (m, rad) --log1p--> standardize --> what the loss is computed on
         inverse:  network output --unstandardize--> clamp at 0 --expm1--> y (m, rad)
@@ -177,11 +222,11 @@ class TargetTransform:
         return Normalizer(mean=self.normalizer.mean.to(device), std=self.normalizer.std.to(device))
 
     def forward(self, y: torch.Tensor) -> torch.Tensor:
-        """Physical [*, 2] (m, rad) -> standardized log1p space."""
+        """Physical [*, K] (m, rad) -> standardized log1p space."""
         return self._on(y.device)(torch.log1p(y))
 
     def inverse(self, y: torch.Tensor) -> torch.Tensor:
-        """Standardized log1p space -> physical [*, 2] (m, rad), guaranteed non-negative."""
+        """Standardized log1p space -> physical [*, K] (m, rad), guaranteed non-negative."""
         return torch.expm1(self._on(y.device).inverse(y).clamp_min(0.0))
 
 
@@ -227,7 +272,7 @@ class ConvBlock(nn.Module):
 
 
 class ArcDivergenceNet(nn.Module):
-    """patch [B, N_CHANNELS, ny, nx] + kappa [B] -> [B, 2] in TargetTransform (log1p/standardized)
+    """patch [B, N_CHANNELS, ny, nx] + command [B, C] -> [B, K] in TargetTransform (log1p/standardized)
     space -- design.md section 5b.
 
     `target_transform` is a plain attribute, not a buffer: it is fitted data, not a learned
@@ -244,12 +289,18 @@ class ArcDivergenceNet(nn.Module):
         squeeze_channels: int = DEFAULT_SQUEEZE_CHANNELS,
         head_width: int = DEFAULT_HEAD_WIDTH,
         head_fusion: str = "film",
+        command_mode: str = "kappa",
+        label_mode: str = "pos_rot",
         patch_spec: PatchSpec | None = None,
         target_transform: TargetTransform | None = None,
     ) -> None:
         super().__init__()
         if head_fusion not in HEAD_FUSIONS:
             raise ValueError(f"head_fusion must be one of {HEAD_FUSIONS}, got {head_fusion!r}")
+        if command_mode not in COMMAND_MODES:
+            raise ValueError(f"command_mode must be one of {COMMAND_MODES}, got {command_mode!r}")
+        if label_mode not in LABEL_MODES:
+            raise ValueError(f"label_mode must be one of {LABEL_MODES}, got {label_mode!r}")
         spec = patch_spec or PatchSpec()
         stride = total_stride()
         geom_h, geom_w = spec.ny // stride, spec.nx // stride
@@ -260,6 +311,9 @@ class ArcDivergenceNet(nn.Module):
             )
         self.patch_spec = spec
         self.head_fusion = head_fusion
+        self.command_mode = command_mode
+        self.label_mode = label_mode
+        self.target_names = LABEL_NAMES[label_mode]
         self.target_transform = target_transform
 
         blocks: list[nn.Module] = []
@@ -280,7 +334,7 @@ class ArcDivergenceNet(nn.Module):
         self.geometry = nn.Conv2d(squeeze_channels, geometry_channels, kernel_size=(geom_h, geom_w))
 
         self.command_encoder = nn.Sequential(
-            nn.Linear(N_CMD_FEATURES, embed_dim), nn.SiLU(),
+            nn.Linear(N_CMD_FEATURES[command_mode], embed_dim), nn.SiLU(),
             nn.Linear(embed_dim, embed_dim),
         )
 
@@ -301,11 +355,12 @@ class ArcDivergenceNet(nn.Module):
             nn.Linear(head_in, head_width), nn.SiLU(),
             nn.Linear(head_width, head_width), nn.SiLU(),
         )
-        # Separate heads rather than one Linear(head_width, 2) purely for readability -- the two
-        # are arithmetically identical, but named heads keep the (e_pos, e_rot) column order,
-        # which TARGET_NAMES depends on, explicit at the definition site.
-        self.head_e_pos = nn.Linear(head_width, 1)
-        self.head_e_rot = nn.Linear(head_width, 1)
+        # Separate heads rather than one Linear(head_width, K) purely for readability -- the two
+        # are arithmetically identical, but one `head_<name>` per LABEL_NAMES column keeps the
+        # column order explicit, and keeps pos_rot's state_dict keys (head_e_pos, head_e_rot)
+        # identical to checkpoints written before label_mode existed.
+        for name in self.target_names:
+            setattr(self, f"head_{name}", nn.Linear(head_width, 1))
 
     def terrain_code(self, x: torch.Tensor) -> torch.Tensor:
         """[B, N_CHANNELS, H, W] relief -> [B, geometry_channels, H', W'] control-free terrain
@@ -330,23 +385,31 @@ class ArcDivergenceNet(nn.Module):
             relief = relief.unsqueeze(1)
         return self.terrain_code(relief)
 
-    def _head(self, c: torch.Tensor, kappa: torch.Tensor) -> torch.Tensor:
-        """[B, geometry_channels] terrain code + [B] curvature -> [B, 2] in model space."""
-        e = self.command_encoder(command_features(kappa))  # [B, embed_dim]
+    def _head(self, c: torch.Tensor, command: torch.Tensor) -> torch.Tensor:
+        """[B, geometry_channels] terrain code + [B, C] command -> [B, K] in model space."""
+        e = self.command_encoder(command_features(command, self.command_mode))  # [B, embed_dim]
         if self.head_fusion == "film":
             gamma, beta = self.film(e).chunk(2, dim=-1)
             h = c * (1.0 + gamma) + beta  # `1 + gamma`: identity modulation at init
         else:
             h = torch.cat([c, e], dim=-1)
         h = self.head_trunk(self.head_pre(h))
-        return torch.cat([self.head_e_pos(h), self.head_e_rot(h)], dim=-1)
+        return torch.cat([getattr(self, f"head_{name}")(h) for name in self.target_names], dim=-1)
 
-    def forward(self, patch: torch.Tensor, kappa: torch.Tensor) -> torch.Tensor:
-        """patch [B, N_CHANNELS, patch_spec.ny, patch_spec.nx], kappa [B] -> [B, 2] in
-        TargetTransform (log1p/standardized) space. Patch mode: the geometry layer's window
-        exactly spans the input, so `terrain_code` collapses to a single 1x1 code per row."""
+    def forward(self, patch: torch.Tensor, command: torch.Tensor) -> torch.Tensor:
+        """patch [B, N_CHANNELS, patch_spec.ny, patch_spec.nx], command [B, C] (columns
+        COMMAND_COLUMNS[command_mode]) -> [B, K] in TargetTransform (log1p/standardized) space,
+        K = len(self.target_names).
+        Patch mode: the geometry layer's window exactly spans the input, so `terrain_code`
+        collapses to a single 1x1 code per row."""
         if patch.ndim != 4 or patch.shape[1] != N_CHANNELS:
             raise ValueError(f"patch must be [B, {N_CHANNELS}, H, W], got {tuple(patch.shape)}")
+        expected = (patch.shape[0], len(COMMAND_COLUMNS[self.command_mode]))
+        if tuple(command.shape) != expected:
+            raise ValueError(
+                f"command_mode={self.command_mode!r} expects command {expected}, got "
+                f"{tuple(command.shape)}"
+            )
         code = self.terrain_code(patch)
         if code.shape[-2:] != (1, 1):
             raise ValueError(
@@ -354,11 +417,12 @@ class ArcDivergenceNet(nn.Module):
                 f"{tuple(code.shape[-2:])} -- feed a {self.patch_spec.ny}x{self.patch_spec.nx} "
                 f"patch, or use encode_map() for a dense field"
             )
-        return self._head(code[..., 0, 0], kappa)
+        return self._head(code[..., 0, 0], command)
 
     @torch.no_grad()
-    def predict(self, patch: torch.Tensor, kappa: torch.Tensor) -> torch.Tensor:
-        """Same signature as forward(), returning physical (e_pos m, e_rot rad). Inference only --
+    def predict(self, patch: torch.Tensor, command: torch.Tensor) -> torch.Tensor:
+        """Same signature as forward(), returning physical errors (m, rad) in `self.target_names`
+        order. Inference only --
         needs a target_transform, exactly like PoseErrorMLP.predict()."""
         if self.target_transform is None:
             raise RuntimeError(
@@ -366,7 +430,7 @@ class ArcDivergenceNet(nn.Module):
                 "trained in -- pass one to __init__ or assign .target_transform. Use forward() "
                 "if you want the raw model-space output."
             )
-        return self.target_transform.inverse(self(patch, kappa))
+        return self.target_transform.inverse(self(patch, command))
 
 
 def _grad_support(net: ArcDivergenceNet, ny: int, nx: int, row: int, col: int) -> torch.Tensor:
@@ -389,28 +453,43 @@ if __name__ == "__main__":
     parser.add_argument("--base-width", type=int, default=DEFAULT_BASE_WIDTH)
     parser.add_argument("--embed-dim", type=int, default=DEFAULT_EMBED_DIM)
     parser.add_argument("--head-fusion", type=str, default="film", choices=HEAD_FUSIONS)
+    parser.add_argument("--command-mode", type=str, default="kappa", choices=COMMAND_MODES)
+    parser.add_argument("--label-mode", type=str, default="pos_rot", choices=LABEL_MODES)
     args = parser.parse_args()
 
     spec = PatchSpec()
     net = ArcDivergenceNet(
-        base_width=args.base_width, embed_dim=args.embed_dim, head_fusion=args.head_fusion
+        base_width=args.base_width, embed_dim=args.embed_dim, head_fusion=args.head_fusion,
+        command_mode=args.command_mode, label_mode=args.label_mode,
     )
+    OUT_DIM = len(net.target_names)
     n_params = sum(p.numel() for p in net.parameters())
     print(f"ArcDivergenceNet(base_width={args.base_width}, embed_dim={args.embed_dim}, "
-          f"head_fusion={args.head_fusion}): {n_params} params")
+          f"head_fusion={args.head_fusion}, command_mode={args.command_mode}, "
+          f"label_mode={args.label_mode}): {n_params} params")
+    # pos_rot's parameter names must stay those of checkpoints written before label_mode existed
+    if args.label_mode == "pos_rot":
+        assert {"head_e_pos.weight", "head_e_rot.weight"} <= set(net.state_dict())
     print(f"[trunk] {spec.ny}x{spec.nx} -> {trunk_out_size(spec.ny)}x{trunk_out_size(spec.nx)}, "
           f"total stride {total_stride()}")
 
     # --- shapes: patch mode collapses to one code / one prediction per row ----------------------
     B = 4
     patch = torch.randn(B, N_CHANNELS, spec.ny, spec.nx)
-    kappa = torch.empty(B).uniform_(-KAPPA_MAX, KAPPA_MAX)
+    kappa = torch.empty(B, 1).uniform_(-KAPPA_MAX, KAPPA_MAX)
+    v_wz = torch.cat([torch.full((B, 1), V_NOM), V_NOM * kappa], dim=-1)  # arc.twist_from_kappa
+    command = kappa if args.command_mode == "kappa" else v_wz
     code = net.terrain_code(patch)
     assert code.shape == (B, DEFAULT_GEOMETRY_CHANNELS, 1, 1), code.shape
-    y_hat = net(patch, kappa)
+    y_hat = net(patch, command)
     assert y_hat.shape == (B, OUT_DIM), y_hat.shape
-    print(f"[forward] patch {tuple(patch.shape)}, kappa {tuple(kappa.shape)} "
+    print(f"[forward] patch {tuple(patch.shape)}, command {tuple(command.shape)} "
           f"-> y_hat {tuple(y_hat.shape)}")
+
+    # --- command modes: at the pinned speed, v_wz's features are kappa's plus a constant 1 column
+    f_vwz = command_features(v_wz, "v_wz")
+    assert torch.allclose(f_vwz, torch.cat([torch.ones(B, 1), command_features(kappa, "kappa")], -1))
+    print("[command] v_wz features == (1, kappa features) at v=V_NOM")
 
     # --- receptive field: measured at a trunk-output cell whose full 23 px RF sits INSIDE the
     # patch (row=3 of 6, col=3 of 7 -- see design.md 5b's table), so the probe isn't confounded by
@@ -482,28 +561,29 @@ if __name__ == "__main__":
     print(f"[mirror] patch row geometry is exactly mirror-symmetric about y=0 ({spec.ny} rows)")
     net.eval()
     with torch.no_grad():
-        mirrored = net(torch.flip(patch, dims=[-2]), -kappa)
+        mirrored = net(torch.flip(patch, dims=[-2]), mirror_command(command, args.command_mode))
         diff = (y_hat - mirrored).abs().max().item()
     print(f"[mirror] model-space equivariance at init (untrained): {diff:.3e} "
           f"(expected O(1) until trained with the y-mirror + kappa-negate augmentation)")
 
     # --- TargetTransform round-trip and non-negativity -------------------------------------------
-    y_phys = torch.rand(64, OUT_DIM) * 3.0  # stand-in physical (e_pos, e_rot), non-negative
+    y_phys = torch.rand(64, OUT_DIM) * 3.0  # stand-in physical errors, non-negative
     transform = TargetTransform.fit(y_phys)
     assert torch.allclose(transform.inverse(transform.forward(y_phys)), y_phys, atol=1e-5), "not invertible"
     assert (transform.inverse(torch.randn(64, OUT_DIM) * 5.0) >= 0).all(), "negative error escaped"
 
     net.target_transform = transform
-    prediction = net.predict(patch, kappa)
+    prediction = net.predict(patch, command)
     assert prediction.shape == (B, OUT_DIM) and (prediction >= 0).all()
     print(f"[predict] range: [{prediction.min():.4f}, {prediction.max():.4f}] "
-          f"({', '.join(TARGET_NAMES)})")
+          f"({', '.join(net.target_names)})")
 
     # --- the concat ablation must at least build and run to the same shape -----------------------
     concat_net = ArcDivergenceNet(
-        base_width=args.base_width, embed_dim=args.embed_dim, head_fusion="concat"
+        base_width=args.base_width, embed_dim=args.embed_dim, head_fusion="concat",
+        command_mode=args.command_mode, label_mode=args.label_mode,
     )
-    assert concat_net(patch, kappa).shape == (B, OUT_DIM)
+    assert concat_net(patch, command).shape == (B, OUT_DIM)
     n_concat = sum(p.numel() for p in concat_net.parameters())
     print(f"[ablation] head_fusion=concat builds and runs: {n_concat} params "
           f"({n_params - n_concat:+d} vs film)")

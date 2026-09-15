@@ -166,6 +166,7 @@ from feasibility.heightmap import HeightMapReader
 from feasibility.lattice_learning.arc import ARC_LEN
 from feasibility.lattice_learning.arc import integrate_arc
 from feasibility.lattice_learning.arc import KAPPA_MAX
+from feasibility.lattice_learning.arc import twist_from_kappa
 from feasibility.lattice_learning.arc import V_NOM
 from feasibility.lattice_learning.patch import patch_overhangs
 from feasibility.lattice_learning.patch import PatchSpec
@@ -467,8 +468,7 @@ def finish_map(
     # v_drive is pinned at V_NOM today (see the module docstring), not sampled, but is still
     # written per-row rather than left to the root attr v_nom so the schema stays self-contained
     # and stays correct for free if v is ever sampled instead of pinned.
-    v_drive = np.full(n, V_NOM, dtype=np.float32)
-    wz_drive = (V_NOM * kappa).astype(np.float32)
+    v_drive, wz_drive = twist_from_kappa(kappa)
 
     t0_pose = np.zeros((n, 3), dtype=np.float64)
     belief_pose = np.zeros((n, 3), dtype=np.float64)
