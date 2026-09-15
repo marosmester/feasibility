@@ -241,7 +241,7 @@ def report_trial(trial: Trial, n: int, device: str, rot_display: str = "rot") ->
     else:
         rot_str = f"e_rot={e_rot:.2f} rad ({np.degrees(e_rot):.2f} deg)"
 
-    # `valid`'s own four ANDed conditions (generate_dataset.py's simulate_map, design.md section
+    # `valid`'s own four ANDed conditions (generate_dataset.py's finish_map, design.md section
     # 7b), recomputed from the file's stored fields. Three are cheap (pure numpy over
     # already-loaded arrays); `settle_ok` needs a real settle re-run at the arc's own endpoint
     # (the same one generation did), so it is the only one that needs Warp initialized and a

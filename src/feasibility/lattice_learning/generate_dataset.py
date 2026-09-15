@@ -98,6 +98,12 @@ config):
                          chunk, BEFORE the warm-up window begins -- run as zero-setpoint rows of
                          the same captured rollout (default: 15)
     +chunk=INT           trials per ostrich model build                    (default: 64)
+    +maps_per_build=INT  maps placed side by side as ONE ostrich terrain, their trials run
+                         together in chunks of +chunk (default: 1 = one build per map). Each map
+                         keeps its own triangulation, shifted to its own tile (tiled_terrain.py);
+                         poses are shifted back, and every trial is drawn identically to the
+                         default, so only ostrich's own run-to-run noise differs. Worth it when
+                         trials_per_map is small: the per-build cost is then most of the time.
     +mu=FLOAT            ground friction                                   (default: 0.8)
     +device=STR          torch/warp device for ostrich AND the settle      (default: "cuda:0")
     +router_cell=FLOAT   the router's own lattice cell -- sets xy_jitter = this/2 (section 1c)
@@ -132,6 +138,7 @@ Usage:
 """
 from __future__ import annotations
 
+import dataclasses
 import pathlib
 import time
 
@@ -180,6 +187,8 @@ from feasibility.lattice_learning.spawn_sampling import map_metadata
 from feasibility.lattice_learning.spawn_sampling import sample_map_trials
 from feasibility.lattice_learning.spawn_sampling import SamplingPolicy
 from feasibility.lattice_learning.spawn_sampling import SpawnBatch
+from feasibility.lattice_learning.tiled_terrain import tile_offsets
+from feasibility.lattice_learning.tiled_terrain import TiledTerrain
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 
@@ -225,6 +234,8 @@ DEFAULT_SETTLE_STEPS = 15  # ostrich steps dropping onto the terrain at zero com
 DEFAULT_CHUNK = 64  # trials per ostrich model build -- a tuning knob, not a hard limit (design.md
 # section 7c: "raise chunk hard" once this is validated on real hardware; kept modest here as a
 # default that fits a small GPU).
+DEFAULT_MAPS_PER_BUILD = 1  # maps sharing one ostrich model build (tiled_terrain.py); 1 = one
+# build per map, the reference path. Chunks of `chunk` worlds then span the group's maps.
 DEFAULT_ROUTER_CELL = 0.24  # m -- demos/navigate_partial_view.py's lat_coarsen=4 example (design.md
 # section 6a); only used to derive xy_jitter = this/2 (section 1c)
 DEFAULT_N_THETA = 24  # the router's own heading bin count; only used to derive yaw_jitter = pi/this
@@ -291,7 +302,27 @@ def swept_clear_batch(
     return feasible.all(axis=0)
 
 
-def simulate_map(
+@dataclasses.dataclass
+class PreparedMap:
+    """One map's trials, everything drawn from the rng before any ostrich rollout (see
+    `prepare_map`)."""
+
+    terrain: HeightMapReader
+    trials: SpawnBatch
+    spawn_zpr: np.ndarray  # [n, 3] absolute z (incl. SPAWN_CLEARANCE), pitch, roll
+    jitter: np.ndarray  # [n, 3] belief (dx, dy, dyaw), design.md section 1c
+
+    @property
+    def n(self) -> int:
+        return self.trials.pose.shape[0]
+
+
+def _wheel_setpoints(kappa: np.ndarray) -> np.ndarray:
+    """[n, 3] wheel velocity setpoints for travel at V_NOM along curvature `kappa` [n]."""
+    return np.stack([cmd_to_wheels(V_NOM, V_NOM * k) for k in kappa]).astype(np.float32)
+
+
+def prepare_map(
     terrain: HeightMapReader,
     n: int,
     rng: np.random.Generator,
@@ -299,6 +330,48 @@ def simulate_map(
     spec: PatchSpec,
     xy_jitter: float,
     yaw_jitter: float,
+    chunk: int,
+    warmup_s: float,
+    kappa_max: float,
+    mu: float,
+    device: str,
+    meta: dict,
+    policy: SamplingPolicy,
+) -> PreparedMap:
+    """Samples a map's `n` (spawn pose, kappa) trials (`spawn_sampling.sample_map_trials`, whose
+    strategy the sidecar `meta` and `policy` select), the static-settle spawn pose ostrich starts
+    from, and the belief jitter.
+
+    The jitter is drawn HERE, per `chunk` slice in the same dx/dy/dyaw order the old single-pass
+    loop drew it after each chunk's rollout -- nothing else in that loop touched the rng, so the
+    stream (and therefore every trial) is identical whether one map or `+maps_per_build` maps
+    share an ostrich build."""
+    robot = RobotParams()
+    w_o = round(warmup_s / OSTRICH_DT)
+    trials = sample_map_trials(
+        terrain, meta, spec, n, rng, kappa_max=kappa_max, lead=w_o * OSTRICH_DT * V_NOM, mu=mu,
+        device=device, policy=policy, robot=robot,
+    )
+    # The same static settle sample_trials accepted each spawn on (helhest_stack is bit-exact), kept
+    # this time as ostrich's starting pose -- see SPAWN_CLEARANCE.
+    spawn_derived, _, _ = settle_batch(terrain, trials.pose, mu, device)
+    spawn_zpr = spawn_derived.astype(np.float64)
+    spawn_zpr[:, 0] += SPAWN_CLEARANCE
+
+    jitter = np.zeros((n, 3), dtype=np.float64)
+    for start in range(0, n, chunk):
+        end = min(start + chunk, n)
+        b = end - start
+        dx = rng.uniform(-xy_jitter, xy_jitter, size=b)
+        dy = rng.uniform(-xy_jitter, xy_jitter, size=b)
+        dyaw = rng.uniform(-yaw_jitter, yaw_jitter, size=b)
+        jitter[start:end] = np.stack([dx, dy, dyaw], axis=-1)
+    return PreparedMap(terrain=terrain, trials=trials, spawn_zpr=spawn_zpr, jitter=jitter)
+
+
+def rollout_group(
+    maps: list[PreparedMap],
+    *,
     sim_config: SimulationConfig,
     render_config: RenderingConfig,
     engine_config: EngineConfig,
@@ -306,26 +379,88 @@ def simulate_map(
     chunk: int,
     settle_steps: int,
     warmup_s: float,
-    kappa_max: float,
     mu: float,
-    device: str,
-    meta: dict,
-    policy: SamplingPolicy,
-) -> tuple[dict[str, np.ndarray], SpawnBatch]:
-    """Replays `n` continuous (spawn pose, kappa) trials on ONE terrain, `chunk` at a time, and
-    returns every per_variant/ostrich array design.md section 7b's schema needs (minus the
-    deferred hstack diagnostic -- see the module docstring), plus the sampler's own summary.
-    Trials come from `spawn_sampling.sample_map_trials`, whose strategy the map's sidecar `meta`
-    and `policy` select. See the module docstring for the warm-start / reference / swept_clear
-    pieces this stitches together."""
-    robot = RobotParams()
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Runs every trial of `maps` through ostrich, `chunk` worlds per model build, and returns per
+    map (pose [settle_steps + T_o, n, 7], wheel_qd [settle_steps + T_o, n, 3]) in that map's own
+    coordinates.
+
+    One map: its own `HeightMapReader` is the terrain, exactly the per-map build. Several maps
+    (`+maps_per_build`): a `TiledTerrain` places each on its own tile, each trial spawns at its
+    map's offset and the offset is subtracted back from the logged x/y, so a chunk can freely mix
+    maps."""
     w_o = round(warmup_s / OSTRICH_DT)
     T_o = w_o + T_RECORD_OSTRICH
+    if len(maps) == 1:
+        terrain = maps[0].terrain
+        offsets = np.zeros((1, 2), dtype=np.float64)
+    else:
+        offsets = tile_offsets([m.terrain for m in maps])
+        terrain = TiledTerrain([m.terrain for m in maps], offsets)
 
-    trials = sample_map_trials(
-        terrain, meta, spec, n, rng, kappa_max=kappa_max, lead=w_o * OSTRICH_DT * V_NOM, mu=mu,
-        device=device, policy=policy, robot=robot,
-    )
+    row_offset = np.concatenate([np.repeat(offsets[i : i + 1], m.n, axis=0) for i, m in enumerate(maps)])
+    spawn_pose = np.concatenate([m.trials.pose for m in maps]).astype(np.float64)
+    spawn_pose[:, :2] += row_offset
+    spawn_zpr = np.concatenate([m.spawn_zpr for m in maps])
+    wheels = np.concatenate([_wheel_setpoints(m.trials.kappa) for m in maps])  # [N, 3]
+    n = spawn_pose.shape[0]
+
+    pose = np.zeros((settle_steps + T_o, n, 7), dtype=np.float32)
+    wheel_qd = np.zeros((settle_steps + T_o, n, 3), dtype=np.float32)
+    for start in range(0, n, chunk):
+        end = min(start + chunk, n)
+        b = end - start
+        t0_chunk_t = time.time()
+        sim_config.num_worlds = b  # mutated in place per chunk, like every sibling generator's
+        # HelhestBatchSimulator.build_model cross-checks it against spawn_pose's row count
+
+        # The settle rides in the CAPTURED rollout as `settle_steps` leading rows of zero wheel
+        # speed, instead of run_ostrich_batch's own uncaptured settle loop (settle_steps=0 skips
+        # it). Same physics per step -- collide, zero wheel target, solve -- but replayed as a
+        # CUDA graph: ~6.5 ms/step instead of ~0.6 s/step of Python kernel launches, which made
+        # the settle ~2/3 of every map's wall time. Sliced back apart in finish_map.
+        setpoints = np.concatenate(
+            [np.zeros((settle_steps, b, 3), dtype=np.float32), np.tile(wheels[None, start:end], (T_o, 1, 1))],
+            axis=0,
+        )
+        chunk_pose, chunk_wheel_qd = run_ostrich_batch(
+            sim_config, render_config, engine_config, logging_config, terrain, setpoints, mu,
+            spawn_pose[start:end], settle_steps=0, spawn_zpr=spawn_zpr[start:end],
+        )
+        chunk_pose[..., :2] -= row_offset[None, start:end].astype(np.float32)
+        pose[:, start:end] = chunk_pose
+        wheel_qd[:, start:end] = chunk_wheel_qd
+        print(f"    ostrich trials {start}..{end - 1} ({b} worlds, {len(maps)} map(s)) "
+              f"done in {time.time() - t0_chunk_t:.1f}s")
+
+    results, row = [], 0
+    for m in maps:
+        results.append((pose[:, row : row + m.n], wheel_qd[:, row : row + m.n]))
+        row += m.n
+    return results
+
+
+def finish_map(
+    prepared: PreparedMap,
+    full_pose: np.ndarray,
+    full_wheel_qd: np.ndarray,
+    *,
+    spec: PatchSpec,
+    chunk: int,
+    settle_steps: int,
+    warmup_s: float,
+    mu: float,
+    device: str,
+) -> dict[str, np.ndarray]:
+    """Turns one map's ostrich rollout (`rollout_group`) into every per_variant/ostrich array
+    design.md section 7b's schema needs (minus the deferred hstack diagnostic -- see the module
+    docstring). See the module docstring for the warm-start / reference / swept_clear pieces this
+    stitches together. Uses no rng."""
+    robot = RobotParams()
+    terrain, trials = prepared.terrain, prepared.trials
+    n = prepared.n
+    w_o = round(warmup_s / OSTRICH_DT)
+    T_o = w_o + T_RECORD_OSTRICH
     spawn_pose, kappa = trials.pose, trials.kappa
     # (v_drive, wz_drive) restated alongside kappa for a future (v, omega)-input model
     # (comparator.common's own ScenarioSpec/Trial naming for the commanded body twist) --
@@ -334,11 +469,6 @@ def simulate_map(
     # and stays correct for free if v is ever sampled instead of pinned.
     v_drive = np.full(n, V_NOM, dtype=np.float32)
     wz_drive = (V_NOM * kappa).astype(np.float32)
-    # The same static settle sample_trials accepted each spawn on (helhest_stack is bit-exact), kept
-    # this time as ostrich's starting pose -- see SPAWN_CLEARANCE.
-    spawn_derived, _, _ = settle_batch(terrain, spawn_pose, mu, device)
-    spawn_zpr = spawn_derived.astype(np.float64)
-    spawn_zpr[:, 0] += SPAWN_CLEARANCE
 
     t0_pose = np.zeros((n, 3), dtype=np.float64)
     belief_pose = np.zeros((n, 3), dtype=np.float64)
@@ -349,53 +479,23 @@ def simulate_map(
     endpoint_blocked = np.zeros(n, dtype=bool)
     swept_clear = np.zeros(n, dtype=bool)
 
-    ostrich_pose = np.zeros((T_RECORD_OSTRICH, n, 7), dtype=np.float32)
-    ostrich_wheel_qd = np.zeros((T_RECORD_OSTRICH, n, 3), dtype=np.float32)
-    ostrich_cmd = np.zeros((T_RECORD_OSTRICH, n, 3), dtype=np.float32)
-    # Viewer-only: the settle drop followed by the warm-up, i.e. everything before the arc.
-    ostrich_preroll_pose = np.zeros((settle_steps + w_o, n, 7), dtype=np.float32)
-    ostrich_preroll_wheel_qd = np.zeros((settle_steps + w_o, n, 3), dtype=np.float32)
+    settle_pose, pose_log = full_pose[:settle_steps], full_pose[settle_steps:]
+    settle_wheel_qd, wheel_qd_o = full_wheel_qd[:settle_steps], full_wheel_qd[settle_steps:]
+    assert pose_log.shape[0] == T_o
 
     for start in range(0, n, chunk):
         end = min(start + chunk, n)
-        b = end - start
-        t0_chunk_t = time.time()
-        sim_config.num_worlds = b  # mutated in place per chunk, like every sibling generator's
-        # HelhestBatchSimulator.build_model cross-checks it against spawn_pose's row count
-        spawn_chunk = spawn_pose[start:end]
-        kappa_chunk = kappa[start:end]
-        omega_chunk = V_NOM * kappa_chunk
-        wheels_chunk = np.stack(
-            [cmd_to_wheels(V_NOM, om) for om in omega_chunk]
-        ).astype(np.float32)  # [b, 3]
-
-        ostrich_setpoints = np.tile(wheels_chunk[None], (T_o, 1, 1))  # [T_o, b, 3]
-
-        # The settle rides in the CAPTURED rollout as `settle_steps` leading rows of zero wheel
-        # speed, instead of run_ostrich_batch's own uncaptured settle loop (settle_steps=0 skips
-        # it). Same physics per step -- collide, zero wheel target, solve -- but replayed as a
-        # CUDA graph: ~6.5 ms/step instead of ~0.6 s/step of Python kernel launches, which made
-        # the settle ~2/3 of every map's wall time. Sliced back apart right below.
-        settle_setpoints = np.zeros((settle_steps, b, 3), dtype=np.float32)
-        full_pose, full_wheel_qd = run_ostrich_batch(
-            sim_config, render_config, engine_config, logging_config, terrain,
-            np.concatenate([settle_setpoints, ostrich_setpoints], axis=0), mu, spawn_chunk,
-            settle_steps=0, spawn_zpr=spawn_zpr[start:end],
-        )
-        settle_pose, pose_log = full_pose[:settle_steps], full_pose[settle_steps:]
-        settle_wheel_qd, wheel_qd_o = full_wheel_qd[:settle_steps], full_wheel_qd[settle_steps:]
+        sl = slice(start, end)
+        kappa_chunk = kappa[sl]
+        last = pose_log[w_o - 1, sl]
         t0_xyyaw = np.column_stack(
-            [pose_log[w_o - 1, :, 0], pose_log[w_o - 1, :, 1], _quat_to_yaw(pose_log[w_o - 1, :, 3:7])]
+            [last[:, 0], last[:, 1], _quat_to_yaw(last[:, 3:7])]
         )  # [b, 3] -- the arc's true origin (design.md section 1c)
 
         arc_end_chunk = integrate_arc(t0_xyyaw, kappa_chunk, ARC_LEN)  # [b, 3]
+        belief_chunk = t0_xyyaw + prepared.jitter[sl]  # design.md section 1c
 
-        dx = rng.uniform(-xy_jitter, xy_jitter, size=b)
-        dy = rng.uniform(-xy_jitter, xy_jitter, size=b)
-        dyaw = rng.uniform(-yaw_jitter, yaw_jitter, size=b)
-        belief_chunk = t0_xyyaw + np.stack([dx, dy, dyaw], axis=-1)  # design.md section 1c
-
-        patch_chunk = sample_patches(terrain, belief_chunk, spec).reshape(b, -1)
+        patch_chunk = sample_patches(terrain, belief_chunk, spec).reshape(end - start, -1)
 
         endpoint_derived, endpoint_residual, endpoint_clearance = settle_batch(
             terrain, arc_end_chunk, mu, device
@@ -409,10 +509,10 @@ def simulate_map(
 
         swept_clear_chunk = swept_clear_batch(terrain, t0_xyyaw, kappa_chunk, mu, device, robot)
 
-        ostrich_final_xy = pose_log[-1, :, :2]
+        ostrich_final_xy = pose_log[-1, sl, :2]
         displacement = np.linalg.norm(ostrich_final_xy - t0_xyyaw[:, :2], axis=1)
         finite = (
-            np.isfinite(pose_log[-1]).all(axis=1)
+            np.isfinite(pose_log[-1, sl]).all(axis=1)
             & np.isfinite(t0_xyyaw).all(axis=1)
             & np.isfinite(ref_pose_chunk).all(axis=1)
         )
@@ -423,7 +523,6 @@ def simulate_map(
         # module docstring
         valid_chunk = finite & displacement_ok & overhang_ok
 
-        sl = slice(start, end)
         t0_pose[sl] = t0_xyyaw
         belief_pose[sl] = belief_chunk
         arc_end_pose[sl] = arc_end_chunk
@@ -433,21 +532,10 @@ def simulate_map(
         endpoint_blocked[sl] = ~settle_ok
         swept_clear[sl] = swept_clear_chunk
 
-        ostrich_pose[:, sl] = pose_log[w_o:]
-        ostrich_wheel_qd[:, sl] = wheel_qd_o[w_o:]
-        ostrich_cmd[:, sl] = ostrich_setpoints[w_o:]
-        ostrich_preroll_pose[:, sl] = np.concatenate([settle_pose, pose_log[:w_o]], axis=0)
-        ostrich_preroll_wheel_qd[:, sl] = np.concatenate([settle_wheel_qd, wheel_qd_o[:w_o]], axis=0)
-
-        n_bad = int((~valid_chunk).sum())
-        bad = f", {n_bad} invalid" if n_bad else ""
-        n_blocked = int((~settle_ok).sum())
-        bad += f", {n_blocked} endpoint-blocked" if n_blocked else ""
-        print(f"    trials {start}..{end - 1} ({b}) done in {time.time() - t0_chunk_t:.1f}s{bad}")
-
+    ostrich_cmd = np.tile(_wheel_setpoints(kappa)[None], (T_RECORD_OSTRICH, 1, 1))
     return dict(
         spawn_pose=spawn_pose.astype(np.float32),
-        spawn_zpr=spawn_zpr.astype(np.float32),
+        spawn_zpr=prepared.spawn_zpr.astype(np.float32),
         t0_pose=t0_pose.astype(np.float32),
         belief_pose=belief_pose.astype(np.float32),
         patch=patch,
@@ -464,12 +552,13 @@ def simulate_map(
         valid=valid,
         endpoint_blocked=endpoint_blocked,
         swept_clear=swept_clear,
-        ostrich_pose=ostrich_pose,
-        ostrich_wheel_qd=ostrich_wheel_qd,
+        ostrich_pose=np.ascontiguousarray(pose_log[w_o:]),
+        ostrich_wheel_qd=np.ascontiguousarray(wheel_qd_o[w_o:]),
         ostrich_cmd=ostrich_cmd,
-        ostrich_preroll_pose=ostrich_preroll_pose,
-        ostrich_preroll_wheel_qd=ostrich_preroll_wheel_qd,
-    ), trials
+        # Viewer-only: the settle drop followed by the warm-up, i.e. everything before the arc.
+        ostrich_preroll_pose=np.concatenate([settle_pose, pose_log[:w_o]], axis=0),
+        ostrich_preroll_wheel_qd=np.concatenate([settle_wheel_qd, wheel_qd_o[:w_o]], axis=0),
+    )
 
 
 def _write_fields(group: h5py.Group, fields: dict[str, np.ndarray]) -> None:
@@ -547,6 +636,9 @@ def generate(cfg: DictConfig) -> None:
     warmup_s = float(cfg.get("warmup_s", DEFAULT_WARMUP_S))
     settle_steps = int(cfg.get("settle_steps", DEFAULT_SETTLE_STEPS))
     chunk = int(cfg.get("chunk", DEFAULT_CHUNK))
+    maps_per_build = int(cfg.get("maps_per_build", DEFAULT_MAPS_PER_BUILD))
+    if maps_per_build < 1:
+        raise ValueError(f"+maps_per_build must be >= 1, got {maps_per_build}")
     mu = float(cfg.get("mu", 0.8))
     device = str(cfg.get("device", "cuda:0"))
     router_cell = float(cfg.get("router_cell", DEFAULT_ROUTER_CELL))
@@ -630,16 +722,35 @@ def generate(cfg: DictConfig) -> None:
     map_index_all, map_path_all, targeted_all = [], [], []
     terrain_entries: list[tuple[pathlib.Path, HeightMapReader]] = []
 
-    for m, p in enumerate(map_paths):
-        print(f"[map {m + 1}/{n_maps}] {p.name}")
-        terrain = HeightMapReader.load(p)
-        result, trials = simulate_map(
-            terrain, trials_per_map, rng, spec=spec, xy_jitter=xy_jitter, yaw_jitter=yaw_jitter,
-            sim_config=sim_config, render_config=render_config, engine_config=engine_config,
-            logging_config=logging_config, chunk=chunk, settle_steps=settle_steps,
-            warmup_s=warmup_s, kappa_max=kappa_max, mu=mu, device=device,
-            meta=map_metadata(p), policy=policy,
+    finished: list[tuple[int, pathlib.Path, HeightMapReader, dict, SpawnBatch]] = []
+    for g in range(0, n_maps, maps_per_build):
+        group_paths = map_paths[g : g + maps_per_build]
+        prepared = []
+        for m, p in enumerate(group_paths, start=g):
+            print(f"[map {m + 1}/{n_maps}] {p.name}: sampling trials")
+            prepared.append(prepare_map(
+                HeightMapReader.load(p), trials_per_map, rng, spec=spec, xy_jitter=xy_jitter,
+                yaw_jitter=yaw_jitter, chunk=chunk, warmup_s=warmup_s, kappa_max=kappa_max, mu=mu,
+                device=device, meta=map_metadata(p), policy=policy,
+            ))
+        t_build = time.time()
+        rollouts = rollout_group(
+            prepared, sim_config=sim_config, render_config=render_config,
+            engine_config=engine_config, logging_config=logging_config, chunk=chunk,
+            settle_steps=settle_steps, warmup_s=warmup_s, mu=mu,
         )
+        print(f"[ostrich]  maps {g + 1}..{g + len(group_paths)} simulated in "
+              f"{time.time() - t_build:.1f}s")
+        for m, (p, prep, (full_pose, full_wheel_qd)) in enumerate(
+            zip(group_paths, prepared, rollouts), start=g
+        ):
+            result = finish_map(
+                prep, full_pose, full_wheel_qd, spec=spec, chunk=chunk, settle_steps=settle_steps,
+                warmup_s=warmup_s, mu=mu, device=device,
+            )
+            finished.append((m, p, prep.terrain, result, prep.trials))
+
+    for m, p, terrain, result, trials in finished:
         for key in ("spawn_pose", "spawn_zpr", "t0_pose", "belief_pose", "patch", "kappa", "v_drive",
                     "wz_drive", "arc_relief", "interact_dir", "ramp_deg", "ramp_s", "sampling",
                     "arc_end_pose", "ref_pose", "valid", "endpoint_blocked", "swept_clear"):
@@ -653,7 +764,7 @@ def generate(cfg: DictConfig) -> None:
         terrain_entries.extend([(p, terrain)] * trials_per_map)
 
         n_valid = int(result["valid"].sum())
-        print(f"    -> {n_valid}/{trials_per_map} valid, "
+        print(f"[map {m + 1}/{n_maps}] {p.name} -> {n_valid}/{trials_per_map} valid, "
               f"{int(result['endpoint_blocked'].sum())}/{trials_per_map} endpoint-blocked, "
               f"{int(result['swept_clear'].sum())}/{trials_per_map} swept-clear, "
               f"{describe_trials(trials, trials_per_map, interact_relief)}")
@@ -697,6 +808,7 @@ def generate(cfg: DictConfig) -> None:
             mu=mu, k_p=K_P,
             ostrich_dt=OSTRICH_DT,
             n_maps=n_maps, trials_per_map=trials_per_map, n=n, seed=seed,
+            maps_per_build=maps_per_build, chunk=chunk,
             **patch_spec_to_attrs(spec),
         ),
         per_variant=per_variant,

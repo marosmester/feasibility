@@ -8,7 +8,7 @@ the sidecar `category` back:
     ramps            create_ramps.build_ramp_map: 0.7 m tall,  `ramp`: head-on up a face, 75%
                      finite-width ramps, rising face 5-80 deg  straight; ramp_deg per trial
     curbs_and_walls  create_curbs_and_walls.build_walls_map:   `edge`: near an edge, half of them
-                     curbs, walls, L-corners, gaps, boxes,     running into it (climb up or drive
+                     2 of curb/wall/L-corner/box, 1 m apart,   running into it (climb up or drive
                      0.2-1.0 m tall, 80 deg sides              down)
     rough            create_rough_terrain.build_rough_terrain: `uniform`
                      exactly flat, or low-amplitude rough
@@ -52,7 +52,6 @@ Usage:
     python src/feasibility/heightmap/create_maps_for_lattice_learning.py --seed 0 --dry-run
     python src/feasibility/heightmap/create_maps_for_lattice_learning.py --seed 0 --n 400
     python src/feasibility/heightmap/create_maps_for_lattice_learning.py --seed 0 --ratios ramps=1
-    python src/feasibility/lattice_learning/generate_dataset.py +maps_dir=assets/lattice_maps/0
 """
 from __future__ import annotations
 

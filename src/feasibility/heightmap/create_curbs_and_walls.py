@@ -1,4 +1,4 @@
-"""Curbs, thin walls, L-corners, wall-gaps and boxes of continuous height, for lattice_learning's
+"""Curbs, thin walls, L-corners and boxes of continuous height, for lattice_learning's
 `curbs_and_walls` maps.
 
 Every feature is steep-sided (80 deg) and 0.2-1.0 m tall (~0.6-2.9 wheel radii), from an edge a
@@ -7,18 +7,21 @@ with its `edge` strategy: every trial starts near an edge and half of them run i
 up or driving down, with the arc end NOT required to be settle-feasible -- so the tall end of the
 range shows what ostrich does when helhest_stack says `blocked`.
 
-A map is K features, each drawn independently -- its own height, yaw and kind:
+A map is 2 features (WallsConfig.n_features), each drawn independently -- its own height, yaw and
+kind:
 
     curb    one long rectangle, 0.3-0.8 m wide (a step up onto it, then straight off again)
     wall    one long, thin rectangle
     corner  two walls meeting at a right angle (an L), the sampled center is the corner point
-    gap     two parallel walls with a clear passage between them, about the robot's width
     box     a rectangle with both sides >= 1.5 m, so the whole robot fits on top -- the only kind
             a trial can drive DOWN from
 
-Every rectangle is create_large_box_obstacles.build_rect_obstacle (with its `yaw`), and layers
-combine with an elementwise MAXIMUM: the union of solid extrusions standing on flat ground, which
-stays correct when two features of DIFFERENT heights overlap (a sum would stack them into a tower).
+Few features, kept apart: the footprints of two features (sloped skirts included) stay more than
+WallsConfig.overlap_margin (1.0 m) clear of each other, so each one stays a recognizable shape
+instead of merging into a clutter of overlapping walls and boxes.
+
+Every rectangle is create_large_box_obstacles.build_rect_obstacle (with its `yaw`), and the
+rectangles of one feature (a corner's two arms) combine with an elementwise MAXIMUM.
 
 Wall thickness is floored at 0.15 m on purpose. lattice_learning's patch samples terrain every
 0.125 m, so anything thinner can fall entirely between two sample points and be invisible to the
@@ -51,6 +54,7 @@ import dataclasses
 import pathlib
 
 import numpy as np
+from scipy.ndimage import distance_transform_edt
 
 from feasibility.heightmap import HeightMapReader
 from feasibility.heightmap.create_large_box_obstacles import build_rect_obstacle
@@ -61,7 +65,7 @@ PLACEMENT_MARGIN = 1.1  # m, feature centers stay this far inside the grid edge 
 MAX_FEATURE_ATTEMPTS = 50  # draws per feature before the map stops growing
 GROUND_EPS = 1e-6  # m, a cell above this counts as covered by a feature
 
-FEATURE_KINDS = ("curb", "wall", "corner", "gap", "box")
+FEATURE_KINDS = ("curb", "wall", "corner", "box")
 
 # (w, d, cx, cy, yaw) of one rectangle in world coordinates, w along its own rotated x axis
 Rect = tuple[float, float, float, float, float]
@@ -72,15 +76,15 @@ class WallsConfig:
     """Sampling ranges for build_walls_map; every (lo, hi) pair is a uniform draw."""
 
     height: tuple[float, float] = (0.2, 1.0)  # m, per feature
-    n_features: tuple[int, int] = (3, 8)  # inclusive; an UPPER bound once the area budget binds
-    kind_weights: tuple[float, ...] = (0.2, 0.2, 0.2, 0.15, 0.25)  # FEATURE_KINDS order
+    n_features: tuple[int, int] = (2, 2)  # inclusive; an UPPER bound if placement runs out
+    kind_weights: tuple[float, ...] = (0.25, 0.25, 0.25, 0.25)  # FEATURE_KINDS order
     curb_length: tuple[float, float] = (2.0, 6.0)  # m
     curb_width: tuple[float, float] = (0.3, 0.8)  # m
-    wall_length: tuple[float, float] = (1.5, 5.0)  # m, also each corner arm / gap wall
+    wall_length: tuple[float, float] = (1.5, 5.0)  # m, also each corner arm
     wall_thickness: tuple[float, float] = (0.15, 0.25)  # m, >= 0.15 so the 0.125 m patch sees it
-    gap_width: tuple[float, float] = (1.1, 1.8)  # m, clear passage between the two gap walls
     box_side: tuple[float, float] = (1.5, 4.0)  # m, each side; >= 1.5 so the robot fits on top
     incline_deg: float = 80.0  # side slope; sharp, but no single-cell mesh sliver
+    overlap_margin: float = 1.0  # m, clear ground between two features' footprints
     max_area_fraction: float = 0.3  # of the whole map, keeps clear ground for spawn sampling
 
 
@@ -124,11 +128,6 @@ def feature_rects(
             place(thickness, arm_y, 0.0, arm_y / 2.0 - thickness / 2.0),
         ]
         return rects, {"arm_x": arm_x, "arm_y": arm_y, "thickness": thickness}
-    if kind == "gap":
-        length, gap = rng.uniform(*cfg.wall_length), rng.uniform(*cfg.gap_width)
-        offset = gap / 2.0 + thickness / 2.0
-        rects = [place(length, thickness, 0.0, offset), place(length, thickness, 0.0, -offset)]
-        return rects, {"length": length, "gap": gap, "thickness": thickness}
     raise ValueError(f"unknown feature kind {kind!r}, expected one of {FEATURE_KINDS}")
 
 
@@ -161,10 +160,11 @@ def build_walls_map(
     extent: float = DEFAULT_EXTENT,
     cell: float = DEFAULT_CELL,
 ) -> tuple[HeightMapReader, dict]:
-    """One map of curbs/walls/corners/gaps on flat ground, plus a params dict for a .yaml
-    sidecar. Each feature gets up to MAX_FEATURE_ATTEMPTS draws to land fully inside the grid
-    without pushing the covered area past cfg.max_area_fraction; the first feature that cannot
-    stops the map, so n_features is an upper bound."""
+    """One map of curbs/walls/corners/boxes on flat ground, plus a params dict for a .yaml
+    sidecar. Each feature gets up to MAX_FEATURE_ATTEMPTS draws to land fully inside the grid,
+    more than cfg.overlap_margin clear of every earlier feature, without pushing the covered area
+    past cfg.max_area_fraction; the first feature that cannot stops the map, so n_features is an
+    upper bound."""
     center_limit = extent / 2.0 - PLACEMENT_MARGIN
     if center_limit <= 0.0:
         raise ValueError(f"extent {extent} m leaves no room inside the {PLACEMENT_MARGIN} m margin")
@@ -173,6 +173,7 @@ def build_walls_map(
 
     n_axis = grid_axes(extent, cell).size
     H = np.zeros((n_axis, n_axis), dtype=np.float64)
+    clearance = np.full((n_axis, n_axis), np.inf)  # m, distance to the nearest existing footprint
     features: list[dict] = []
     n_target = int(rng.integers(cfg.n_features[0], cfg.n_features[1] + 1))
     for _ in range(n_target):
@@ -184,10 +185,14 @@ def build_walls_map(
             rects, shape = feature_rects(kind, rng, cfg, cx, cy, yaw)
             if not all(rect_inside_grid(r, height, cfg.incline_deg, extent) for r in rects):
                 continue
-            candidate = np.maximum(H, rects_layer(rects, height, cfg.incline_deg, extent, cell))
+            layer = rects_layer(rects, height, cfg.incline_deg, extent, cell)
+            if (clearance[layer > GROUND_EPS] <= cfg.overlap_margin).any():
+                continue
+            candidate = np.maximum(H, layer)
             if np.count_nonzero(candidate > GROUND_EPS) / candidate.size > cfg.max_area_fraction:
                 continue
             H = candidate
+            clearance = distance_transform_edt(H <= GROUND_EPS) * cell
             features.append(
                 {
                     "kind": kind,
@@ -255,10 +260,20 @@ if __name__ == "__main__":
     assert all(cfg.height[0] <= h <= cfg.height[1] for h in heights)
     assert params["area_fraction"] <= cfg.max_area_fraction
 
-    # --- kinds over many maps: every kind appears, every box top fits the robot -----------------
+    # --- kinds over many maps: every kind appears, every box top fits the robot, every map is -----
+    # --- filled to n_features, and no two features come within overlap_margin of each other -----
     seen: dict[str, int] = {k: 0 for k in FEATURE_KINDS}
     for i in range(40):
         _, p = build_walls_map(np.random.default_rng([args.seed, i]), cfg, args.extent, args.cell)
+        assert len(p["features"]) == cfg.n_features[1], f"map {i}: {len(p['features'])} features"
+        covered = [
+            rects_layer(f["rects"], f["height"], cfg.incline_deg, args.extent, args.cell) > GROUND_EPS
+            for f in p["features"]
+        ]
+        for a in range(len(covered)):
+            gap = distance_transform_edt(~covered[a]) * args.cell
+            for b in range(a + 1, len(covered)):
+                assert gap[covered[b]].min() > cfg.overlap_margin, f"map {i}: features {a},{b} touch"
         for f in p["features"]:
             seen[f["kind"]] += 1
             assert cfg.height[0] <= f["height"] <= cfg.height[1]
