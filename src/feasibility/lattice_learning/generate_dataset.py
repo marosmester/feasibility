@@ -43,22 +43,22 @@ Three things this generator does that no sibling generator does, all from design
 arc, at the arc's OWN (fixed) heading -- matching the kernel's own convention of indexing
 `blocked[..., t]` at the sweep's outer heading, not the locally-varying arc heading.
 
-Trial selection -- spawn pose AND kappa -- lives in this package's `spawn_sampling.py`
-(`sample_map_trials`), with a strategy picked per map from its sidecar `category` (stored per row
-as `sampling`). Every strategy requires the static settle to be feasible at the spawn; `uniform`
-and `targeted` also require it at the nominal arc end, `ramp` and `edge` do not.
-  - `ramp`: maps in `+ramp_categories` (default: ramps). Every trial drives head-on up a ramp
-    face, `+ramp_straight_frac` of them straight, so divergence can be read against the face's
-    slope. Stored per row as `ramp_deg`, plus `ramp_s` = the arc origin's position along the face;
+Trial selection -- spawn pose AND kappa -- lives in this package's `spawn_sampling.py`, and WHICH
+strategy runs on which maps, with which params and on what share of the rows, in the config's `mix`
+(`dataset_config.py`: validation, the strategy registry, and the allocation of maps and rows).
+Entries on the same map category share its maps, so one ramp map can carry `ramp_up` and
+`ramp_down` rows. Every strategy requires the static settle to be feasible at the spawn; `uniform`
+and `targeted` also require it at the nominal arc end, `ramp_up`, `ramp_down` and `edge` do not.
+  - `ramp_up` / `ramp_down` (ramps maps): head-on up a face from before its foot / down a face from
+    its plateau, so divergence can be read against the face's slope. Stored per row as `ramp_deg`,
+    plus `ramp_s` = the arc origin's position onto the face from its entry point (foot / crest);
     both are NaN for every other row.
-  - `edge`: maps in `+edge_categories` (default: curbs_and_walls, and the retired walls/boxes).
-    Arc origins within `+edge_band` of a height edge; `+interact_frac` of the trials run into it,
-    `+edge_down_frac` of those driving down, the rest climbing up.
-  - `uniform`: maps in `+untargeted_categories` (default: rough -- flat and low-amplitude rough
-    ground).
-  - `targeted` (any other map): uniform proposals, `+interact_frac` of the trials drawn from those
-    whose arc meets terrain.
-Every row stores `arc_relief`, `interact_dir` (+1 up / -1 down / 0 none) and a `targeted` flag.
+  - `edge` (curbs_and_walls maps): arc origins near a height edge, `interact_frac` of the trials
+    running into it, `down_frac` of those driving down, the rest climbing up.
+  - `uniform` (any map, typically rough): uniform (pose, kappa).
+  - `targeted` (any map): uniform proposals, `interact_frac` of the trials meeting terrain.
+Every row stores `sampling` (its strategy), `map_category`, `arc_relief`, `interact_dir` (+1 up /
+-1 down / 0 none) and a `targeted` flag.
 
 `valid` is the data-quality gate only: finite poses, a plausible displacement, a patch on the map.
 It does NOT include the static settle at the arc end -- that is stored separately per row as
@@ -83,61 +83,23 @@ writer makes, for the identical reason (its schema doesn't fit `write_comparison
 assumption either) -- so terrain embedding and git provenance still can't drift from
 `write_comparison`'s own files.
 
-CLI parameters (Hydra overrides; `+` prefix required since none exist in the base "helhest"
-config):
-    +n_maps=INT          maps drawn (without replacement) from maps_dir     (default: 4)
-    +trials_per_map=INT  trials per map -- n = n_maps * this                (default: 16)
-    +maps_dir=STR        repo-root-relative or absolute map directory
-                         (default: assets/large_box_random/0)
-    +seed=INT            RNG seed for map selection, poses, kappa, jitter   (default: 0)
-    +kappa_max=FLOAT     sample kappa ~ U(-this, this), 1/m                 (default: arc.KAPPA_MAX)
-    +warmup_s=FLOAT      captured warm-up duration before the recorded arc (default: 0.375) --
-                         design.md section 2's "measured quantity"; NOT independently re-measured
-                         in this checkout, see DEFAULT_WARMUP_S's comment
-    +settle_steps=INT    ostrich steps dropping onto the terrain at zero command, paid once per
-                         chunk, BEFORE the warm-up window begins -- run as zero-setpoint rows of
-                         the same captured rollout (default: 15)
-    +chunk=INT           trials per ostrich model build                    (default: 64)
-    +maps_per_build=INT  maps placed side by side as ONE ostrich terrain, their trials run
-                         together in chunks of +chunk (default: 1 = one build per map). Each map
-                         keeps its own triangulation, shifted to its own tile (tiled_terrain.py);
-                         poses are shifted back, and every trial is drawn identically to the
-                         default, so only ostrich's own run-to-run noise differs. Worth it when
-                         trials_per_map is small: the per-build cost is then most of the time.
-    +mu=FLOAT            ground friction                                   (default: 0.8)
-    +device=STR          torch/warp device for ostrich AND the settle      (default: "cuda:0")
-    +router_cell=FLOAT   the router's own lattice cell -- sets xy_jitter = this/2 (section 1c)
-                         (default: 0.24, demos/navigate_partial_view.py's lat_coarsen=4 example)
-    +n_theta=INT         the router's own heading bin count -- sets yaw_jitter = pi/this
-                         (default: 24)
-    +interact_frac=FLOAT exact share of a targeted/edge map's trials whose arc meets terrain, i.e.
-                         arc_relief > interact_relief (default: 0.5); null = no interaction strata
-    +interact_relief=FLOAT  m, plane-relative terrain relief along the arc that counts as meeting
-                         terrain (default: 0.05)
-    +untargeted_categories=[..]  sidecar categories sampled uniformly (default: [rough]; [] for
-                         none). Maps without a `category` key are targeted.
-    +ramp_categories=[..]  sidecar categories whose trials all drive head-on up a ramp face
-                         (default: [ramps]; [] to target them instead)
-    +ramp_straight_frac=FLOAT  share of those trials driven straight, kappa = 0 (default: 0.75)
-    +ramp_yaw_jitter_deg=FLOAT mid-arc heading off the face's uphill axis, uniform +- (default: 5)
-    +edge_categories=[..]  sidecar categories sampled near height edges
-                         (default: [curbs_and_walls, walls, boxes]; [] to target them instead)
-    +edge_band=FLOAT     m, arc origins at most this far from an edge (default: 1.5)
-    +edge_facing_frac=FLOAT  share of edge proposals heading at the nearest edge (default: 0.7)
-    +edge_down_frac=FLOAT    share of an edge map's interacting trials driving down (default: 0.5)
-    +dry_run=BOOL        trial sampling (settle on CPU) on every selected map, no ostrich, no
-                         output (default: false)
-    Also accepts any standard Hydra config-group override against the "helhest" base config
-    (engine=mujoco, simulation=..., logging=...); rendering is forced headless.
+CLI: ONE argument, the dataset config -- a name in `configs/` or a path to a YAML file. Every
+parameter (seed, map dir and counts, warm-up, friction, jitter, chunking, device, dry run, ostrich
+Hydra overrides, and the sampling mix with each strategy's params) lives in that file, so the file
+alone reproduces a dataset; the h5 embeds its text as the root attr `config_yaml`.
+`configs/default.yaml` documents every key; `dataset_config.py` validates it.
+
+Output: outputs/dataset_arc_<config name>_M<n_maps>_R<trials_per_map>_seed<seed>.h5
 
 Usage:
-    python src/feasibility/lattice_learning/generate_dataset.py +dry_run=true   # cheap CPU check
-    python src/feasibility/lattice_learning/generate_dataset.py +n_maps=1 +trials_per_map=2 +chunk=2
-    python src/feasibility/lattice_learning/generate_dataset.py                 # M=4, 16/map
-    python src/feasibility/lattice_learning/generate_dataset.py +chunk=32       # if the GPU OOMs
+    python src/feasibility/lattice_learning/generate_dataset.py default    # configs/default.yaml
+    python src/feasibility/lattice_learning/generate_dataset.py my_config
+    python src/feasibility/lattice_learning/generate_dataset.py path/to/my_dataset.yaml
+Set `run.dry_run: true` in a copy of a config for a cheap CPU check of the allocation and sampling.
 """
 from __future__ import annotations
 
+import argparse
 import dataclasses
 import pathlib
 import time
@@ -145,7 +107,8 @@ import time
 import h5py
 import hydra
 import numpy as np
-from omegaconf import DictConfig
+from hydra import compose
+from hydra import initialize_config_dir
 from ostrich import EngineConfig
 from ostrich import LoggingConfig
 from ostrich import RenderingConfig
@@ -165,33 +128,27 @@ from feasibility.comparator.provenance import terrain_fields
 from feasibility.heightmap import HeightMapReader
 from feasibility.lattice_learning.arc import ARC_LEN
 from feasibility.lattice_learning.arc import integrate_arc
-from feasibility.lattice_learning.arc import KAPPA_MAX
 from feasibility.lattice_learning.arc import twist_from_kappa
 from feasibility.lattice_learning.arc import V_NOM
+from feasibility.lattice_learning.dataset_config import allocate
+from feasibility.lattice_learning.dataset_config import AllocatedMap
+from feasibility.lattice_learning.dataset_config import check_maps
+from feasibility.lattice_learning.dataset_config import ConfigError
+from feasibility.lattice_learning.dataset_config import DatasetConfig
+from feasibility.lattice_learning.dataset_config import load_config
+from feasibility.lattice_learning.dataset_config import MAP_GLOB
+from feasibility.lattice_learning.dataset_config import sample_map_mix
 from feasibility.lattice_learning.patch import patch_overhangs
 from feasibility.lattice_learning.patch import PatchSpec
 from feasibility.lattice_learning.patch import patch_spec_to_attrs
 from feasibility.lattice_learning.patch import sample_patches
 from feasibility.lattice_learning.settle import settle_batch
 from feasibility.lattice_learning.settle import settle_feasible
-from feasibility.lattice_learning.spawn_sampling import DEFAULT_EDGE_BAND
-from feasibility.lattice_learning.spawn_sampling import DEFAULT_EDGE_CATEGORIES
-from feasibility.lattice_learning.spawn_sampling import DEFAULT_EDGE_DOWN_FRAC
-from feasibility.lattice_learning.spawn_sampling import DEFAULT_EDGE_FACING_FRAC
-from feasibility.lattice_learning.spawn_sampling import DEFAULT_INTERACT_FRAC
-from feasibility.lattice_learning.spawn_sampling import DEFAULT_INTERACT_RELIEF
-from feasibility.lattice_learning.spawn_sampling import DEFAULT_RAMP_CATEGORIES
-from feasibility.lattice_learning.spawn_sampling import DEFAULT_RAMP_STRAIGHT_FRAC
-from feasibility.lattice_learning.spawn_sampling import DEFAULT_RAMP_YAW_JITTER_DEG
-from feasibility.lattice_learning.spawn_sampling import DEFAULT_UNTARGETED_CATEGORIES
 from feasibility.lattice_learning.spawn_sampling import map_metadata
-from feasibility.lattice_learning.spawn_sampling import sample_map_trials
-from feasibility.lattice_learning.spawn_sampling import SamplingPolicy
 from feasibility.lattice_learning.spawn_sampling import SpawnBatch
 from feasibility.lattice_learning.tiled_terrain import tile_offsets
 from feasibility.lattice_learning.tiled_terrain import TiledTerrain
 
-REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 
 # --- pinned physics constants (design.md section 2a) ---------------------------------------------
 
@@ -213,33 +170,8 @@ def _exact_steps(duration_s: float, dt: float) -> int:
 
 T_RECORD_OSTRICH = _exact_steps(ARC_DURATION_S, OSTRICH_DT)  # 20
 
-# --- hyperparameters (module constants -- override any of them with a Hydra `+key=value`) --------
-
-DEFAULT_N_MAPS = 4
-DEFAULT_TRIALS_PER_MAP = 16
-DEFAULT_SEED = 0
-DEFAULT_MAPS_DIR = "assets/large_box_random/0"  # heightmap/create_large_box_obstacles.py's series
-# -- the same starvation fix grid_learning_2 uses (design.md section 7c)
-MAP_GLOB = "*.png"
-
-DEFAULT_WARMUP_S = 0.375  # s -- design.md section 2's "measured quantity": run a pilot batch,
-# find the step by which body speed is within 2% of v_nom and yaw rate within 2% of v_nom*kappa,
-# take that with ~1.7x margin; design.md expects order 12-18 ostrich steps (~0.3-0.45s) at
-# OSTRICH_DT=2.5e-2. NOT independently re-measured against ostrich in this checkout -- this is a
-# placeholder within the expected range, exposed as +warmup_s= so the real pilot measurement can
-# be plugged in with no code change.
-DEFAULT_SETTLE_STEPS = 15  # ostrich steps dropping onto the terrain at zero command, paid once
-# per chunk, BEFORE the warm-up window -- learning/generate_dataset_utils.py measured 12 steps at
-# ostrich dt=3e-2 (~0.36s of physical settle time); scaled to this dataset's finer OSTRICH_DT to
-# cover the same physical time, not independently re-measured here.
-DEFAULT_CHUNK = 64  # trials per ostrich model build -- a tuning knob, not a hard limit (design.md
-# section 7c: "raise chunk hard" once this is validated on real hardware; kept modest here as a
-# default that fits a small GPU).
-DEFAULT_MAPS_PER_BUILD = 1  # maps sharing one ostrich model build (tiled_terrain.py); 1 = one
-# build per map, the reference path. Chunks of `chunk` worlds then span the group's maps.
-DEFAULT_ROUTER_CELL = 0.24  # m -- demos/navigate_partial_view.py's lat_coarsen=4 example (design.md
-# section 6a); only used to derive xy_jitter = this/2 (section 1c)
-DEFAULT_N_THETA = 24  # the router's own heading bin count; only used to derive yaw_jitter = pi/this
+# Every former hyperparameter (map counts, warm-up, settle steps, chunking, jitter, sampling) now
+# lives in the dataset config -- see configs/default.yaml for each value and its rationale.
 MAX_SPAWN_DISPLACEMENT = 3.0 * ARC_LEN  # m -- design.md section 7b: a final pose farther than
 # this from the arc's own origin t0_pose is an implausible/diverged solve, not a large-but-real
 # collision displacement (the arc only travels ARC_LEN=0.3m nominally).
@@ -258,26 +190,6 @@ SWEPT_SAMPLES = 6  # points sampled along the arc's own curve for the swept_clea
 # _relax_lattice_pose_kernel's blocked[..., t] convention, t held at the sweep's outer heading
 # rather than the locally-varying arc heading). Re-derived rather than importing that kernel,
 # which is embedded in CostToGo's captured-graph machinery and not meant to be called per-trial.
-
-
-def resolve_path(arg: str) -> pathlib.Path:
-    """`+maps_dir=` -> a loadable path: absolute passes through, else resolves against the repo
-    root (matches every heightmap/create_*.py generator's own asset layout)."""
-    p = pathlib.Path(arg)
-    return p if p.is_absolute() else REPO_ROOT / p
-
-
-def select_maps(maps_dir: pathlib.Path, n_maps: int, rng: np.random.Generator) -> list[pathlib.Path]:
-    """`n_maps` heightmap stems drawn without replacement from every PNG in `maps_dir`, sorted
-    first so a given seed always picks the same maps regardless of filesystem ordering."""
-    candidates = sorted(p.with_suffix("") for p in maps_dir.glob(MAP_GLOB))
-    if len(candidates) < n_maps:
-        raise ValueError(
-            f"{maps_dir} holds {len(candidates)} map(s) matching {MAP_GLOB}, need {n_maps}. "
-            f"Generate more with: python src/feasibility/heightmap/create_large_box_obstacles.py "
-            f"--n {n_maps}"
-        )
-    return [candidates[i] for i in rng.choice(len(candidates), size=n_maps, replace=False)]
 
 
 def _quat_to_yaw(q: np.ndarray) -> np.ndarray:
@@ -309,6 +221,7 @@ class PreparedMap:
     `prepare_map`)."""
 
     terrain: HeightMapReader
+    category: str  # the map's sidecar category
     trials: SpawnBatch
     spawn_zpr: np.ndarray  # [n, 3] absolute z (incl. SPAWN_CLEARANCE), pitch, roll
     jitter: np.ndarray  # [n, 3] belief (dx, dy, dyaw), design.md section 1c
@@ -324,38 +237,26 @@ def _wheel_setpoints(kappa: np.ndarray) -> np.ndarray:
 
 
 def prepare_map(
-    terrain: HeightMapReader,
-    n: int,
-    rng: np.random.Generator,
-    *,
-    spec: PatchSpec,
-    xy_jitter: float,
-    yaw_jitter: float,
-    chunk: int,
-    warmup_s: float,
-    kappa_max: float,
-    mu: float,
-    device: str,
-    meta: dict,
-    policy: SamplingPolicy,
+    allocated: AllocatedMap, cfg: DatasetConfig, rng: np.random.Generator, *, spec: PatchSpec
 ) -> PreparedMap:
-    """Samples a map's `n` (spawn pose, kappa) trials (`spawn_sampling.sample_map_trials`, whose
-    strategy the sidecar `meta` and `policy` select), the static-settle spawn pose ostrich starts
-    from, and the belief jitter.
+    """Samples a map's trials -- `counts` rows per mix entry, by `dataset_config.sample_map_mix` --
+    the static-settle spawn pose ostrich starts from, and the belief jitter.
 
-    The jitter is drawn HERE, per `chunk` slice in the same dx/dy/dyaw order the old single-pass
-    loop drew it after each chunk's rollout -- nothing else in that loop touched the rng, so the
-    stream (and therefore every trial) is identical whether one map or `+maps_per_build` maps
-    share an ostrich build."""
+    The jitter is drawn HERE, per `run.chunk` slice in dx/dy/dyaw order, after the trials --
+    nothing else touches the rng, so the stream (and therefore every trial) is identical whether
+    one map or `run.maps_per_build` maps share an ostrich build."""
     robot = RobotParams()
-    w_o = round(warmup_s / OSTRICH_DT)
-    trials = sample_map_trials(
-        terrain, meta, spec, n, rng, kappa_max=kappa_max, lead=w_o * OSTRICH_DT * V_NOM, mu=mu,
-        device=device, policy=policy, robot=robot,
+    n = sum(allocated.counts.values())
+    chunk, device = cfg.run.chunk, cfg.run.device
+    xy_jitter, yaw_jitter = cfg.trial.xy_jitter, cfg.trial.yaw_jitter
+    terrain = HeightMapReader.load(allocated.path)
+    trials = sample_map_mix(
+        terrain, map_metadata(allocated.path), spec, allocated.counts, cfg, rng, lead=lead_m(cfg),
+        device=device, robot=robot,
     )
     # The same static settle sample_trials accepted each spawn on (helhest_stack is bit-exact), kept
     # this time as ostrich's starting pose -- see SPAWN_CLEARANCE.
-    spawn_derived, _, _ = settle_batch(terrain, trials.pose, mu, device)
+    spawn_derived, _, _ = settle_batch(terrain, trials.pose, cfg.trial.mu, device)
     spawn_zpr = spawn_derived.astype(np.float64)
     spawn_zpr[:, 0] += SPAWN_CLEARANCE
 
@@ -367,7 +268,18 @@ def prepare_map(
         dy = rng.uniform(-xy_jitter, xy_jitter, size=b)
         dyaw = rng.uniform(-yaw_jitter, yaw_jitter, size=b)
         jitter[start:end] = np.stack([dx, dy, dyaw], axis=-1)
-    return PreparedMap(terrain=terrain, trials=trials, spawn_zpr=spawn_zpr, jitter=jitter)
+    return PreparedMap(terrain=terrain, category=allocated.category, trials=trials,
+                       spawn_zpr=spawn_zpr, jitter=jitter)
+
+
+def warmup_steps(cfg: DatasetConfig) -> int:
+    """Ostrich steps of warm-up; `trial.warmup_s` must be an exact multiple of OSTRICH_DT."""
+    return _exact_steps(cfg.trial.warmup_s, OSTRICH_DT)
+
+
+def lead_m(cfg: DatasetConfig) -> float:
+    """m travelled along the arc's curvature during the warm-up, before the recorded arc."""
+    return warmup_steps(cfg) * OSTRICH_DT * V_NOM
 
 
 def rollout_group(
@@ -546,7 +458,9 @@ def finish_map(
         interact_dir=trials.interact_dir,
         ramp_deg=trials.ramp_deg,
         ramp_s=trials.ramp_s,
-        sampling=np.full(n, trials.strategy),
+        sampling=trials.strategy,
+        map_category=np.full(n, prepared.category),
+        targeted=trials.targeted,
         arc_end_pose=arc_end_pose.astype(np.float32),
         ref_pose=ref_pose,
         valid=valid,
@@ -576,20 +490,26 @@ def _write_fields(group: h5py.Group, fields: dict[str, np.ndarray]) -> None:
             group.create_dataset(name, data=arr, compression="gzip", compression_opts=4)
 
 
-def describe_trials(trials: SpawnBatch, n: int, interact_relief: float) -> str:
-    """One-line summary of a map's sampled trials, for the per-map progress print."""
-    short = f", {trials.shortfall} short" if trials.shortfall else ""
-    n_up, n_down = int((trials.interact_dir > 0).sum()), int((trials.interact_dir < 0).sum())
-    text = f"{n_up + n_down}/{n} interacting ({n_up} up, {n_down} down; {trials.strategy}{short})"
-    n_blocked = int((~trials.endpoint_feasible).sum())
-    if n_blocked:
-        text += f", {n_blocked} nominal arc ends blocked"
-    on_ramp = np.isfinite(trials.ramp_deg)
-    if on_ramp.any():
-        text += (f", {int(on_ramp.sum())}/{n} up a ramp face at "
-                 f"{np.nanmin(trials.ramp_deg):.1f}-{np.nanmax(trials.ramp_deg):.1f} deg, "
-                 f"{int((trials.kappa[on_ramp] == 0).sum())} straight")
-    return text
+def describe_trials(trials: SpawnBatch) -> str:
+    """One-line summary of a map's sampled trials, per strategy, for the per-map progress print."""
+    parts = []
+    for strategy in dict.fromkeys(trials.strategy.tolist()):
+        k = trials.strategy == strategy
+        n_up, n_down = int((trials.interact_dir[k] > 0).sum()), int((trials.interact_dir[k] < 0).sum())
+        text = f"{strategy} {int(k.sum())}: {n_up} up/{n_down} down"
+        n_blocked = int((~trials.endpoint_feasible[k]).sum())
+        if n_blocked:
+            text += f", {n_blocked} nominal ends blocked"
+        on_ramp = k & np.isfinite(trials.ramp_deg)
+        if on_ramp.any():
+            text += (f", faces {np.nanmin(trials.ramp_deg[on_ramp]):.0f}-"
+                     f"{np.nanmax(trials.ramp_deg[on_ramp]):.0f} deg, "
+                     f"{int((trials.kappa[on_ramp] == 0).sum())} straight")
+            if on_ramp.sum() < k.sum():
+                text += f", {int(k.sum() - on_ramp.sum())} fallback"
+        parts.append(text)
+    short = f" ({trials.shortfall} short)" if trials.shortfall else ""
+    return "; ".join(parts) + short
 
 
 def write_arc_dataset(
@@ -627,90 +547,72 @@ def write_arc_dataset(
     print(f"saved {path}")
 
 
-def generate(cfg: DictConfig) -> None:
-    n_maps = int(cfg.get("n_maps", DEFAULT_N_MAPS))
-    trials_per_map = int(cfg.get("trials_per_map", DEFAULT_TRIALS_PER_MAP))
-    seed = int(cfg.get("seed", DEFAULT_SEED))
-    maps_dir = resolve_path(str(cfg.get("maps_dir", DEFAULT_MAPS_DIR)))
-    kappa_max = float(cfg.get("kappa_max", KAPPA_MAX))
-    warmup_s = float(cfg.get("warmup_s", DEFAULT_WARMUP_S))
-    settle_steps = int(cfg.get("settle_steps", DEFAULT_SETTLE_STEPS))
-    chunk = int(cfg.get("chunk", DEFAULT_CHUNK))
-    maps_per_build = int(cfg.get("maps_per_build", DEFAULT_MAPS_PER_BUILD))
-    if maps_per_build < 1:
-        raise ValueError(f"+maps_per_build must be >= 1, got {maps_per_build}")
-    mu = float(cfg.get("mu", 0.8))
-    device = str(cfg.get("device", "cuda:0"))
-    router_cell = float(cfg.get("router_cell", DEFAULT_ROUTER_CELL))
-    n_theta = int(cfg.get("n_theta", DEFAULT_N_THETA))
-    interact_frac_cfg = cfg.get("interact_frac", DEFAULT_INTERACT_FRAC)
-    interact_frac = None if interact_frac_cfg is None else float(interact_frac_cfg)
-    interact_relief = float(cfg.get("interact_relief", DEFAULT_INTERACT_RELIEF))
-    untargeted_categories = tuple(
-        str(c) for c in cfg.get("untargeted_categories", DEFAULT_UNTARGETED_CATEGORIES)
+def compose_ostrich_config(overrides: tuple[str, ...]) -> tuple[
+    SimulationConfig, RenderingConfig, EngineConfig, LoggingConfig
+]:
+    """Ostrich's "helhest" base config with the dataset config's `ostrich_overrides`, composed
+    through Hydra's compose API (no @hydra.main: the only CLI argument is the dataset config)."""
+    with initialize_config_dir(config_dir=str(CONFIG_PATH), version_base=None):
+        hcfg = compose(config_name="helhest", overrides=list(overrides))
+    return (
+        hydra.utils.instantiate(hcfg.simulation),
+        hydra.utils.instantiate(hcfg.rendering),
+        hydra.utils.instantiate(hcfg.engine),
+        hydra.utils.instantiate(hcfg.logging),
     )
-    ramp_categories = tuple(str(c) for c in cfg.get("ramp_categories", DEFAULT_RAMP_CATEGORIES))
-    policy = SamplingPolicy(
-        interact_frac=interact_frac,
-        interact_relief=interact_relief,
-        untargeted_categories=untargeted_categories,
-        ramp_categories=ramp_categories,
-        ramp_straight_frac=float(cfg.get("ramp_straight_frac", DEFAULT_RAMP_STRAIGHT_FRAC)),
-        ramp_yaw_jitter_deg=float(cfg.get("ramp_yaw_jitter_deg", DEFAULT_RAMP_YAW_JITTER_DEG)),
-        edge_categories=tuple(str(c) for c in cfg.get("edge_categories", DEFAULT_EDGE_CATEGORIES)),
-        edge_band=float(cfg.get("edge_band", DEFAULT_EDGE_BAND)),
-        edge_facing_frac=float(cfg.get("edge_facing_frac", DEFAULT_EDGE_FACING_FRAC)),
-        edge_down_frac=float(cfg.get("edge_down_frac", DEFAULT_EDGE_DOWN_FRAC)),
-    )
-    dry_run = bool(cfg.get("dry_run", False))
+
+
+def generate(cfg: DatasetConfig) -> None:
+    seed = cfg.seed
+    n_maps, trials_per_map = cfg.maps.n_maps, cfg.maps.trials_per_map
+    maps_dir = cfg.maps.path
+    warmup_s, settle_steps, mu = cfg.trial.warmup_s, cfg.trial.settle_steps, cfg.trial.mu
+    chunk, maps_per_build, device = cfg.run.chunk, cfg.run.maps_per_build, cfg.run.device
+    w_o = warmup_steps(cfg)  # raises unless warmup_s is a multiple of OSTRICH_DT
+    lead = lead_m(cfg)
 
     spec = PatchSpec()
-    xy_jitter = router_cell / 2.0  # design.md section 1c
-    yaw_jitter = np.pi / n_theta
+    xy_jitter, yaw_jitter = cfg.trial.xy_jitter, cfg.trial.yaw_jitter
 
-    print(f"[arc]      v_nom={V_NOM} m/s  arc_len={ARC_LEN} m  kappa in [-{kappa_max}, {kappa_max}] "
-          f"1/m  duration={ARC_DURATION_S}s -> {T_RECORD_OSTRICH} ostrich steps")
-    print(f"[warmup]   {warmup_s}s -> {round(warmup_s / OSTRICH_DT)} ostrich steps, entered "
-          f"already moving at v_nom")
+    print(f"[config]   {cfg.path}")
+    print(f"[arc]      v_nom={V_NOM} m/s  arc_len={ARC_LEN} m  kappa in [-{cfg.trial.kappa_max}, "
+          f"{cfg.trial.kappa_max}] 1/m  duration={ARC_DURATION_S}s -> {T_RECORD_OSTRICH} ostrich steps")
+    print(f"[warmup]   {warmup_s}s -> {w_o} ostrich steps ({lead:.3f} m), entered already moving at v_nom")
     print(f"[patch]    {spec.ny}x{spec.nx} cells @ {spec.cell} m, reference={spec.reference}")
-    print(f"[jitter]   xy=+-{xy_jitter:.4f} m (router_cell={router_cell}), "
-          f"yaw=+-{yaw_jitter:.4f} rad (n_theta={n_theta})")
-    print(f"[trials]   interact_frac={interact_frac} (arc_relief > {interact_relief} m), "
-          f"untargeted categories: {', '.join(untargeted_categories) or 'none'}")
-    print(f"[ramps]    categories: {', '.join(ramp_categories) or 'none'} -- head-on up a face, "
-          f"{policy.ramp_straight_frac:.0%} straight, heading +-{policy.ramp_yaw_jitter_deg} deg")
-    print(f"[edges]    categories: {', '.join(policy.edge_categories) or 'none'} -- origins within "
-          f"{policy.edge_band} m of an edge, {policy.edge_facing_frac:.0%} facing it, "
-          f"{policy.edge_down_frac:.0%} of interacting trials driving down")
-    print(f"[validity] no arc-end settle check when sampling: "
-          f"{', '.join(policy.spawn_only_strategies) or 'none'}; every row stores endpoint_blocked, "
-          f"never folded into valid")
+    print(f"[jitter]   xy=+-{xy_jitter:.4f} m (router_cell={cfg.trial.router_cell}), "
+          f"yaw=+-{yaw_jitter:.4f} rad (n_theta={cfg.trial.n_theta})")
+    for e in cfg.mix:
+        params = ", ".join(f"{k}={v}" for k, v in dataclasses.asdict(e.params).items())
+        print(f"[mix]      {e.percent:6.2f}% {e.strategy} on {e.map}"
+              f"{'' if e.spec.spawn_only else ' (arc end must be settle-feasible)'}"
+              f"{f' -- {params}' if params else ''}")
 
     rng = np.random.default_rng(seed)
-    map_paths = select_maps(maps_dir, n_maps, rng)
-    n = n_maps * trials_per_map
-    print(f"[maps]     {n_maps} from {maps_dir}, {trials_per_map} trial(s) each -> {n} rows")
+    pool = check_maps(cfg, lead)
+    allocation = allocate(cfg, pool, rng)
+    n = cfg.n
+    print(f"[maps]     {n_maps} from {maps_dir} ("
+          + ", ".join(f"{c}: {len(pool[c])} available" for c in cfg.categories)
+          + f"), {trials_per_map} trial(s) each -> {n} rows")
+    print(allocation.table())
 
-    if dry_run:
+    if cfg.run.dry_run:
         # CPU-only check: trial sampling (including its static settle, run on CPU) on every
-        # selected map -- no ostrich rollout, nothing written.
+        # allocated map -- no ostrich rollout, nothing written.
         assert T_RECORD_OSTRICH * OSTRICH_DT == ARC_DURATION_S
-        lead = round(warmup_s / OSTRICH_DT) * OSTRICH_DT * V_NOM
-        for p in map_paths:
-            trials = sample_map_trials(
-                HeightMapReader.load(p), map_metadata(p), spec, trials_per_map, rng,
-                kappa_max=kappa_max, lead=lead, mu=mu, device="cpu", policy=policy,
+        for i, m in enumerate(allocation.maps):
+            trials = sample_map_mix(
+                HeightMapReader.load(m.path), map_metadata(m.path), spec, m.counts, cfg, rng,
+                lead=lead, device="cpu",
             )
-            print(f"[dry-run]  {p.name}: {describe_trials(trials, trials_per_map, interact_relief)}")
-        print("[dry-run]  sampling + step-count/duration self-checks ok, nothing simulated")
+            print(f"[dry-run]  {i + 1}/{n_maps} {m.path.name}: {describe_trials(trials)}")
+        print("[dry-run]  allocation + sampling + step-count/duration self-checks ok, nothing simulated")
         return
 
     init_warp_device(device)
-
-    sim_config: SimulationConfig = hydra.utils.instantiate(cfg.simulation)
-    render_config: RenderingConfig = hydra.utils.instantiate(cfg.rendering)
-    engine_config: EngineConfig = hydra.utils.instantiate(cfg.engine)
-    logging_config: LoggingConfig = hydra.utils.instantiate(cfg.logging)
+    sim_config, render_config, engine_config, logging_config = compose_ostrich_config(
+        cfg.ostrich_overrides
+    )
     render_config.vis_type = "null"  # headless
 
     # design.md section 2a: override in code, never in the shared helhest.yaml (submodule_test's
@@ -719,90 +621,73 @@ def generate(cfg: DictConfig) -> None:
 
     per_variant_fields: dict[str, list[np.ndarray]] = {}
     ostrich_fields: dict[str, list[np.ndarray]] = {}
-    map_index_all, map_path_all, targeted_all = [], [], []
+    map_index_all, map_path_all = [], []
     terrain_entries: list[tuple[pathlib.Path, HeightMapReader]] = []
 
     finished: list[tuple[int, pathlib.Path, HeightMapReader, dict, SpawnBatch]] = []
     for g in range(0, n_maps, maps_per_build):
-        group_paths = map_paths[g : g + maps_per_build]
+        group = allocation.maps[g : g + maps_per_build]
         prepared = []
-        for m, p in enumerate(group_paths, start=g):
-            print(f"[map {m + 1}/{n_maps}] {p.name}: sampling trials")
-            prepared.append(prepare_map(
-                HeightMapReader.load(p), trials_per_map, rng, spec=spec, xy_jitter=xy_jitter,
-                yaw_jitter=yaw_jitter, chunk=chunk, warmup_s=warmup_s, kappa_max=kappa_max, mu=mu,
-                device=device, meta=map_metadata(p), policy=policy,
-            ))
+        for m, am in enumerate(group, start=g):
+            print(f"[map {m + 1}/{n_maps}] {am.path.name}: sampling trials")
+            prepared.append(prepare_map(am, cfg, rng, spec=spec))
         t_build = time.time()
         rollouts = rollout_group(
             prepared, sim_config=sim_config, render_config=render_config,
             engine_config=engine_config, logging_config=logging_config, chunk=chunk,
             settle_steps=settle_steps, warmup_s=warmup_s, mu=mu,
         )
-        print(f"[ostrich]  maps {g + 1}..{g + len(group_paths)} simulated in "
-              f"{time.time() - t_build:.1f}s")
-        for m, (p, prep, (full_pose, full_wheel_qd)) in enumerate(
-            zip(group_paths, prepared, rollouts), start=g
+        print(f"[ostrich]  maps {g + 1}..{g + len(group)} simulated in {time.time() - t_build:.1f}s")
+        for m, (am, prep, (full_pose, full_wheel_qd)) in enumerate(
+            zip(group, prepared, rollouts), start=g
         ):
             result = finish_map(
                 prep, full_pose, full_wheel_qd, spec=spec, chunk=chunk, settle_steps=settle_steps,
                 warmup_s=warmup_s, mu=mu, device=device,
             )
-            finished.append((m, p, prep.terrain, result, prep.trials))
+            finished.append((m, am.path, prep.terrain, result, prep.trials))
 
     for m, p, terrain, result, trials in finished:
         for key in ("spawn_pose", "spawn_zpr", "t0_pose", "belief_pose", "patch", "kappa", "v_drive",
                     "wz_drive", "arc_relief", "interact_dir", "ramp_deg", "ramp_s", "sampling",
-                    "arc_end_pose", "ref_pose", "valid", "endpoint_blocked", "swept_clear"):
+                    "map_category", "targeted", "arc_end_pose", "ref_pose", "valid",
+                    "endpoint_blocked", "swept_clear"):
             per_variant_fields.setdefault(key, []).append(result[key])
         for key in ("ostrich_pose", "ostrich_wheel_qd", "ostrich_cmd",
                     "ostrich_preroll_pose", "ostrich_preroll_wheel_qd"):
             ostrich_fields.setdefault(key, []).append(result[key])
         map_index_all.append(np.full(trials_per_map, m, dtype=np.int64))
         map_path_all.extend([str(p)] * trials_per_map)
-        targeted_all.append(np.full(trials_per_map, trials.targeted, dtype=bool))
         terrain_entries.extend([(p, terrain)] * trials_per_map)
 
         n_valid = int(result["valid"].sum())
         print(f"[map {m + 1}/{n_maps}] {p.name} -> {n_valid}/{trials_per_map} valid, "
               f"{int(result['endpoint_blocked'].sum())}/{trials_per_map} endpoint-blocked, "
-              f"{int(result['swept_clear'].sum())}/{trials_per_map} swept-clear, "
-              f"{describe_trials(trials, trials_per_map, interact_relief)}")
+              f"{int(result['swept_clear'].sum())}/{trials_per_map} swept-clear; "
+              f"{describe_trials(trials)}")
 
     per_variant = {k: np.concatenate(v, axis=0) for k, v in per_variant_fields.items()}
     per_variant["map_index"] = np.concatenate(map_index_all, axis=0)
     per_variant["map_path"] = np.array(map_path_all)
-    per_variant["targeted"] = np.concatenate(targeted_all, axis=0)
     ostrich = {k.removeprefix("ostrich_"): np.concatenate(v, axis=1) for k, v in ostrich_fields.items()}
     ostrich["dt"] = OSTRICH_DT
     ostrich["t"] = np.arange(T_RECORD_OSTRICH, dtype=np.float32) * OSTRICH_DT
-    n_preroll = settle_steps + round(warmup_s / OSTRICH_DT)
+    n_preroll = settle_steps + w_o
     # Negative times, so preroll_t continues straight into t (the arc's first step is t=0).
     ostrich["preroll_t"] = (np.arange(n_preroll, dtype=np.float32) - n_preroll) * OSTRICH_DT
 
-    tag = f"{maps_dir.parent.name}{maps_dir.name}" if maps_dir.name.isdigit() else maps_dir.name
-    out_path = OUT_DIR / f"dataset_arc_{tag}_M{n_maps}_R{trials_per_map}_seed{seed}.h5"
+    out_path = OUT_DIR / f"dataset_arc_{cfg.name}_M{n_maps}_R{trials_per_map}_seed{seed}.h5"
     write_arc_dataset(
         out_path,
         root=dict(
+            config_name=cfg.name, config_path=str(cfg.path), config_yaml=cfg.raw_yaml,
             v_nom=V_NOM, arc_len=ARC_LEN, min_turn_radius=0.5,  # design.md section 4c's pinned
             # guard trio -- see arc.py; kept literal here so this file has no import-time
             # dependency beyond arc.py's already-imported constants
-            kappa_min=-kappa_max, kappa_max=kappa_max,
+            kappa_min=-cfg.trial.kappa_max, kappa_max=cfg.trial.kappa_max,
             warmup_s=warmup_s, settle_steps=settle_steps, spawn_clearance=SPAWN_CLEARANCE,
-            xy_jitter=xy_jitter, yaw_jitter=yaw_jitter, router_cell=router_cell, n_theta=n_theta,
-            # NaN = untargeted everywhere (an HDF5 attr cannot hold None)
-            interact_frac=np.nan if interact_frac is None else interact_frac,
-            interact_relief=interact_relief,
-            untargeted_categories=",".join(untargeted_categories),
-            ramp_categories=",".join(ramp_categories),
-            ramp_straight_frac=policy.ramp_straight_frac,
-            ramp_yaw_jitter_deg=policy.ramp_yaw_jitter_deg,
-            edge_categories=",".join(policy.edge_categories),
-            edge_band=policy.edge_band,
-            edge_facing_frac=policy.edge_facing_frac,
-            edge_down_frac=policy.edge_down_frac,
-            spawn_only_strategies=",".join(policy.spawn_only_strategies),
+            xy_jitter=xy_jitter, yaw_jitter=yaw_jitter, router_cell=cfg.trial.router_cell,
+            n_theta=cfg.trial.n_theta, interact_relief=cfg.trial.interact_relief,
             valid_excludes_endpoint_settle=True,
             maps_dir=str(maps_dir), map_glob=MAP_GLOB,
             mu=mu, k_p=K_P,
@@ -824,12 +709,22 @@ def generate(cfg: DictConfig) -> None:
     print(f"  valid       {n_valid:>7d}  ({100 * n_valid / n:5.1f}%)")
     print(f"  of which endpoint_blocked {n_blocked:>5d}  -- custom_dataset.py drop_blocked_endpoints")
     print(f"  swept_clear {n_swept:>7d}  ({100 * n_swept / n:5.1f}%)  -- reporting split only")
+    for strategy in dict.fromkeys(per_variant["sampling"].tolist()):
+        k = per_variant["sampling"] == strategy
+        print(f"  {strategy:<11} {int(k.sum()):>7d} rows, {int((per_variant['valid'] & k).sum())} valid")
     print("=" * 60)
 
 
-@hydra.main(config_path=str(CONFIG_PATH), config_name="helhest", version_base=None)
-def main(cfg: DictConfig) -> None:
-    generate(cfg)
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("config", help="dataset config: a name in configs/ or a path to a .yaml file")
+    args = parser.parse_args()
+    try:
+        generate(load_config(args.config))
+    except ConfigError as err:  # a bad file, or a file that does not fit its map directory
+        parser.exit(2, f"config error: {err}\n")
 
 
 if __name__ == "__main__":

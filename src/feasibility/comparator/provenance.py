@@ -94,11 +94,12 @@ def terrain_fields(
     actually share a terrain) -- run_comparison's per-height variants each load() their own
     HeightMapReader, so nothing is deduped there and the field is omitted; terrain_from_h5()
     treats a missing index as the old direct-index behavior, so already-written files (which
-    never had this field) still read back correctly."""
-    shapes = {(t.ny, t.nx) for _, t in entries}
-    if len(shapes) > 1:
-        bad = next((p, t) for p, t in entries if (t.ny, t.nx) != next(iter(shapes)))
-        raise ValueError(f"terrain grids differ in shape across variants: e.g. {bad[0]} is {(bad[1].ny, bad[1].nx)}")
+    never had this field) still read back correctly.
+
+    Grids of different shapes (e.g. lattice_learning's 14 m ramp maps next to 12 m curb maps) are
+    NaN-padded to the largest [ny, nx] in `H`, and a `shape` [k, 2] (ny, nx) per unique terrain
+    records each one's own extent, which `_terrain_row` crops back to. Only written when shapes
+    actually differ, so single-shape files are laid out exactly as before."""
 
     unique_entries: list[tuple[pathlib.Path | None, HeightMapReader]] = []
     seen: dict[int, int] = {}  # id(terrain) -> index into unique_entries
@@ -117,7 +118,7 @@ def terrain_fields(
         # unlike H's 255-level quantization, a value like cell=0.05 has no exact float32
         # representation -- downcasting it would make a round-tripped HeightMapReader.cell
         # silently not bit-match the yaml sidecar's.
-        "H": np.stack([t.H for _, t in unique_entries], axis=0).astype(np.float32),
+        "H": _stack_padded([t.H for _, t in unique_entries]),
         "cell": np.array([t.cell for _, t in unique_entries], dtype=np.float64),
         "origin": np.array([[t.x0, t.y0] for _, t in unique_entries], dtype=np.float64),
         "min_z": np.array([t.min_z for _, t in unique_entries], dtype=np.float64),
@@ -132,7 +133,21 @@ def terrain_fields(
     }
     if len(unique_entries) < len(entries):
         fields["variant_to_terrain"] = variant_to_terrain
+    shapes = np.array([t.H.shape for _, t in unique_entries], dtype=np.int64)
+    if len({tuple(row) for row in shapes}) > 1:
+        fields["shape"] = shapes
     return fields
+
+
+def _stack_padded(grids: list[np.ndarray]) -> np.ndarray:
+    """[k, max ny, max nx] float32; a smaller grid is NaN-padded at its high-index edges (the
+    origin corner stays at [0, 0], so its own cells keep their indices)."""
+    ny = max(g.shape[0] for g in grids)
+    nx = max(g.shape[1] for g in grids)
+    out = np.full((len(grids), ny, nx), np.nan, dtype=np.float32)
+    for i, g in enumerate(grids):
+        out[i, : g.shape[0], : g.shape[1]] = g
+    return out
 
 
 def _terrain_row(grp: h5py.Group, j: int) -> HeightMapReader:
@@ -140,8 +155,12 @@ def _terrain_row(grp: h5py.Group, j: int) -> HeightMapReader:
     group -- the shared body of terrain_from_h5()/unique_terrains_from_h5(), kept in one place
     so a schema change to the terrain/ group only has to be applied once."""
     x0, y0 = grp["origin"][j]
+    H = grp["H"][j]
+    if "shape" in grp:  # mixed grid shapes, NaN-padded -- see terrain_fields()
+        ny, nx = (int(v) for v in grp["shape"][j])
+        H = H[:ny, :nx]
     return HeightMapReader(
-        grp["H"][j],
+        H,
         (float(x0), float(y0)),
         float(grp["cell"][j]),
         min_z=float(grp["min_z"][j]),

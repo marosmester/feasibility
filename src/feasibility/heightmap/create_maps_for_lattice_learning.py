@@ -1,13 +1,16 @@
 """Generate a mixed batch of heightmaps for lattice_learning/generate_dataset.py, with set ratios.
 
 Three map categories, each built by a helper in this package (this script only samples, mixes and
-writes), and each sampled by its own strategy in lattice_learning/spawn_sampling.py, which reads
-the sidecar `category` back:
+writes). lattice_learning/generate_dataset.py reads the sidecar `category` back and applies the
+spawn_sampling strategies its dataset YAML's `mix` assigns to that category (see
+lattice_learning/dataset_config.py for which strategy is eligible where):
 
-    category         builder                                   trials (spawn_sampling strategy)
-    ramps            create_ramps.build_ramp_map: 0.7 m tall,  `ramp`: head-on up a face, 75%
-                     finite-width ramps, rising face 5-80 deg  straight; ramp_deg per trial
-    curbs_and_walls  create_curbs_and_walls.build_walls_map:   `edge`: near an edge, half of them
+    category         builder                                   strategies (lattice_learning)
+    ramps            create_ramps.build_ramp_map: 0.7 m tall,  `ramp_up`: head-on up a face;
+                     finite-width ramps, rising face 5-80 deg, `ramp_down`: from the plateau, head-
+                     plateau >= 2.1 m (a standing platform),   on down a face; ramp_deg per trial
+                     14 m maps
+    curbs_and_walls  create_curbs_and_walls.build_walls_map:   `edge`: near an edge, some of them
                      2 of curb/wall/L-corner/box, 1 m apart,   running into it (climb up or drive
                      0.2-1.0 m tall, 80 deg sides              down)
     rough            create_rough_terrain.build_rough_terrain: `uniform`
@@ -23,9 +26,10 @@ the ratios with --ratios. Per-category counts use largest-remainder rounding, so
 to exactly --n.
 
 All maps go into ONE flat directory, <out-dir>/<category>_i<NNNN>.png/.yaml, plus manifest.yaml
-(seed, ratios, counts, extent, cell, and the full per-category config), so
-`generate_dataset.py +maps_dir=<out-dir>` works unchanged. That script draws n_maps at random from
-the directory, so the ratios hold on average, and exactly when n_maps equals --n. Each map's
+(seed, ratios, counts, per-category extent, cell, and the full per-category config), which a
+dataset YAML's `maps.dir` points at. generate_dataset.py draws each category's maps from here in
+the proportions of its own `mix`, so these ratios only need to leave every category enough maps;
+it also checks each ramp's sidecar plateau before allowing `ramp_down`. Each map's
 .yaml sidecar also carries the helper's params (feature list, heights, ...); HeightMapReader.load
 ignores the extra keys.
 
@@ -43,7 +47,8 @@ CLI parameters:
     --n INT            total number of maps (default: 200)
     --ratios STR       comma-separated category=weight, e.g. ramps=1,curbs_and_walls=1,rough=1
                        (default: DEFAULT_RATIOS below); normalized, weights must be >= 0
-    --extent FLOAT     full width/height of every square map in meters (default: 12.0)
+    --extent FLOAT     full width/height of every square map in meters, overriding every category's
+                       own CONFIG "extent" (default: per category -- ramps 14.0, others 12.0)
     --cell FLOAT       grid resolution in meters (default: 0.1)
     --out-dir PATH     output directory (default: assets/lattice_maps/<seed>)
     --dry-run          print counts and build one example per category, write nothing
@@ -69,6 +74,7 @@ from feasibility.heightmap.create_curbs_and_walls import WallsConfig
 from feasibility.heightmap.create_curbs_and_walls import build_walls_map
 from feasibility.heightmap.create_ramps import RampsConfig
 from feasibility.heightmap.create_ramps import build_ramp_map
+from feasibility.heightmap.create_ramps import DEFAULT_EXTENT as RAMPS_DEFAULT_EXTENT
 from feasibility.heightmap.create_rough_terrain import build_rough_terrain
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
@@ -79,16 +85,19 @@ ASSETS_DIR = REPO_ROOT / "assets" / "lattice_maps"
 DEFAULT_RATIOS: dict[str, float] = {"ramps": 1 / 3, "curbs_and_walls": 1 / 3, "rough": 1 / 3}
 
 DEFAULT_N = 200
-DEFAULT_EXTENT = 12.0  # m; generate_dataset.py spawns >= 2.1 m from the edge, leaving ~7.8 m square
+DEFAULT_EXTENT = 12.0  # m, curbs_and_walls and rough; generate_dataset.py spawns >= 2.1 m from the
+# edge, leaving ~7.8 m square
 DEFAULT_CELL = 0.1  # m
 
 RAMPS = {
     "config": RampsConfig(),  # every range lives in create_ramps.RampsConfig: 0.7 m, 5-80 deg
     "base_rms": (0.0, 0.0),  # m; upper bound > 0 adds a rough base layer
+    "extent": RAMPS_DEFAULT_EXTENT,  # m, 14: a 5 deg ramp plus its standing platform is 10.5 m long
 }
 CURBS_AND_WALLS = {
     "config": WallsConfig(),  # every range lives in create_curbs_and_walls.WallsConfig: 0.2-1.0 m
     "base_rms": (0.0, 0.0),
+    "extent": DEFAULT_EXTENT,
 }
 ROUGH = {
     "flat_prob": 0.3,  # share of rough-category maps that are exactly flat
@@ -96,6 +105,7 @@ ROUGH = {
     "cutoff_wavelength": (1.0, 3.0),  # m
     "min_wavelength": 0.6,  # m
     "beta": 2.5,
+    "extent": DEFAULT_EXTENT,
 }
 # Rough-base spectrum under ramps/curbs_and_walls, when their base_rms is enabled.
 BASE_ROUGH = {"cutoff_wavelength": 2.0, "min_wavelength": 0.6, "beta": 2.5}
@@ -122,20 +132,28 @@ def parse_ratios(text: str) -> dict[str, float]:
     return ratios
 
 
+def largest_remainder(weights: list[float], total: int) -> list[int]:
+    """Non-negative ints proportional to the (unnormalized, >= 0) `weights`, summing to exactly
+    `total`; ties go to the earlier weight. Also lattice_learning/dataset_config.py's allocation."""
+    w = np.asarray(weights, dtype=np.float64)
+    if (w < 0.0).any():
+        raise ValueError(f"weights must be >= 0, got {weights}")
+    if w.sum() <= 0.0:
+        raise ValueError("at least one weight must be positive")
+    raw = total * w / w.sum()
+    counts = np.floor(raw).astype(int)
+    order = sorted(range(len(w)), key=lambda i: (-(raw[i] - counts[i]), i))
+    for i in order[: total - int(counts.sum())]:
+        counts[i] += 1
+    return counts.tolist()
+
+
 def allocate_counts(ratios: dict[str, float], n: int) -> dict[str, int]:
-    """Largest-remainder split of n by the (unnormalized, >= 0) ratios; sums to exactly n."""
-    if any(w < 0.0 for w in ratios.values()):
-        raise ValueError(f"ratios must be >= 0, got {ratios}")
-    total = sum(ratios.values())
-    if total <= 0.0:
-        raise ValueError("at least one ratio must be positive")
-    raw = {name: n * w / total for name, w in ratios.items()}
-    counts = {name: int(np.floor(v)) for name, v in raw.items()}
-    leftover = n - sum(counts.values())
-    by_remainder = sorted(raw, key=lambda name: (-(raw[name] - counts[name]), CATEGORY_IDS[name]))
-    for name in by_remainder[:leftover]:
-        counts[name] += 1
-    return counts
+    """Largest-remainder split of n by the (unnormalized, >= 0) ratios; sums to exactly n. Ties go
+    to the lower category id."""
+    names = sorted(ratios, key=CATEGORY_IDS.__getitem__)
+    counts = dict(zip(names, largest_remainder([ratios[k] for k in names], n)))
+    return {name: counts[name] for name in ratios}
 
 
 def map_rng(seed: int, category: str, index: int) -> np.random.Generator:
@@ -204,6 +222,12 @@ BUILDERS: dict[str, Callable[[np.random.Generator, float, float], tuple[HeightMa
     "curbs_and_walls": build_curbs_and_walls,
     "rough": build_rough,
 }
+CATEGORY_CONFIGS: dict[str, dict] = {"ramps": RAMPS, "curbs_and_walls": CURBS_AND_WALLS, "rough": ROUGH}
+
+
+def category_extent(category: str, override: float | None) -> float:
+    """m -- `--extent` when given (every category), else the category's own CONFIG "extent"."""
+    return float(override) if override is not None else float(CATEGORY_CONFIGS[category]["extent"])
 
 
 def to_plain(value: object) -> object:
@@ -243,7 +267,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--n", type=int, default=DEFAULT_N)
     parser.add_argument("--ratios", type=str, default=None)
-    parser.add_argument("--extent", type=float, default=DEFAULT_EXTENT)
+    parser.add_argument("--extent", type=float, default=None)
     parser.add_argument("--cell", type=float, default=DEFAULT_CELL)
     parser.add_argument("--out-dir", type=str, default=None)
     parser.add_argument("--dry-run", action="store_true")
@@ -271,7 +295,9 @@ def main() -> None:
     if args.dry_run:
         for category in CATEGORY_IDS:
             if counts[category]:
-                hmap, params = BUILDERS[category](map_rng(args.seed, category, 0), args.extent, args.cell)
+                hmap, params = BUILDERS[category](
+                    map_rng(args.seed, category, 0), category_extent(category, args.extent), args.cell
+                )
                 print("example " + describe(category, f"{category}_i0000", hmap, params))
         print("dry run -- nothing written")
         return
@@ -286,11 +312,12 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     for category, i, name in names:
-        hmap, params = BUILDERS[category](map_rng(args.seed, category, i), args.extent, args.cell)
+        extent = category_extent(category, args.extent)
+        hmap, params = BUILDERS[category](map_rng(args.seed, category, i), extent, args.cell)
         path = out_dir / name
         hmap.save(path)
         write_sidecar_params(
-            path, {"category": category, "index": i, "seed": args.seed, "extent": args.extent,
+            path, {"category": category, "index": i, "seed": args.seed, "extent": extent,
                    "cell": args.cell, **params},
         )
         print(describe(category, name, hmap, params))
@@ -300,11 +327,10 @@ def main() -> None:
         "n": args.n,
         "ratios": ratios,
         "counts": counts,
-        "extent": args.extent,
+        "extent": {c: category_extent(c, args.extent) for c in CATEGORY_IDS},
         "cell": args.cell,
         "category_ids": CATEGORY_IDS,
-        "config": {"ramps": RAMPS, "curbs_and_walls": CURBS_AND_WALLS, "rough": ROUGH,
-                   "base_rough": BASE_ROUGH},
+        "config": {**CATEGORY_CONFIGS, "base_rough": BASE_ROUGH},
     }
     (out_dir / "manifest.yaml").write_text(yaml.safe_dump(to_plain(manifest), sort_keys=False))
     print(f"wrote {len(names)} maps + manifest.yaml to {out_dir}")

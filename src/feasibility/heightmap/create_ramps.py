@@ -41,7 +41,7 @@ output layout. Running this module directly is its smoke test.
 
 CLI parameters:
     --seed INT       RNG seed for the example map (default: 0)
-    --extent FLOAT   full width/height of the square grid in meters (default: 12.0)
+    --extent FLOAT   full width/height of the square grid in meters (default: 14.0)
     --cell FLOAT     grid resolution in meters (default: 0.1)
     --out PATH       if given, save the example map to this stem (.png/.yaml)
 
@@ -62,7 +62,8 @@ from feasibility.heightmap import HeightMapReader
 from feasibility.heightmap.create_curbs_and_walls import GROUND_EPS
 from feasibility.heightmap.create_curbs_and_walls import grid_axes
 
-DEFAULT_EXTENT = 12.0  # m
+DEFAULT_EXTENT = 14.0  # m -- 2 m more than the other lattice map categories: a 5 deg ramp
+# with its 2.1 m platform is up to 10.5 m long and must still place with its foot 2.2 m inside the edge
 DEFAULT_CELL = 0.1  # m
 MAX_PLACEMENT_ATTEMPTS = 200  # placements per drawn ramp shape before the map stops growing
 
@@ -74,8 +75,12 @@ class RampsConfig:
     n_ramps: tuple[int, int] = (1, 3)  # inclusive; an UPPER bound once placement/area binds
     up_deg: tuple[float, float] = (5.0, 80.0)  # rising face: gentle to wall-like
     height: tuple[float, float] = (0.7, 0.7)  # m, plateau height
-    max_length: float = 10.0  # m, cap on s_end (foot to far-side bottom); >= a 5 deg run of 8.0 m
-    plateau: tuple[float, float] = (0.5, 2.5)  # m, flat top length, shortened to fit max_length
+    max_length: float = 10.5  # m, cap on s_end (foot to far-side bottom); >= a 5 deg run of 8.0 m
+    # plus the plateau floor plus an 80 deg drop's 0.12 m
+    plateau: tuple[float, float] = (2.1, 3.0)  # m, flat top length, shortened to fit max_length
+    # but never below the floor: a STANDING PLATFORM for lattice_learning's ramp_down trials, which
+    # start with the whole robot on the plateau -- spawn_sampling.required_platform_length (2.08 m
+    # at the default warm-up); dataset_config.check_maps refuses shorter plateaus for ramp_down.
     width: tuple[float, float] = (0.9, 3.0)  # m, TOP width
     drop_prob: float = 0.5  # chance the far side is a steep drop instead of a down-ramp
     drop_deg: float = 80.0  # far-side angle when it is a drop

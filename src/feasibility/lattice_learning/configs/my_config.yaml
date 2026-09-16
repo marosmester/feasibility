@@ -1,0 +1,91 @@
+# lattice_learning dataset config -- the ONLY input of generate_dataset.py:
+#     python src/feasibility/lattice_learning/generate_dataset.py default
+# (a bare name resolves to this directory; a path works too). Every key is required; see
+# dataset_config.py for the validation and generate_dataset.py's docstring for what a sample is.
+# This file documents every key -- copy it to start a new config.
+#
+# Mix: today's pre-config behaviour, one strategy per map category, in equal thirds.
+
+seed: 0                       # RNG seed for map selection, trial poses, kappa and belief jitter
+
+maps:
+  dir: assets/lattice_maps/0  # repo-root-relative or absolute directory written by
+                              # heightmap/create_maps_for_lattice_learning.py; each map's sidecar
+                              # `category` is what the mix's `map:` refers to
+  n_maps: 200                   # maps drawn in total, split across categories by the mix percents
+                              # (largest-remainder rounding, each category drawn without replacement)
+  trials_per_map: 8          # rows per map, so the dataset has n_maps * trials_per_map rows
+
+trial:                        # what one sample is -- changing these changes the data
+  kappa_max: 2.0              # 1/m, curvature ~ U(-kappa_max, kappa_max) wherever a strategy samples
+                              # it; 2.0 = arc.KAPPA_MAX, the router's 0.5 m minimum turn radius
+  warmup_s: 0.375             # s of captured, commanded ostrich rollout before the recorded arc, so
+                              # every trial enters the arc already moving at V_NOM (design.md s2);
+                              # must be a multiple of OSTRICH_DT = 0.025 s. A placeholder inside
+                              # design.md's expected 0.3-0.45 s, not re-measured against ostrich.
+                              # It also sets the ramp_down standing platform (0.375 s -> 2.08 m).
+  settle_steps: 15            # ostrich steps dropping onto the terrain at zero command, before the
+                              # warm-up (0.375 s at OSTRICH_DT, scaled from learning/'s 12 steps at 30 ms)
+  mu: 0.8                     # ground friction, for ostrich AND helhest_stack's static settle
+  interact_relief: 0.05       # m, plane-relative terrain relief along the arc that counts as the
+                              # arc meeting terrain (interact_dir != 0); low enough for the lowest curb
+  router_cell: 0.24           # m, the router's own lattice cell -> belief xy jitter = router_cell / 2
+                              # (design.md s1c; demos/navigate_partial_view.py's lat_coarsen=4)
+  n_theta: 24                 # the router's heading bin count -> belief yaw jitter = pi / n_theta
+
+run:                          # how the dataset is computed -- does not change the trials
+  chunk: 64                   # ostrich worlds per model build; lower it if the GPU runs out of memory
+  maps_per_build: 10           # maps tiled side by side into one ostrich terrain (tiled_terrain.py);
+                              # 1 = one build per map, the reference path. Trials are identical either
+                              # way, only ostrich's own run-to-run noise differs; raise it when
+                              # trials_per_map is small and the per-build cost dominates.
+  device: cuda:0              # warp device for ostrich and the static settle
+  dry_run: false              # true: print the allocation and sample every allocated map's trials
+                              # (settle on CPU), without simulating or writing anything
+
+ostrich_overrides: []         # Hydra overrides applied to ostrich's "helhest" base config
+                              # (ostrich/examples/conf), e.g. [engine=mujoco]; rendering is forced
+                              # headless and the timestep pinned to OSTRICH_DT regardless
+
+# percent of SAMPLES drawn by `strategy` on maps whose sidecar category is `map`; percents must sum
+# to 100 and each (map, strategy) pair may appear once. Entries on the same category share its maps
+# (each map carries rows of every entry on its category, split by their percents).
+#
+# strategy   eligible map categories           params
+# uniform    any                               (none) -- uniform (pose, kappa) over the whole map
+# targeted   any                               interact_frac
+# ramp_up    ramps                             straight_frac, yaw_jitter_deg, fallback_interact_frac
+# ramp_down  ramps (plateau >= platform)       straight_frac, yaw_jitter_deg, fallback_interact_frac
+# edge       curbs_and_walls, walls, boxes     interact_frac, band, facing_frac, down_frac
+mix:
+  - map: ramps
+    strategy: ramp_up         # head-on UP a face (rising face or far side, 80 deg drops included),
+    percent: 25            # arc origin from before its foot up to the crest
+    params:
+      straight_frac: 0.75     # share of trials driven straight (kappa = 0), the rest kappa ~ U(+-kappa_max)
+      yaw_jitter_deg: 5.0     # mid-arc heading off the face axis, uniform +-
+      fallback_interact_frac: 0.5  # if the faces cannot supply enough trials, the rest are drawn
+                              # uniformly with this share meeting terrain (null = plain uniform)
+
+  - map: ramps
+    strategy: ramp_down         # head-on UP a face (rising face or far side, 80 deg drops included),
+    percent: 25            # arc origin from before its foot up to the crest
+    params:
+      straight_frac: 0.75     # share of trials driven straight (kappa = 0), the rest kappa ~ U(+-kappa_max)
+      yaw_jitter_deg: 5.0     # mid-arc heading off the face axis, uniform +-
+      fallback_interact_frac: 0.5  # if the faces cannot supply enough trials, the rest are drawn
+                              # uniformly with this share meeting terrain (null = plain uniform)
+
+  - map: curbs_and_walls
+    strategy: edge            # arc origins near a height edge (a >45 deg step, found from the grid)
+    percent: 25
+    params:
+      interact_frac: 0.5      # exact share of trials whose arc meets the edge (null = no strata)
+      band: 1.5               # m, arc origins at most this far from an edge
+      facing_frac: 0.7        # share of proposals heading at the nearest edge (+-45 deg), the rest any heading
+      down_frac: 0.5          # share of the interacting trials that drive DOWN an edge, the rest climb UP
+
+  - map: rough
+    strategy: uniform         # flat and low-amplitude rough ground: the negatives, nothing to aim at
+    percent: 25
+    params: {}

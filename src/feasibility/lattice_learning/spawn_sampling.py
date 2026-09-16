@@ -6,11 +6,11 @@ Three decisions, all independent of any per-map height threshold:
 * **Validity -- the planner's own static settle.** A trial needs helhest_stack's settle to be
   feasible (`settle.settle_feasible`: pitch/roll envelope, residual, chassis clearance) at the
   spawn, and the patch at the arc origin to stay on mapped terrain. Whether the NOMINAL arc end
-  must be settle-feasible too depends on the strategy (`SamplingPolicy.spawn_only_strategies`):
+  must be settle-feasible too depends on the strategy (`dataset_config.StrategySpec.spawn_only`):
   - `uniform`/`targeted` keep the arc-end check: without it, most arcs aimed at a tall obstacle
     end where the planner says `blocked` (measured 25% end-feasible among interacting trials vs
     92% for the rest), which is not those maps' regime.
-  - `ramp`/`edge` drop it: those maps exist to show what ostrich does when the robot drives at a
+  - `ramp_up`/`ramp_down`/`edge` drop it: those maps exist to show what ostrich does when the robot drives at a
     wall-like ramp or tries to climb up / drive down a 1.0 m edge, which is exactly where the
     settle says `blocked`. generate_dataset.py records every row's `endpoint_blocked`, so a
     consumer can still drop them (custom_dataset.py's `drop_blocked_endpoints`).
@@ -26,40 +26,51 @@ Three decisions, all independent of any per-map height threshold:
   largest departure is ABOVE the plane (climbing up: a step, a wall, the foot of a ramp) and -1
   when BELOW (driving down: off a box top, over a crest), 0 when it does not interact.
 
-* **Strategy per map category -- `sample_map_trials`.** The map's sidecar `category` (written by
-  heightmap/create_maps_for_lattice_learning.py) picks how its trials are drawn:
+* **Strategies.** Which strategy runs on which map category, with which params and on what share
+  of the dataset, is NOT decided here: generate_dataset.py's YAML config lists a `mix`, and
+  dataset_config.py (its registry `STRATEGIES`) validates it and calls one of these per map:
 
-  - `ramps` (`ramp_categories`) -> `sample_ramp_trials`: every trial drives UP a ramp face, head
-    on, so divergence can be read against a continuous slope angle (`SpawnBatch.ramp_deg`). The
-    faces come from the sidecar's `ramps` list: each rising face and each far side (a down-ramp,
-    or a steep drop -- a wall-like face driven at from its foot). A trial picks a face, puts the
-    arc origin's front axle at `ramp_s` ~ U(-ARC_LEN - wheel_radius, run - ARC_LEN) metres along
-    it from the foot -- from where the front wheel just reaches the foot at the arc end, up to the
-    crest; a 0.3 m arc after a 0.225 m warm-up cannot climb a long ramp from its foot, so to see
-    the face at all the arc must also be allowed to START on it -- anywhere across its top width,
-    with the heading at MID-arc along the face +- `ramp_yaw_jitter_deg`. A `ramp_straight_frac`
-    share drives straight (kappa = 0), the rest on kappa ~ U(-kappa_max, kappa_max). Every wheel
-    contact from spawn to arc end must stay inside the face's top width and on that ramp's own
-    surface (compared against the ramp rasterised on the terrain's grid, so bilinear interpolation
-    of an 80 deg face matches exactly and a second ramp overlapping it rejects the trial). Spawns
-    past the climb envelope fail the settle, so on a steep face trials start before its foot.
-  - `curbs_and_walls` (`edge_categories`, also the retired `walls`/`boxes`) -> `sample_edge_trials`:
-    arc origins uniform among cells within `edge_band` of a height EDGE (a cell whose neighbour is
-    steeper than EDGE_MIN_SLOPE_DEG -- found from the heightmap alone, no sidecar needed), heading
-    at the nearest edge +- EDGE_FACING_CONE_DEG with probability `edge_facing_frac`, else uniform.
-    Exactly `round(n * interact_frac)` trials interact, `edge_down_frac` of them driving down and
-    the rest climbing up; the remainder are near an edge but do not meet it.
-  - `untargeted_categories` (default `rough`) -> `sample_trials(interact_frac=None)`: uniform
-    (pose, kappa) over the whole map.
-  - anything else (and maps with no sidecar category) -> targeted `sample_trials`: uniform
-    proposals, exactly `round(n * interact_frac)` interacting.
+  - `ramp_up` -> `sample_ramp_up_trials` (maps with a create_ramps.py sidecar `ramps` list): every
+    trial drives UP a ramp face, head on, so divergence can be read against a continuous slope
+    angle (`SpawnBatch.ramp_deg`). The faces come from the sidecar's `ramps` list: each rising
+    face and each far side (a down-ramp, or a steep drop -- a wall-like face driven at from its
+    foot). A trial picks a face, puts the arc origin's front axle at `ramp_s` ~ U(-ARC_LEN -
+    wheel_radius, run - ARC_LEN) metres along it from the foot -- from where the front wheel just
+    reaches the foot at the arc end, up to the crest; a 0.3 m arc after a 0.225 m warm-up cannot
+    climb a long ramp from its foot, so to see the face at all the arc must also be allowed to
+    START on it -- anywhere across its top width, with the heading at MID-arc along the face +-
+    `yaw_jitter_deg`. A `straight_frac` share drives straight (kappa = 0), the rest on kappa ~
+    U(-kappa_max, kappa_max). Every wheel contact from spawn to arc end must stay inside the
+    face's top width and on that ramp's own surface (compared against the ramp rasterised on the
+    terrain's grid, so bilinear interpolation of an 80 deg face matches exactly and a second ramp
+    overlapping it rejects the trial). Spawns past the climb envelope fail the settle, so on a
+    steep face trials start before its foot.
+  - `ramp_down` -> `sample_ramp_down_trials`: the exact mirror. The entry point is the face's
+    CREST and the robot heads downhill, so `ramp_s` runs from where the front wheel just reaches
+    the crest at the arc end (the robot standing on the plateau) to where the arc ends at the
+    foot. Drops are faces too, so some trials drive off an 80 deg edge. The earliest spawn needs
+    `required_platform_length` of plateau behind the crest; create_ramps.py's plateau floor is
+    sized for it and dataset_config.check_maps refuses maps whose sidecar plateaus are shorter.
+  - `edge` -> `sample_edge_trials`: arc origins uniform among cells within `band` of a height
+    EDGE (a cell whose neighbour is steeper than EDGE_MIN_SLOPE_DEG -- found from the heightmap
+    alone, no sidecar needed), heading at the nearest edge +- EDGE_FACING_CONE_DEG with
+    probability `facing_frac`, else uniform. Exactly `round(n * interact_frac)` trials interact,
+    `down_frac` of them driving down and the rest climbing up; the remainder are near an edge but
+    do not meet it.
+  - `uniform` -> `sample_trials(interact_frac=None)`: uniform (pose, kappa) over the whole map.
+  - `targeted` -> `sample_trials(interact_frac)`: uniform proposals, exactly
+    `round(n * interact_frac)` interacting.
+
+  Several strategies can share one map; `concat_batches` merges their trials and SpawnBatch
+  carries `strategy`/`targeted` per row.
 
   Every stratified strategy is exact conditional sampling from its proposal: candidates are
   labelled by `arc_relief`, and each stratum is filled uniformly from the candidates carrying its
   label. If a stratum cannot be filled within `MAX_PROPOSAL_ROUNDS`, its deficit moves to a
   fallback stratum (down -> up -> non-interacting) and is counted in `SpawnBatch.shortfall`; only
   a map with too few valid spawns at all raises. A ramp map whose faces cannot supply enough
-  trials falls back to `sample_trials` for the rest.
+  trials falls back to `sample_trials` (`fallback_interact_frac`) for the rest, still labelled
+  with the ramp strategy but with NaN `ramp_deg`/`ramp_s`.
 
 Where the arc starts: every trial is entered at speed after a warm-up of `lead` metres along the
 same curvature (generate_dataset.py's `warmup_s * V_NOM`), so relief and the overhang check are
@@ -68,9 +79,9 @@ evaluated from the NOMINAL arc origin `integrate_arc(spawn, kappa, lead)`, not f
 Deliberately independent of `feasibility.learning`, `feasibility.grid_learning` and
 `feasibility.grid_learning_2` (design.md section 11a).
 
-Usage (smoke test -- synthetic maps on CPU, no assets; the first run compiles the settle kernels):
+Usage (smoke test -- synthetic maps on CPU, no assets; the first run compiles the settle kernels;
+per-map stats on real maps come from generate_dataset.py's `run.dry_run: true`):
     python src/feasibility/lattice_learning/spawn_sampling.py
-    python src/feasibility/lattice_learning/spawn_sampling.py --maps-dir assets/lattice_maps/0
 """
 from __future__ import annotations
 
@@ -94,28 +105,12 @@ from feasibility.lattice_learning.patch import WHEEL_CONTACTS_LOCAL
 from feasibility.lattice_learning.settle import settle_batch
 from feasibility.lattice_learning.settle import settle_feasible
 
-DEFAULT_INTERACT_FRAC: float | None = 0.5  # share of a stratified map's trials whose arc meets
-# terrain; None = no interaction strata anywhere (plain draws from each strategy's proposal)
-DEFAULT_INTERACT_RELIEF = 0.05  # m -- low enough that the lowest curb counts as an interaction
-DEFAULT_UNTARGETED_CATEGORIES = ("rough",)  # sidecar categories sampled uniformly: flat and
-# low-amplitude rough ground are negatives, there is nothing on them to aim at
-
-DEFAULT_RAMP_CATEGORIES = ("ramps",)  # sidecar categories sampled by sample_ramp_trials
-DEFAULT_RAMP_STRAIGHT_FRAC = 0.75  # share of ramp trials driven straight (kappa = 0)
-DEFAULT_RAMP_YAW_JITTER_DEG = 5.0  # mid-arc heading off the face's uphill axis, uniform +-
-
-DEFAULT_EDGE_CATEGORIES = ("curbs_and_walls", "walls", "boxes")  # sampled by sample_edge_trials;
-# walls/boxes are create_maps_for_lattice_learning.py's retired categories, so old maps get it too
-DEFAULT_EDGE_BAND = 1.5  # m, arc origins at most this far from an edge
-DEFAULT_EDGE_FACING_FRAC = 0.7  # share of edge proposals heading at the nearest edge
-DEFAULT_EDGE_DOWN_FRAC = 0.5  # share of an edge map's interacting trials that drive DOWN
-
-DEFAULT_SPAWN_ONLY_STRATEGIES = ("ramp", "edge")  # no arc-end settle check, see module docstring
-
 RAMP_MAX_FACE_DEG = 90.0  # every face is driven at, including 80 deg drops
 RAMP_SIDE_MARGIN = 0.05  # m, wheel contacts stay this far inside the face's top width
 RAMP_SURFACE_TOL = 0.03  # m, |terrain - that ramp alone| at a contact; catches a second ramp
 # overlapping the face (and a rough base layer, which would reject every trial if enabled)
+PLATFORM_MARGIN = 0.1  # m, added to the footprint in required_platform_length: heading jitter and
+# curvature swing the rear wheel off the face axis
 
 EDGE_MIN_SLOPE_DEG = 45.0  # a cell is an edge when a neighbour rises/falls steeper than this
 EDGE_FACING_CONE_DEG = 45.0  # heading at the nearest edge, uniform +-
@@ -134,13 +129,14 @@ class SpawnBatch:
     pose: np.ndarray  # [n, 3] float64 spawn (x, y, yaw)
     kappa: np.ndarray  # [n] float32 arc curvature, 1/m
     arc_relief: np.ndarray  # [n] float32 m, see arc_relief()
-    targeted: bool  # whether this map's trials were stratified by interaction
+    targeted: np.ndarray  # [n] bool, whether the trial's strategy stratified by interaction
     shortfall: int  # stratified trials requested but substituted from a fallback stratum
     proposal_interact_rate: float  # natural share of interacting proposal candidates
-    strategy: str = "targeted"  # "uniform" | "targeted" | "ramp" | "edge"
+    strategy: np.ndarray  # [n] str: uniform | targeted | ramp_up | ramp_down | edge
     ramp_deg: np.ndarray | None = None  # [n] float32 slope of the face driven, NaN = not a ramp trial
     ramp_s: np.ndarray | None = None  # [n] float32 m, arc origin's front axle along the face from
-    # its foot (negative = still before the foot), NaN = not a ramp trial
+    # its entry point in the direction of travel -- the foot for ramp_up, the crest for ramp_down
+    # (negative = not on the face yet), NaN = not a ramp trial
     interact_dir: np.ndarray | None = None  # [n] int8 +1 up / -1 down / 0 not interacting
     endpoint_feasible: np.ndarray | None = None  # [n] bool, static settle at the NOMINAL arc end
 
@@ -154,47 +150,26 @@ class SpawnBatch:
             self.endpoint_feasible = np.ones(n, dtype=bool)
 
 
-@dataclasses.dataclass(frozen=True)
-class SamplingPolicy:
-    """How `sample_map_trials` picks a strategy from a map's sidecar category, and each strategy's
-    knobs. generate_dataset.py builds one from its Hydra overrides."""
-
-    interact_frac: float | None = DEFAULT_INTERACT_FRAC
-    interact_relief: float = DEFAULT_INTERACT_RELIEF
-    untargeted_categories: tuple[str, ...] = DEFAULT_UNTARGETED_CATEGORIES
-    ramp_categories: tuple[str, ...] = DEFAULT_RAMP_CATEGORIES
-    ramp_straight_frac: float = DEFAULT_RAMP_STRAIGHT_FRAC
-    ramp_yaw_jitter_deg: float = DEFAULT_RAMP_YAW_JITTER_DEG
-    edge_categories: tuple[str, ...] = DEFAULT_EDGE_CATEGORIES
-    edge_band: float = DEFAULT_EDGE_BAND
-    edge_facing_frac: float = DEFAULT_EDGE_FACING_FRAC
-    edge_down_frac: float = DEFAULT_EDGE_DOWN_FRAC
-    spawn_only_strategies: tuple[str, ...] = DEFAULT_SPAWN_ONLY_STRATEGIES
-
-
 def map_metadata(stem: str | pathlib.Path) -> dict:
     """A map's whole .yaml sidecar (create_maps_for_lattice_learning.py adds `category` and the
     builder's params, e.g. the `ramps` list, to HeightMapReader's own keys)."""
     return yaml.safe_load(pathlib.Path(stem).with_suffix(".yaml").read_text()) or {}
 
 
-def map_category(stem: str | pathlib.Path) -> str | None:
-    """The `category` key a create_maps_for_lattice_learning.py sidecar carries, or None for maps
-    from other generators (which are then targeted)."""
-    return map_metadata(stem).get("category")
-
-
-def map_strategy(meta: dict, policy: SamplingPolicy) -> str:
-    """"ramp" | "edge" | "uniform" | "targeted" for a map with sidecar `meta`, checked in that
-    order -- see the module docstring."""
-    category = meta.get("category")
-    if category in policy.ramp_categories:
-        return "ramp"
-    if category in policy.edge_categories:
-        return "edge"
-    if policy.interact_frac is None or category in policy.untargeted_categories:
-        return "uniform"
-    return "targeted"
+def concat_batches(batches: list[SpawnBatch], rng: np.random.Generator) -> SpawnBatch:
+    """One map's trials from several strategies, as one batch in a random row order (so chunk order
+    never correlates with strategy). `shortfall` sums; `proposal_interact_rate` is NaN when more
+    than one batch contributes, since the rates come from different proposals."""
+    batches = [b for b in batches if len(b.pose)]
+    if len(batches) == 1:
+        return batches[0]
+    order = rng.permutation(sum(len(b.pose) for b in batches))
+    rows = {
+        f.name: np.concatenate([getattr(b, f.name) for b in batches])[order]
+        for f in dataclasses.fields(SpawnBatch)
+        if f.name not in ("shortfall", "proposal_interact_rate")
+    }
+    return SpawnBatch(**rows, shortfall=sum(b.shortfall for b in batches), proposal_interact_rate=float("nan"))
 
 
 def relief_lookahead(interact_relief: float) -> float:
@@ -368,7 +343,8 @@ def stratified_fill(
 
 
 def batch_from_rows(
-    rows: np.ndarray, rng: np.random.Generator, interact_relief: float, **fields: object
+    rows: np.ndarray, rng: np.random.Generator, interact_relief: float, *, strategy: str,
+    targeted: bool, **fields: object
 ) -> SpawnBatch:
     """SpawnBatch from `stratified_fill`'s rows, shuffled so chunk order never correlates with
     which stratum a trial came from."""
@@ -379,6 +355,8 @@ def batch_from_rows(
         arc_relief=rows[:, 4].astype(np.float32),
         interact_dir=interaction_dir(rows[:, 4], rows[:, 5], interact_relief),
         endpoint_feasible=rows[:, 6] > 0.5,
+        strategy=np.full(len(rows), strategy),
+        targeted=np.full(len(rows), targeted),
         **fields,
     )
 
@@ -393,8 +371,8 @@ def sample_trials(
     lead: float,
     mu: float,
     device: str,
-    interact_frac: float | None = DEFAULT_INTERACT_FRAC,
-    interact_relief: float = DEFAULT_INTERACT_RELIEF,
+    interact_frac: float | None,
+    interact_relief: float,
     require_endpoint: bool = True,
     robot: RobotParams | None = None,
 ) -> SpawnBatch:
@@ -475,11 +453,11 @@ def sample_edge_trials(
     lead: float,
     mu: float,
     device: str,
-    interact_frac: float | None = DEFAULT_INTERACT_FRAC,
-    interact_relief: float = DEFAULT_INTERACT_RELIEF,
-    band: float = DEFAULT_EDGE_BAND,
-    facing_frac: float = DEFAULT_EDGE_FACING_FRAC,
-    down_frac: float = DEFAULT_EDGE_DOWN_FRAC,
+    interact_frac: float | None,
+    interact_relief: float,
+    band: float,
+    facing_frac: float,
+    down_frac: float,
     require_endpoint: bool = False,
     robot: RobotParams | None = None,
 ) -> SpawnBatch:
@@ -506,7 +484,7 @@ def sample_edge_trials(
             interact_frac=interact_frac, interact_relief=interact_relief,
             require_endpoint=require_endpoint, robot=robot,
         )
-        return dataclasses.replace(rest, shortfall=n, strategy="edge")
+        return dataclasses.replace(rest, shortfall=n, strategy=np.full(n, "edge"))
 
     cone = np.radians(EDGE_FACING_CONE_DEG)
     dist, near_x, near_y = field.dist.ravel(), field.nearest_x.ravel(), field.nearest_y.ravel()
@@ -592,37 +570,54 @@ def ramp_alone(terrain: HeightMapReader, ramp: Ramp) -> HeightMapReader:
     return HeightMapReader(ramp_height(ramp, X, Y), origin=(terrain.x0, terrain.y0), cell=terrain.cell)
 
 
-def sample_ramp_trials(
+def required_platform_length(lead: float, robot: RobotParams | None = None) -> float:
+    """m -- the plateau length a `ramp_down` trial needs for the robot's whole footprint to stand on
+    it at the earliest spawn. That spawn puts the arc origin's front axle ARC_LEN + wheel_radius
+    before the crest (the front wheel just reaches the crest at the arc end), `lead` further back
+    for the warm-up; the rear wheel's back edge is rear_offset + wheel_radius behind the front axle.
+    create_ramps.RampsConfig.plateau's floor is sized from this at the default lead."""
+    robot = robot or _ROBOT
+    r = float(robot.wheel_radius)
+    return ARC_LEN + r + lead + float(robot.rear_offset) + r + PLATFORM_MARGIN
+
+
+def _sample_face_trials(
     terrain: HeightMapReader,
     faces: list[RampFace],
     spec: PatchSpec,
     n: int,
     rng: np.random.Generator,
     *,
+    direction: int,
     kappa_max: float,
     lead: float,
     mu: float,
     device: str,
-    straight_frac: float = DEFAULT_RAMP_STRAIGHT_FRAC,
-    yaw_jitter_deg: float = DEFAULT_RAMP_YAW_JITTER_DEG,
-    interact_relief: float = DEFAULT_INTERACT_RELIEF,
-    fallback_interact_frac: float | None = DEFAULT_INTERACT_FRAC,
+    straight_frac: float,
+    yaw_jitter_deg: float,
+    interact_relief: float,
+    fallback_interact_frac: float | None,
     require_endpoint: bool = False,
     robot: RobotParams | None = None,
 ) -> SpawnBatch:
-    """`n` trials driving head-on up the given ramp faces -- see the module docstring. Faces are
-    picked uniformly per candidate. If too few candidates survive (no faces, or every face too
-    narrow or too crowded for a feasible spawn), the remainder is filled by `sample_trials` with
-    `fallback_interact_frac` and counted in `shortfall`."""
+    """The ramp sampler for both directions. `direction` +1 drives UP a face from its foot, -1
+    drives DOWN it from its crest; `s` below is measured from that entry point along the direction
+    of travel, so the whole proposal is the same expression either way."""
     if not 0.0 <= straight_frac <= 1.0:
         raise ValueError(f"straight_frac must be in [0, 1], got {straight_frac}")
-    robot = robot or RobotParams()
+    robot = robot or _ROBOT
     lookahead = relief_lookahead(interact_relief)
     jitter = np.radians(yaw_jitter_deg)
     local = WHEEL_CONTACTS_LOCAL
     window = np.linspace(-lead, ARC_LEN, ARC_SAMPLES)  # spawn ... arc end, relative to the origin
-    s_min = -ARC_LEN - float(robot.wheel_radius)  # front wheel just reaches the foot at arc end
+    s_min = -ARC_LEN - float(robot.wheel_radius)  # front wheel just reaches the entry at arc end
     surfaces = {f.ramp_index: ramp_alone(terrain, f.ramp) for f in faces}
+    foot_x, foot_y, face_yaw, face_run, face_half_w, face_slope = (
+        np.array([getattr(f, k) for f in faces])
+        for k in ("foot_x", "foot_y", "yaw", "run", "half_width", "slope_deg")
+    )
+    entry = 0.0 if direction > 0 else 1.0  # entry point: the foot going up, the crest going down
+    turn = 0.0 if direction > 0 else np.pi  # heading of travel relative to the uphill axis
 
     got: list[np.ndarray] = []
     count = 0
@@ -631,19 +626,19 @@ def sample_ramp_trials(
             break
         m = PROPOSAL_BATCH
         face_idx = rng.integers(0, len(faces), m)
-        fx = np.array([f.foot_x for f in faces])[face_idx]
-        fy = np.array([f.foot_y for f in faces])[face_idx]
-        fyaw = np.array([f.yaw for f in faces])[face_idx]
-        run = np.array([f.run for f in faces])[face_idx]
-        half_w = np.array([f.half_width for f in faces])[face_idx]
+        fx, fy, fyaw, run = foot_x[face_idx], foot_y[face_idx], face_yaw[face_idx], face_run[face_idx]
+        half_w = face_half_w[face_idx]
+        c, s = np.cos(fyaw), np.sin(fyaw)  # the face's uphill axis
+        ex, ey = fx + entry * run * c, fy + entry * run * s
+        travel = fyaw + turn
 
         s0 = rng.uniform(s_min, np.maximum(run - ARC_LEN, s_min))
         t0 = rng.uniform(-half_w, half_w)
         kappa = np.where(rng.uniform(size=m) < straight_frac, 0.0, rng.uniform(-kappa_max, kappa_max, m))
         # heading along the face at MID-arc, so a curved arc bends symmetrically about the axis
-        yaw0 = fyaw + rng.uniform(-jitter, jitter, m) - kappa * ARC_LEN / 2.0
-        c, s = np.cos(fyaw), np.sin(fyaw)
-        origin = np.column_stack([fx + s0 * c - t0 * s, fy + s0 * s + t0 * c, yaw0])
+        yaw0 = travel + rng.uniform(-jitter, jitter, m) - kappa * ARC_LEN / 2.0
+        tc, ts = np.cos(travel), np.sin(travel)
+        origin = np.column_stack([ex + s0 * tc - t0 * ts, ey + s0 * ts + t0 * tc, yaw0])
 
         # every wheel contact from spawn to arc end inside the top width and on this ramp's surface
         on_face = np.ones(m, dtype=bool)
@@ -667,7 +662,7 @@ def sample_ramp_trials(
         base_ok, end_ok = trials_feasible(terrain, spec, spawn, kappa[idx], lead, mu, device, robot)
         ok = base_ok & end_ok if require_endpoint else base_ok
         keep = np.flatnonzero(ok)[: n - count]
-        slope = np.array([f.slope_deg for f in faces])[face_idx[idx[keep]]]
+        slope = face_slope[face_idx[idx[keep]]]
         got.append(np.column_stack([spawn[keep], kappa[idx[keep]], slope, s0[idx[keep]], end_ok[keep]]))
         count += len(keep)
 
@@ -678,9 +673,9 @@ def sample_ramp_trials(
     end_feasible = rows[:, 6] > 0.5
     if len(rows):
         relief, sign = arc_relief_signed(terrain, pose, rows[:, 3], lead, lookahead)
-        direction = interaction_dir(relief, sign, interact_relief)
+        interact = interaction_dir(relief, sign, interact_relief)
     else:
-        relief, direction = np.zeros(0), np.zeros(0, dtype=np.int8)
+        relief, interact = np.zeros(0), np.zeros(0, dtype=np.int8)
     if shortfall:
         rest = sample_trials(
             terrain, spec, shortfall, rng, kappa_max=kappa_max, lead=lead, mu=mu, device=device,
@@ -691,7 +686,7 @@ def sample_ramp_trials(
         pose = np.concatenate([pose, rest.pose])
         kap = np.concatenate([kap, rest.kappa])
         relief = np.concatenate([relief, rest.arc_relief])
-        direction = np.concatenate([direction, rest.interact_dir])
+        interact = np.concatenate([interact, rest.interact_dir])
         end_feasible = np.concatenate([end_feasible, rest.endpoint_feasible])
         ramp_deg, ramp_s = np.concatenate([ramp_deg, nan]), np.concatenate([ramp_s, nan])
     order = rng.permutation(n)
@@ -699,49 +694,36 @@ def sample_ramp_trials(
         pose=pose[order],
         kappa=kap[order],
         arc_relief=relief[order].astype(np.float32),
-        targeted=True,
+        targeted=np.ones(n, dtype=bool),
         shortfall=shortfall,
         proposal_interact_rate=float("nan"),
-        strategy="ramp",
+        strategy=np.full(n, "ramp_up" if direction > 0 else "ramp_down"),
         ramp_deg=ramp_deg[order],
         ramp_s=ramp_s[order],
-        interact_dir=direction[order],
+        interact_dir=interact[order],
         endpoint_feasible=end_feasible[order],
     )
 
 
-def sample_map_trials(
-    terrain: HeightMapReader,
-    meta: dict,
-    spec: PatchSpec,
-    n: int,
-    rng: np.random.Generator,
-    *,
-    kappa_max: float,
-    lead: float,
-    mu: float,
-    device: str,
-    policy: SamplingPolicy = SamplingPolicy(),
-    robot: RobotParams | None = None,
+def sample_ramp_up_trials(
+    terrain: HeightMapReader, faces: list[RampFace], spec: PatchSpec, n: int,
+    rng: np.random.Generator, **kw: object,
 ) -> SpawnBatch:
-    """`n` trials on one map, drawn by the strategy its sidecar `meta` selects (`map_strategy`)."""
-    strategy = map_strategy(meta, policy)
-    kw = dict(kappa_max=kappa_max, lead=lead, mu=mu, device=device,
-              interact_relief=policy.interact_relief, robot=robot,
-              require_endpoint=strategy not in policy.spawn_only_strategies)
-    if strategy == "ramp":
-        return sample_ramp_trials(
-            terrain, ramp_faces(meta), spec, n, rng, straight_frac=policy.ramp_straight_frac,
-            yaw_jitter_deg=policy.ramp_yaw_jitter_deg, fallback_interact_frac=policy.interact_frac,
-            **kw,
-        )
-    if strategy == "edge":
-        return sample_edge_trials(
-            terrain, spec, n, rng, interact_frac=policy.interact_frac, band=policy.edge_band,
-            facing_frac=policy.edge_facing_frac, down_frac=policy.edge_down_frac, **kw,
-        )
-    frac = None if strategy == "uniform" else policy.interact_frac
-    return sample_trials(terrain, spec, n, rng, interact_frac=frac, **kw)
+    """`n` trials driving head-on UP the given faces -- see the module docstring. Faces are picked
+    uniformly per candidate. If too few candidates survive (no faces, or every face too narrow or
+    too crowded for a feasible spawn), the remainder is filled by `sample_trials` with
+    `fallback_interact_frac` and counted in `shortfall`. Keywords: `_sample_face_trials`'s."""
+    return _sample_face_trials(terrain, faces, spec, n, rng, direction=1, **kw)
+
+
+def sample_ramp_down_trials(
+    terrain: HeightMapReader, faces: list[RampFace], spec: PatchSpec, n: int,
+    rng: np.random.Generator, **kw: object,
+) -> SpawnBatch:
+    """`n` trials driving head-on DOWN the given faces from their crest -- the mirror of
+    `sample_ramp_up_trials`, drops included (driving off an 80 deg drop). The earliest spawn stands
+    on the plateau, which must be `required_platform_length` long for the whole robot to fit."""
+    return _sample_face_trials(terrain, faces, spec, n, rng, direction=-1, **kw)
 
 
 if __name__ == "__main__":
@@ -754,15 +736,17 @@ if __name__ == "__main__":
     from feasibility.lattice_learning.arc import V_NOM
 
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--maps-dir", default=None, help="also report per-map stats for every *.png here")
-    ap.add_argument("--n", type=int, default=64, help="trials per map for --maps-dir (default: 64)")
     ap.add_argument("--device", default="cpu")
     args = ap.parse_args()
 
     wp.init()
     spec = PatchSpec()
-    lead = 0.375 * V_NOM  # generate_dataset.py's DEFAULT_WARMUP_S
-    kw = dict(kappa_max=KAPPA_MAX, lead=lead, mu=0.8, device=args.device)
+    lead = 0.375 * V_NOM  # configs/default.yaml's trial.warmup_s
+    relief_thr = 0.05  # configs/default.yaml's trial.interact_relief
+    kw = dict(kappa_max=KAPPA_MAX, lead=lead, mu=0.8, device=args.device, interact_relief=relief_thr)
+    # configs/default.yaml's mix params
+    edge_kw = dict(interact_frac=0.5, band=1.5, facing_frac=0.7, down_frac=0.5)
+    ramp_kw = dict(straight_frac=0.75, yaw_jitter_deg=5.0, fallback_interact_frac=0.5)
     rng = np.random.default_rng(0)
 
     xs = np.arange(-8.0, 8.0, 0.05) + 0.025
@@ -779,6 +763,7 @@ if __name__ == "__main__":
     fb = sample_trials(flat, spec, 32, rng, interact_frac=0.5, **kw)
     assert fb.pose.shape == (32, 3) and fb.shortfall == 16 and (fb.arc_relief == 0).all()
     assert (fb.interact_dir == 0).all() and fb.endpoint_feasible.all()
+    assert fb.strategy.shape == (32,) and (fb.strategy == "targeted").all() and fb.targeted.all()
 
     # 0.2 m box: exact stratification, patch at the arc origin on the map, spawns AND arc ends
     # settle-feasible (including some spawns on the box top).
@@ -787,7 +772,7 @@ if __name__ == "__main__":
                           origin=(-8.0, -8.0), cell=0.05)
     t0 = time.perf_counter()
     b = sample_trials(box, spec, 200, rng, interact_frac=0.5, **kw)
-    interacts = b.arc_relief > DEFAULT_INTERACT_RELIEF
+    interacts = b.arc_relief > relief_thr
     assert interacts.sum() == 100 and b.shortfall == 0, (interacts.sum(), b.shortfall)
     assert ((b.interact_dir != 0) == interacts).all() and b.endpoint_feasible.all()
     assert not patch_overhangs(box, integrate_arc(b.pose, b.kappa, lead), spec).any()
@@ -811,16 +796,15 @@ if __name__ == "__main__":
     walls = np.maximum(walls, np.where((np.abs(X - 2.5) < 0.1) & (np.abs(Y) < 2.0), 1.0, 0.0))
     wall_map = HeightMapReader(walls, origin=(-8.0, -8.0), cell=0.05)
     t0 = time.perf_counter()
-    policy = SamplingPolicy()
-    eb = sample_map_trials(wall_map, {"category": "curbs_and_walls"}, spec, 200, rng, policy=policy, **kw)
+    eb = sample_edge_trials(wall_map, spec, 200, rng, **edge_kw, **kw)
     n_up, n_down = int((eb.interact_dir > 0).sum()), int((eb.interact_dir < 0).sum())
-    assert eb.strategy == "edge" and eb.shortfall == 0, (eb.strategy, eb.shortfall)
+    assert (eb.strategy == "edge").all() and eb.shortfall == 0, eb.shortfall
     assert n_up + n_down == 100 and n_down == 50, (n_up, n_down)
     field = edge_field(wall_map)
     origin = integrate_arc(eb.pose, eb.kappa, lead)
     col = np.clip(((origin[:, 0] - wall_map.x0) / wall_map.cell).astype(int), 0, wall_map.nx - 1)
     row = np.clip(((origin[:, 1] - wall_map.y0) / wall_map.cell).astype(int), 0, wall_map.ny - 1)
-    assert (field.dist[row, col] <= policy.edge_band + 1e-9).all()
+    assert (field.dist[row, col] <= edge_kw["band"] + 1e-9).all()
     base_ok, end_ok = trials_feasible(wall_map, spec, eb.pose, eb.kappa, lead, 0.8, args.device, RobotParams())
     assert base_ok.all() and np.array_equal(end_ok, eb.endpoint_feasible)
     assert (~eb.endpoint_feasible).any(), "spawn-only edge trials should include blocked arc ends"
@@ -830,14 +814,17 @@ if __name__ == "__main__":
           f"ends, {down_on_box:.0%} of down spawns on the box, {time.perf_counter() - t0:.2f}s")
     print("edge checks ok")
 
-    # Ramps: every trial head-on up a face, straight share ~ ramp_straight_frac, mid-arc heading
-    # within the jitter of the uphill axis, all wheel contacts on that face's surface.
+    # Ramps, both directions: every trial head-on along a face, straight share ~ straight_frac,
+    # mid-arc heading within the jitter of the face axis (uphill / downhill), wheel contacts on
+    # that face's surface. Plateaus are create_ramps.RampsConfig's standing-platform floor.
     from feasibility.heightmap.create_ramps import ramp_layer
 
+    platform = required_platform_length(lead)
+    assert 2.0 < platform <= 2.1, platform  # create_ramps.RampsConfig.plateau[0] = 2.1 is sized on it
     ramps = [
-        Ramp(cx=-2.0, cy=0.0, yaw=0.3, up_deg=12.0, height=0.5, plateau=1.0, down_deg=80.0,
+        Ramp(cx=-3.0, cy=-2.0, yaw=0.3, up_deg=12.0, height=0.5, plateau=2.1, down_deg=80.0,
              width=1.6, side_deg=80.0),
-        Ramp(cx=2.5, cy=1.0, yaw=2.0, up_deg=20.0, height=0.4, plateau=1.0, down_deg=8.0,
+        Ramp(cx=2.5, cy=2.5, yaw=2.0, up_deg=20.0, height=0.4, plateau=2.1, down_deg=8.0,
              width=2.0, side_deg=80.0),
     ]
     ramp_map = HeightMapReader(np.maximum(*(ramp_layer(r, 16.0, 0.05) for r in ramps)),
@@ -845,48 +832,49 @@ if __name__ == "__main__":
     meta = {"category": "ramps", "ramps": [dataclasses.asdict(r) for r in ramps]}
     faces = ramp_faces(meta)
     assert sorted(round(f.slope_deg) for f in faces) == [8, 12, 20, 80], "drop is a face too"
-    t0 = time.perf_counter()
-    rb = sample_map_trials(ramp_map, meta, spec, 400, rng, policy=policy, **kw)
-    assert rb.strategy == "ramp" and rb.shortfall == 0 and np.isfinite(rb.ramp_deg).all()
-    straight = (rb.kappa == 0).mean()
-    assert abs(straight - policy.ramp_straight_frac) < 0.1, straight
-    assert set(np.round(rb.ramp_deg).tolist()) == {8.0, 12.0, 20.0, 80.0}
-    mid = integrate_arc(rb.pose, rb.kappa, lead + ARC_LEN / 2.0)
-    uphill = np.array([next(f.yaw for f in faces if np.isclose(f.slope_deg, d)) for d in rb.ramp_deg])
-    off = np.degrees(np.abs(np.angle(np.exp(1j * (mid[:, 2] - uphill)))))
-    assert off.max() <= policy.ramp_yaw_jitter_deg + 1e-6, off.max()
-    assert (rb.ramp_s >= -ARC_LEN - _ROBOT.wheel_radius - 1e-6).all()
-    base_ok, end_ok = trials_feasible(ramp_map, spec, rb.pose, rb.kappa, lead, 0.8, args.device, RobotParams())
-    assert base_ok.all() and np.array_equal(end_ok, rb.endpoint_feasible)
-    # a wall-like 80 deg face: trials start before the foot and run into it, no shortfall
-    steep = [dataclasses.replace(ramps[0], up_deg=80.0, height=0.7)]
+    for sampler, name, turn in ((sample_ramp_up_trials, "ramp_up", 0.0),
+                                (sample_ramp_down_trials, "ramp_down", np.pi)):
+        t0 = time.perf_counter()
+        rb = sampler(ramp_map, faces, spec, 400, rng, **ramp_kw, **kw)
+        assert (rb.strategy == name).all() and rb.shortfall == 0 and np.isfinite(rb.ramp_deg).all(), \
+            (name, rb.shortfall)
+        straight = (rb.kappa == 0).mean()
+        assert abs(straight - ramp_kw["straight_frac"]) < 0.1, (name, straight)
+        assert set(np.round(rb.ramp_deg).tolist()) == {8.0, 12.0, 20.0, 80.0}, name
+        mid = integrate_arc(rb.pose, rb.kappa, lead + ARC_LEN / 2.0)
+        axis = np.array([next(f.yaw for f in faces if np.isclose(f.slope_deg, d)) for d in rb.ramp_deg])
+        off = np.degrees(np.abs(np.angle(np.exp(1j * (mid[:, 2] - axis - turn)))))
+        assert off.max() <= ramp_kw["yaw_jitter_deg"] + 1e-6, (name, off.max())
+        assert (rb.ramp_s >= -ARC_LEN - _ROBOT.wheel_radius - 1e-6).all()
+        base_ok, end_ok = trials_feasible(ramp_map, spec, rb.pose, rb.kappa, lead, 0.8, args.device,
+                                          RobotParams())
+        assert base_ok.all() and np.array_equal(end_ok, rb.endpoint_feasible)
+        n_up, n_down = int((rb.interact_dir > 0).sum()), int((rb.interact_dir < 0).sum())
+        if name == "ramp_down":
+            # the crest drops away below the wheel-contact plane; only arcs starting ON a face
+            # and reaching its foot read +1 there
+            assert n_down > n_up, (n_up, n_down)
+            before_crest = rb.ramp_s < 0
+            assert before_crest.any() and (rb.interact_dir[before_crest] <= 0).mean() > 0.9
+        print(f"{name}: 400 trials, {straight:.0%} straight, max mid-arc heading off-axis "
+              f"{off.max():.1f} deg, ramp_s p10/p90 {np.percentile(rb.ramp_s, 10):.2f}/"
+              f"{np.percentile(rb.ramp_s, 90):.2f} m, interact {n_up} up / {n_down} down, "
+              f"{int((~rb.endpoint_feasible).sum())} blocked ends, {time.perf_counter() - t0:.2f}s")
+    # a wall-like 80 deg face: trials start before the foot and run into it, no shortfall; driven
+    # down, the same face is an 0.7 m drop off a standing platform
+    steep = [dataclasses.replace(ramps[0], cx=0.0, cy=0.0, up_deg=80.0, height=0.7)]
     steep_map = HeightMapReader(ramp_layer(steep[0], 16.0, 0.05), origin=(-8.0, -8.0), cell=0.05)
-    sb = sample_ramp_trials(steep_map, ramp_faces({"ramps": [dataclasses.asdict(r) for r in steep]}),
-                            spec, 32, rng, **kw)
+    steep_faces = ramp_faces({"ramps": [dataclasses.asdict(r) for r in steep]})
+    sb = sample_ramp_up_trials(steep_map, steep_faces, spec, 32, rng, **ramp_kw, **kw)
     assert sb.shortfall == 0 and (sb.interact_dir > 0).mean() > 0.5, (sb.shortfall, sb.interact_dir)
-    print(f"ramps: 400 trials, {straight:.0%} straight, max mid-arc heading off-axis {off.max():.1f} deg, "
-          f"ramp_s p10/p90 {np.percentile(rb.ramp_s, 10):.2f}/{np.percentile(rb.ramp_s, 90):.2f} m, "
-          f"{int((~rb.endpoint_feasible).sum())} blocked ends, {time.perf_counter() - t0:.2f}s; "
-          f"80 deg face: 32/32, {int((sb.interact_dir > 0).sum())} reach it, "
-          f"{int((~sb.endpoint_feasible).sum())} blocked ends")
-    print("ramp checks ok")
+    db = sample_ramp_down_trials(steep_map, steep_faces, spec, 32, rng, **ramp_kw, **kw)
+    assert db.shortfall == 0 and (db.interact_dir < 0).mean() > 0.5, (db.shortfall, db.interact_dir)
+    print(f"80 deg face: up 32/32, {int((sb.interact_dir > 0).sum())} reach it, "
+          f"{int((~sb.endpoint_feasible).sum())} blocked ends; down 32/32, "
+          f"{int((db.interact_dir < 0).sum())} go over the edge, "
+          f"{int((~db.endpoint_feasible).sum())} blocked ends")
 
-    if args.maps_dir:
-        maps_dir = pathlib.Path(args.maps_dir)
-        maps_dir = maps_dir if maps_dir.is_absolute() else pathlib.Path(__file__).resolve().parents[3] / maps_dir
-        print(f"\n{'map':24s} {'strategy':8s} {'up':>3s} {'down':>4s} {'short':>5s} {'blocked':>7s} "
-              f"{'relief p50/p90':>15s}  time")
-        for png in sorted(maps_dir.glob("*.png")):
-            stem = png.with_suffix("")
-            terrain = HeightMapReader.load(stem)
-            meta = map_metadata(stem)
-            t0 = time.perf_counter()
-            s = sample_map_trials(terrain, meta, spec, args.n, rng, **kw)
-            p50, p90 = np.percentile(s.arc_relief, [50, 90])
-            extra = ""
-            if s.strategy == "ramp" and np.isfinite(s.ramp_deg).any():
-                extra = f"  slopes {np.nanmin(s.ramp_deg):.0f}-{np.nanmax(s.ramp_deg):.0f} deg"
-            print(f"{stem.name:24s} {s.strategy:8s} {int((s.interact_dir > 0).sum()):3d} "
-                  f"{int((s.interact_dir < 0).sum()):4d} {s.shortfall:5d} "
-                  f"{int((~s.endpoint_feasible).sum()):7d} {p50:7.3f}/{p90:.3f}  "
-                  f"{time.perf_counter() - t0:.1f}s{extra}")
+    mixed = concat_batches([fb, eb], rng)
+    assert len(mixed.pose) == 232 and set(mixed.strategy) == {"targeted", "edge"}
+    assert (mixed.strategy == "edge").sum() == 200 and mixed.shortfall == fb.shortfall + eb.shortfall
+    print("ramp / concat checks ok")

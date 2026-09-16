@@ -1,0 +1,62 @@
+# lattice_learning dataset config -- every key is documented in configs/default.yaml.
+#     python src/feasibility/lattice_learning/generate_dataset.py up_down
+#
+# Mix: a quarter each of negatives, climbs up ramps, descents down ramps (including off 80 deg
+# drops), and curbs/walls. The two ramp entries share the ramp maps, 8 up + 8 down trials on each.
+# Needs ramp maps with a standing platform (create_maps_for_lattice_learning.py after the plateau
+# floor was raised to 2.1 m).
+
+seed: 0
+
+maps:
+  dir: assets/lattice_maps/3
+  n_maps: 40                  # -> 10 rough, 20 ramps, 10 curbs_and_walls
+  trials_per_map: 16          # -> 640 rows
+
+trial:
+  kappa_max: 2.0
+  warmup_s: 0.375
+  settle_steps: 15
+  mu: 0.8
+  interact_relief: 0.05
+  router_cell: 0.24
+  n_theta: 24
+
+run:
+  chunk: 64
+  maps_per_build: 4
+  device: cuda:0
+  dry_run: false
+
+ostrich_overrides: []
+
+mix:
+  - map: rough
+    strategy: uniform
+    percent: 25
+    params: {}
+
+  - map: ramps
+    strategy: ramp_up
+    percent: 25
+    params:
+      straight_frac: 0.75
+      yaw_jitter_deg: 5.0
+      fallback_interact_frac: 0.5
+
+  - map: ramps
+    strategy: ramp_down       # from the plateau, head-on down a face or off a drop
+    percent: 25
+    params:
+      straight_frac: 0.75
+      yaw_jitter_deg: 5.0
+      fallback_interact_frac: 0.5
+
+  - map: curbs_and_walls
+    strategy: edge
+    percent: 25
+    params:
+      interact_frac: 0.5
+      band: 1.5
+      facing_frac: 0.7
+      down_frac: 0.5
