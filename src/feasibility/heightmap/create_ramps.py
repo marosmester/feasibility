@@ -59,8 +59,9 @@ import numpy as np
 from scipy.ndimage import distance_transform_edt
 
 from feasibility.heightmap import HeightMapReader
-from feasibility.heightmap.create_curbs_and_walls import GROUND_EPS
-from feasibility.heightmap.create_curbs_and_walls import grid_axes
+from feasibility.heightmap.lattice_maps_utils import GROUND_EPS
+from feasibility.heightmap.lattice_maps_utils import grid_axes
+from feasibility.heightmap.lattice_maps_utils import place_features
 
 DEFAULT_EXTENT = 14.0  # m -- 2 m more than the other lattice map categories: a 5 deg ramp
 # with its 2.1 m platform is up to 10.5 m long and must still place with its foot 2.2 m inside the edge
@@ -208,37 +209,31 @@ def build_ramp_map(
     extent: float = DEFAULT_EXTENT,
     cell: float = DEFAULT_CELL,
 ) -> tuple[HeightMapReader, dict]:
-    """One map of ramps on flat ground, plus a params dict for a .yaml sidecar. Each ramp slot
-    draws a shape, then up to MAX_PLACEMENT_ATTEMPTS placements that keep the footprint inside the
-    grid, `overlap_margin` clear of earlier ramps and the covered area within
-    cfg.max_area_fraction; the first shape that cannot be placed stops the map, so n_ramps is an
-    upper bound."""
+    """One map of ramps on flat ground, plus a params dict for a .yaml sidecar --
+    lattice_maps_utils.place_features runs the placement/overlap/area-budget loop. Each ramp slot
+    draws its shape once (retrying placement must never bias the angle distribution) and then gets
+    up to MAX_PLACEMENT_ATTEMPTS placements; the first shape that cannot be placed stops the map,
+    so n_ramps is an upper bound."""
     foot_limit = extent / 2.0 - cfg.foot_edge_margin
     if foot_limit <= 0.0:
         raise ValueError(f"extent {extent} m leaves no room inside the {cfg.foot_edge_margin} m margin")
-    n_axis = grid_axes(extent, cell).size
-    H = np.zeros((n_axis, n_axis), dtype=np.float64)
-    clearance = np.full((n_axis, n_axis), np.inf)  # m, distance to the nearest existing footprint
-    ramps: list[Ramp] = []
-    n_target = int(rng.integers(cfg.n_ramps[0], cfg.n_ramps[1] + 1))
-    for _ in range(n_target):
+
+    def make_attempt():
         shape = sample_ramp_shape(rng, cfg)
-        for _ in range(MAX_PLACEMENT_ATTEMPTS):
+
+        def attempt():
             ramp = place_ramp(rng, shape, extent, foot_limit)
             if not ramp_inside_grid(ramp, extent):
-                continue
-            layer = ramp_layer(ramp, extent, cell)
-            if (clearance[layer > GROUND_EPS] <= cfg.overlap_margin).any():
-                continue
-            candidate = np.maximum(H, layer)
-            if np.count_nonzero(candidate > GROUND_EPS) / candidate.size > cfg.max_area_fraction:
-                continue
-            H = candidate
-            clearance = distance_transform_edt(H <= GROUND_EPS) * cell
-            ramps.append(ramp)
-            break
-        else:
-            break
+                return None
+            return ramp_layer(ramp, extent, cell), ramp
+
+        return attempt
+
+    n_target = int(rng.integers(cfg.n_ramps[0], cfg.n_ramps[1] + 1))
+    H, ramps = place_features(
+        extent, cell, n_target, cfg.overlap_margin, cfg.max_area_fraction, make_attempt,
+        max_attempts=MAX_PLACEMENT_ATTEMPTS,
+    )
 
     half = extent / 2.0
     max_z = float(H.max())

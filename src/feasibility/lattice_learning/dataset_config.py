@@ -194,7 +194,8 @@ class StrategySpec:
 
 
 RAMP_CATEGORIES = ("ramps",)
-EDGE_CATEGORIES = ("curbs_and_walls", "walls", "boxes")  # walls/boxes: retired categories of old dirs
+EDGE_CATEGORIES = ("curbs_and_walls", "poles_and_walls", "walls", "boxes")  # walls/boxes: retired
+# categories of old dirs
 
 STRATEGIES: dict[str, StrategySpec] = {
     s.name: s

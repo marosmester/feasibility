@@ -60,6 +60,15 @@ Three decisions, all independent of any per-map height threshold:
   - `uniform` -> `sample_trials(interact_frac=None)`: uniform (pose, kappa) over the whole map.
   - `targeted` -> `sample_trials(interact_frac)`: uniform proposals, exactly
     `round(n * interact_frac)` interacting.
+  - `rotate_in_place` -> `sample_rotate_in_place_trials` (poles_and_walls maps, or any map with a
+    height edge): spawns for a STATIC trial -- generate_dataset.py commands `v=0, wz != 0` on
+    these rows rather than driving a lattice arc, so there is no forward arc to sample a curvature
+    or a relief window over. Only the spawn pose matters: the CLOSEST of the three wheels sits
+    `min_clearance` to `min_clearance + band` beyond contact from the nearest pole/wall edge
+    (`edge_field`, heightmap-only, same as `edge`) -- close enough that rotating in place is
+    likely to sweep a wheel through the feature, but never already resting on it. `kappa` is a
+    fixed 0 placeholder and `endpoint_feasible` is left at its all-True default: neither curvature
+    nor an "arc end" mean anything for a pure yaw command.
 
   Several strategies can share one map; `concat_batches` merges their trials and SpawnBatch
   carries `strategy`/`targeted` per row.
@@ -99,6 +108,7 @@ from feasibility.heightmap.create_ramps import Ramp
 from feasibility.heightmap.create_ramps import ramp_height
 from feasibility.lattice_learning.arc import ARC_LEN
 from feasibility.lattice_learning.arc import integrate_arc
+from feasibility.lattice_learning.patch import _body_to_world
 from feasibility.lattice_learning.patch import patch_overhangs
 from feasibility.lattice_learning.patch import PatchSpec
 from feasibility.lattice_learning.patch import WHEEL_CONTACTS_LOCAL
@@ -443,6 +453,15 @@ def edge_field(terrain: HeightMapReader, min_slope_deg: float = EDGE_MIN_SLOPE_D
     )
 
 
+def cell_centers(terrain: HeightMapReader) -> tuple[np.ndarray, np.ndarray]:
+    """([ny, nx] world x, [ny, nx] world y) of every cell center, `EdgeField`'s own grid -- shared
+    by `sample_edge_trials` and `sample_rotate_in_place_trials`, both of which restrict candidate
+    origins to cells within reach of an edge."""
+    cx = terrain.x0 + (np.arange(terrain.nx) + 0.5) * terrain.cell
+    cy = terrain.y0 + (np.arange(terrain.ny) + 0.5) * terrain.cell
+    return np.meshgrid(cx, cy)
+
+
 def sample_edge_trials(
     terrain: HeightMapReader,
     spec: PatchSpec,
@@ -472,9 +491,7 @@ def sample_edge_trials(
     robot = robot or RobotParams()
     field = edge_field(terrain)
     x_lo, x_hi, y_lo, y_hi = sampling_bounds(terrain, spec, 0.0)  # origins: the patch is there
-    cx = terrain.x0 + (np.arange(terrain.nx) + 0.5) * terrain.cell
-    cy = terrain.y0 + (np.arange(terrain.ny) + 0.5) * terrain.cell
-    CX, CY = np.meshgrid(cx, cy)
+    CX, CY = cell_centers(terrain)
     cells = np.flatnonzero(
         (field.dist <= band) & (CX >= x_lo) & (CX <= x_hi) & (CY >= y_lo) & (CY <= y_hi)
     )
@@ -520,6 +537,108 @@ def sample_edge_trials(
     return batch_from_rows(
         rows, rng, interact_relief, targeted=interact_frac is not None, shortfall=shortfall,
         proposal_interact_rate=rate, strategy="edge",
+    )
+
+
+def wheel_positions(pose: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """([n, 3] world x, [n, 3] world y) of the three wheel contacts at `pose` [n, 3] = (x, y, yaw)
+    -- `patch._body_to_world` applied to `WHEEL_CONTACTS_LOCAL`, pulled out here since
+    `sample_rotate_in_place_trials` is the only caller with no surrounding per-arc-sample loop to
+    inline it into (unlike `arc_relief_signed`'s and `_sample_face_trials`'s local `contacts()`
+    closures, which do the same rotation inline for that reason)."""
+    c, s = np.cos(pose[:, 2:3]), np.sin(pose[:, 2:3])
+    return _body_to_world(pose[:, 0:1], pose[:, 1:2], c, s, WHEEL_CONTACTS_LOCAL[:, 0], WHEEL_CONTACTS_LOCAL[:, 1])
+
+
+def sample_rotate_in_place_trials(
+    terrain: HeightMapReader,
+    spec: PatchSpec,
+    n: int,
+    rng: np.random.Generator,
+    *,
+    band: float,
+    min_clearance: float,
+    mu: float,
+    device: str,
+    robot: RobotParams | None = None,
+) -> SpawnBatch:
+    """`n` static spawn poses for a rotate-in-place trial (`v=0, wz != 0`, commanded elsewhere by
+    generate_dataset.py) -- see the module docstring's `rotate_in_place` entry. A candidate's
+    THREE wheel contacts (`wheel_positions`) are each looked up in `edge_field`'s per-cell distance
+    to the nearest height edge, wrapped as a `HeightMapReader` so `wheel_positions`' continuous
+    (x, y) get a bilinear-interpolated distance rather than a nearest-cell one; the CLOSEST wheel's
+    distance minus `robot.wheel_radius` (net clearance from the feature's surface, not from its
+    center) must land in `[min_clearance, min_clearance + band]` -- enough headroom that a wheel
+    is never already resting on the pole/wall (poles and walls here are thin enough, module
+    docstring, that no interior point is ever farther from an edge than `robot.wheel_radius`, so
+    this same lower bound also rules out a wheel spawning ON TOP of one), while still within reach
+    of it. Also requires the ordinary spawn checks every strategy shares: settle-feasible (chassis
+    clearance / pitch / roll / residual) and the patch reachable on mapped terrain. No `lead`: the
+    command is stationary, so the patch is sampled at the spawn itself, not a warmed-up origin."""
+    if min_clearance < 0.0:
+        raise ValueError(f"min_clearance must be >= 0, got {min_clearance}")
+    if band <= 0.0:
+        raise ValueError(f"band must be > 0, got {band}")
+    robot = robot or RobotParams()
+    wheel_r = float(robot.wheel_radius)
+    lo, hi = wheel_r + min_clearance, wheel_r + min_clearance + band
+
+    field = edge_field(terrain)
+    dist_map = HeightMapReader(field.dist, origin=(terrain.x0, terrain.y0), cell=terrain.cell)
+    x_lo, x_hi, y_lo, y_hi = sampling_bounds(terrain, spec, 0.0)
+
+    CX, CY = cell_centers(terrain)
+    # Candidate ORIGIN cells: within `hi` of an edge, widened by the farthest wheel's own radius
+    # from the body origin (the rear wheel, `rear_offset`) -- a body origin just outside `hi` can
+    # still place that wheel inside it.
+    wheel_reach = float(np.hypot(WHEEL_CONTACTS_LOCAL[:, 0], WHEEL_CONTACTS_LOCAL[:, 1]).max())
+    cells = np.flatnonzero(
+        (field.dist <= hi + wheel_reach) & (CX >= x_lo) & (CX <= x_hi) & (CY >= y_lo) & (CY <= y_hi)
+    )
+    if len(cells) == 0:
+        raise ValueError(
+            "no map cell lies within reach of a height edge for sample_rotate_in_place_trials"
+        )
+
+    got: list[np.ndarray] = []
+    count = 0
+    for _ in range(MAX_PROPOSAL_ROUNDS):
+        if count >= n:
+            break
+        m = PROPOSAL_BATCH
+        cell = cells[rng.integers(0, len(cells), m)]
+        x = CX.ravel()[cell] + rng.uniform(-0.5, 0.5, m) * terrain.cell
+        y = CY.ravel()[cell] + rng.uniform(-0.5, 0.5, m) * terrain.cell
+        yaw = rng.uniform(0.0, 2.0 * np.pi, m)
+        pose = np.column_stack([x, y, yaw])
+
+        wx, wy = wheel_positions(pose)
+        closest = np.asarray(dist_map.sample(wx, wy)).min(axis=1)
+        close_idx = np.flatnonzero((closest >= lo) & (closest <= hi))
+        idx = close_idx[~patch_overhangs(terrain, pose[close_idx], spec)]
+        idx = idx[: int(SETTLE_SLACK * (n - count)) + 16]
+        if len(idx) == 0:
+            continue
+        derived, residual, clearance = settle_batch(terrain, pose[idx], mu, device)
+        keep = idx[settle_feasible(derived, residual, clearance, robot)][: n - count]
+        got.append(pose[keep])
+        count += len(keep)
+
+    if count < n:
+        raise ValueError(
+            f"only found {count}/{n} settle-feasible trials with a wheel {lo:.2f}-{hi:.2f} m from "
+            "a height edge -- the map has too little qualifying ground for sample_rotate_in_place_trials"
+        )
+    rows = np.concatenate(got)[:n]
+    rng.shuffle(rows)
+    return SpawnBatch(
+        pose=rows,
+        kappa=np.zeros(n, dtype=np.float32),
+        arc_relief=np.zeros(n, dtype=np.float32),
+        targeted=np.ones(n, dtype=bool),
+        shortfall=0,
+        proposal_interact_rate=float("nan"),
+        strategy=np.full(n, "rotate_in_place"),
     )
 
 
@@ -813,6 +932,36 @@ if __name__ == "__main__":
           f"rate {eb.proposal_interact_rate:.1%}), {int((~eb.endpoint_feasible).sum())} blocked arc "
           f"ends, {down_on_box:.0%} of down spawns on the box, {time.perf_counter() - t0:.2f}s")
     print("edge checks ok")
+
+    # Rotate-in-place: a thin wall + a small pole stand-in -- poles_and_walls features never have
+    # an interior point farther than ~0.15 m from their own edge, unlike the box above (half-
+    # extent 1.25 m), so this needs its own map to test the "never on the feature" guarantee for
+    # real. No forward arc (kappa/relief are 0), every trial's closest wheel clearance lands in
+    # [lo, hi], no wheel ever rests on the feature itself, spawns are settle-feasible, reproduces.
+    t0 = time.perf_counter()
+    thin_wall = np.where((np.abs(X - 2.5) < 0.1) & (np.abs(Y) < 2.0), 1.0, 0.0)  # 0.2 m thick
+    thin_pole = np.where((np.abs(X + 2.0) < 0.15) & (np.abs(Y - 1.0) < 0.15), 0.5, 0.0)  # ~0.3 m square
+    thin_map = HeightMapReader(np.maximum(thin_wall, thin_pole), origin=(-8.0, -8.0), cell=0.05)
+    rot_kw = dict(band=0.5, min_clearance=0.05, mu=0.8, device=args.device)
+    lo = RobotParams().wheel_radius + rot_kw["min_clearance"]
+    hi = lo + rot_kw["band"]
+    rb2 = sample_rotate_in_place_trials(thin_map, spec, 200, rng, **rot_kw)
+    assert (rb2.strategy == "rotate_in_place").all() and rb2.shortfall == 0
+    assert (rb2.kappa == 0).all() and (rb2.arc_relief == 0).all() and rb2.endpoint_feasible.all()
+    wx, wy = wheel_positions(rb2.pose)
+    thin_field = edge_field(thin_map)
+    dist_map = HeightMapReader(thin_field.dist, origin=(thin_map.x0, thin_map.y0), cell=thin_map.cell)
+    closest = np.asarray(dist_map.sample(wx, wy)).min(axis=1)
+    assert (closest >= lo - 1e-6).all() and (closest <= hi + 1e-6).all(), (closest.min(), closest.max())
+    assert (np.asarray(thin_map.sample(wx, wy)) < 1e-6).all(), "a spawn wheel must never rest on the feature"
+    d, r, c = settle_batch(thin_map, rb2.pose, 0.8, args.device)
+    assert settle_feasible(d, r, c, RobotParams()).all()
+    same = [sample_rotate_in_place_trials(thin_map, spec, 16, np.random.default_rng(5), **rot_kw)
+            for _ in range(2)]
+    assert np.array_equal(same[0].pose, same[1].pose)
+    print(f"rotate_in_place: 200 trials, closest-wheel clearance within [{lo:.2f}, {hi:.2f}] m, "
+          f"{time.perf_counter() - t0:.2f}s")
+    print("rotate-in-place checks ok")
 
     # Ramps, both directions: every trial head-on along a face, straight share ~ straight_frac,
     # mid-arc heading within the jitter of the face axis (uphill / downhill), wheel contacts on

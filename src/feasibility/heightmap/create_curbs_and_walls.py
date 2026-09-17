@@ -28,11 +28,10 @@ Wall thickness is floored at 0.15 m on purpose. lattice_learning's patch samples
 network while ostrich still hits it; the __main__ check below asserts a minimum-thickness wall is
 always seen.
 
-Feature centers are drawn inside |x|, |y| <= extent/2 - PLACEMENT_MARGIN. lattice_learning keeps
-spawn poses ~2.5 m from the map edge (patch reach + warm-up lead) and its edge strategy starts
-trials up to 1.5 m from an edge, so a feature placed 1.1 m from the edge is still reachable.
-Re-derived, not imported: heightmap/ is shared infrastructure and must not depend on an
-experiment tree.
+Feature centers are drawn inside |x|, |y| <= extent/2 - PLACEMENT_MARGIN (lattice_maps_utils; see
+its docstring for the margin's rationale). The placement/overlap/area-budget loop itself is
+lattice_maps_utils.place_features, shared with create_poles_and_walls.py and create_ramps.py so
+none of the three imports from another.
 
 `build_walls_map` does no file IO -- create_maps_for_lattice_learning.py composes it and owns the
 output layout. Running this module directly is its smoke test.
@@ -58,17 +57,16 @@ from scipy.ndimage import distance_transform_edt
 
 from feasibility.heightmap import HeightMapReader
 from feasibility.heightmap.create_large_box_obstacles import build_rect_obstacle
+from feasibility.heightmap.lattice_maps_utils import GROUND_EPS
+from feasibility.heightmap.lattice_maps_utils import PLACEMENT_MARGIN
+from feasibility.heightmap.lattice_maps_utils import Rect
+from feasibility.heightmap.lattice_maps_utils import place_features
+from feasibility.heightmap.lattice_maps_utils import rect_inside_grid
 
 DEFAULT_EXTENT = 12.0  # m
 DEFAULT_CELL = 0.1  # m
-PLACEMENT_MARGIN = 1.1  # m, feature centers stay this far inside the grid edge -- module docstring
-MAX_FEATURE_ATTEMPTS = 50  # draws per feature before the map stops growing
-GROUND_EPS = 1e-6  # m, a cell above this counts as covered by a feature
 
 FEATURE_KINDS = ("curb", "wall", "corner", "box")
-
-# (w, d, cx, cy, yaw) of one rectangle in world coordinates, w along its own rotated x axis
-Rect = tuple[float, float, float, float, float]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -86,13 +84,6 @@ class WallsConfig:
     incline_deg: float = 80.0  # side slope; sharp, but no single-cell mesh sliver
     overlap_margin: float = 1.0  # m, clear ground between two features' footprints
     max_area_fraction: float = 0.3  # of the whole map, keeps clear ground for spawn sampling
-
-
-def grid_axes(extent: float, cell: float) -> np.ndarray:
-    """Cell-center coordinates along one axis, identical to build_rect_obstacle's and
-    create_rough_terrain.build_rough_terrain's grid, so layers from all three line up."""
-    n = int(round(extent / cell)) + 1
-    return -extent / 2.0 + (np.arange(n) + 0.5) * cell
 
 
 def feature_rects(
@@ -131,18 +122,6 @@ def feature_rects(
     raise ValueError(f"unknown feature kind {kind!r}, expected one of {FEATURE_KINDS}")
 
 
-def rect_inside_grid(rect: Rect, height: float, incline_deg: float, extent: float) -> bool:
-    """True when the rectangle's footprint, including its sloped skirt, lies inside the grid."""
-    w, d, cx, cy, yaw = rect
-    skirt = height / np.tan(np.radians(incline_deg))
-    hx, hy = w / 2.0 + skirt, d / 2.0 + skirt
-    c, s = np.cos(yaw), np.sin(yaw)
-    reach_x = abs(c) * hx + abs(s) * hy
-    reach_y = abs(s) * hx + abs(c) * hy
-    limit = extent / 2.0
-    return abs(cx) + reach_x <= limit and abs(cy) + reach_y <= limit
-
-
 def rects_layer(
     rects: list[Rect], height: float, incline_deg: float, extent: float, cell: float
 ) -> np.ndarray:
@@ -161,51 +140,40 @@ def build_walls_map(
     cell: float = DEFAULT_CELL,
 ) -> tuple[HeightMapReader, dict]:
     """One map of curbs/walls/corners/boxes on flat ground, plus a params dict for a .yaml
-    sidecar. Each feature gets up to MAX_FEATURE_ATTEMPTS draws to land fully inside the grid,
-    more than cfg.overlap_margin clear of every earlier feature, without pushing the covered area
-    past cfg.max_area_fraction; the first feature that cannot stops the map, so n_features is an
-    upper bound."""
+    sidecar -- lattice_maps_utils.place_features runs the placement/overlap/area-budget loop; the
+    first feature that cannot land stops the map, so n_features is an upper bound."""
     center_limit = extent / 2.0 - PLACEMENT_MARGIN
     if center_limit <= 0.0:
         raise ValueError(f"extent {extent} m leaves no room inside the {PLACEMENT_MARGIN} m margin")
     weights = np.asarray(cfg.kind_weights, dtype=np.float64)
     weights = weights / weights.sum()
 
-    n_axis = grid_axes(extent, cell).size
-    H = np.zeros((n_axis, n_axis), dtype=np.float64)
-    clearance = np.full((n_axis, n_axis), np.inf)  # m, distance to the nearest existing footprint
-    features: list[dict] = []
-    n_target = int(rng.integers(cfg.n_features[0], cfg.n_features[1] + 1))
-    for _ in range(n_target):
-        for _ in range(MAX_FEATURE_ATTEMPTS):
+    def make_attempt():
+        def attempt():
             kind = FEATURE_KINDS[int(rng.choice(len(FEATURE_KINDS), p=weights))]
             height = rng.uniform(*cfg.height)
             yaw = rng.uniform(0.0, np.pi)
             cx, cy = rng.uniform(-center_limit, center_limit, size=2)
             rects, shape = feature_rects(kind, rng, cfg, cx, cy, yaw)
             if not all(rect_inside_grid(r, height, cfg.incline_deg, extent) for r in rects):
-                continue
+                return None
             layer = rects_layer(rects, height, cfg.incline_deg, extent, cell)
-            if (clearance[layer > GROUND_EPS] <= cfg.overlap_margin).any():
-                continue
-            candidate = np.maximum(H, layer)
-            if np.count_nonzero(candidate > GROUND_EPS) / candidate.size > cfg.max_area_fraction:
-                continue
-            H = candidate
-            clearance = distance_transform_edt(H <= GROUND_EPS) * cell
-            features.append(
-                {
-                    "kind": kind,
-                    "height": float(height),
-                    "yaw": float(yaw),
-                    "center": [float(cx), float(cy)],
-                    **{k: float(v) for k, v in shape.items()},
-                    "rects": [[float(v) for v in r] for r in rects],  # (w, d, cx, cy, yaw) each
-                }
-            )
-            break
-        else:
-            break
+            record = {
+                "kind": kind,
+                "height": float(height),
+                "yaw": float(yaw),
+                "center": [float(cx), float(cy)],
+                **{k: float(v) for k, v in shape.items()},
+                "rects": [[float(v) for v in r] for r in rects],  # (w, d, cx, cy, yaw) each
+            }
+            return layer, record
+
+        return attempt
+
+    n_target = int(rng.integers(cfg.n_features[0], cfg.n_features[1] + 1))
+    H, features = place_features(
+        extent, cell, n_target, cfg.overlap_margin, cfg.max_area_fraction, make_attempt
+    )
 
     half = extent / 2.0
     hmap = HeightMapReader(H, origin=(-half, -half), cell=cell, min_z=0.0, max_z=float(H.max()))

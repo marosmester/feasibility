@@ -1,6 +1,6 @@
 """Generate a mixed batch of heightmaps for lattice_learning/generate_dataset.py, with set ratios.
 
-Three map categories, each built by a helper in this package (this script only samples, mixes and
+Four map categories, each built by a helper in this package (this script only samples, mixes and
 writes). lattice_learning/generate_dataset.py reads the sidecar `category` back and applies the
 spawn_sampling strategies its dataset YAML's `mix` assigns to that category (see
 lattice_learning/dataset_config.py for which strategy is eligible where):
@@ -13,13 +13,18 @@ lattice_learning/dataset_config.py for which strategy is eligible where):
     curbs_and_walls  create_curbs_and_walls.build_walls_map:   `edge`: near an edge, some of them
                      2 of curb/wall/L-corner/box, 1 m apart,   running into it (climb up or drive
                      0.2-1.0 m tall, 80 deg sides              down)
+    poles_and_walls  create_poles_and_walls.build_poles_and_    `edge`: same as curbs_and_walls --
+                     walls_map: up to 2 of pole/wall, 1 m       edge_field is found from the
+                     apart, 0.1-1.0 m tall, 80 deg sides        heightmap alone, no sidecar needed
     rough            create_rough_terrain.build_rough_terrain: `uniform`
                      exactly flat, or low-amplitude rough
 
 The ramps span a continuous slope so the angle where ostrich and helhest_stack start to diverge
-can be read off; the curbs and walls go from edges a wheel can mount to ones none can; flat/rough
-maps are the negatives the network must predict ~0 on. On ramps and curbs_and_walls maps a trial's
-arc end need not be settle-feasible -- the dataset flags those rows `endpoint_blocked`.
+can be read off; the curbs/walls and poles/walls go from edges a wheel can mount to ones none can
+(the latter narrower and sparser -- a pole or a lone thin wall rather than curbs, corners and
+boxes); flat/rough maps are the negatives the network must predict ~0 on. On ramps,
+curbs_and_walls and poles_and_walls maps a trial's arc end need not be settle-feasible -- the
+dataset flags those rows `endpoint_blocked`.
 
 Ratios and every sampling range live in the CONFIG block below; edit them there, or override just
 the ratios with --ratios. Per-category counts use largest-remainder rounding, so they always sum
@@ -38,14 +43,16 @@ removes maps at the END of a category; every existing <category>_i<NNNN> regener
 The script refuses to write into a directory holding PNGs it would not produce, since
 generate_dataset.py would glob those stale maps too.
 
-`base_rms` (off by default) adds a create_rough_terrain layer under ramps/curbs_and_walls maps, so
-steps and ramps are also seen on non-flat ground. It breaks the ramp sampler's "wheels on this
-face's surface" check (every ramp trial would fall back), so leave it off for ramps.
+`base_rms` (off by default) adds a create_rough_terrain layer under ramps/curbs_and_walls/
+poles_and_walls maps, so steps and ramps are also seen on non-flat ground. It breaks the ramp
+sampler's "wheels on this face's surface" check (every ramp trial would fall back), so leave it
+off for ramps.
 
 CLI parameters:
     --seed INT         RNG seed; REQUIRED -- also names the default output subdirectory
     --n INT            total number of maps (default: 200)
-    --ratios STR       comma-separated category=weight, e.g. ramps=1,curbs_and_walls=1,rough=1
+    --ratios STR       comma-separated category=weight, e.g.
+                       ramps=1,curbs_and_walls=1,poles_and_walls=1,rough=1
                        (default: DEFAULT_RATIOS below); normalized, weights must be >= 0
     --extent FLOAT     full width/height of every square map in meters, overriding every category's
                        own CONFIG "extent" (default: per category -- ramps 14.0, others 12.0)
@@ -69,20 +76,24 @@ import numpy as np
 import yaml
 
 from feasibility.heightmap import HeightMapReader
-from feasibility.heightmap.create_curbs_and_walls import GROUND_EPS
 from feasibility.heightmap.create_curbs_and_walls import WallsConfig
 from feasibility.heightmap.create_curbs_and_walls import build_walls_map
+from feasibility.heightmap.create_poles_and_walls import PolesAndWallsConfig
+from feasibility.heightmap.create_poles_and_walls import build_poles_and_walls_map
 from feasibility.heightmap.create_ramps import RampsConfig
 from feasibility.heightmap.create_ramps import build_ramp_map
 from feasibility.heightmap.create_ramps import DEFAULT_EXTENT as RAMPS_DEFAULT_EXTENT
 from feasibility.heightmap.create_rough_terrain import build_rough_terrain
+from feasibility.heightmap.lattice_maps_utils import GROUND_EPS
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 ASSETS_DIR = REPO_ROOT / "assets" / "lattice_maps"
 
 # ================================ CONFIG ==========================================================
 
-DEFAULT_RATIOS: dict[str, float] = {"ramps": 1 / 3, "curbs_and_walls": 1 / 3, "rough": 1 / 3}
+DEFAULT_RATIOS: dict[str, float] = {
+    "ramps": 0.25, "curbs_and_walls": 0.25, "poles_and_walls": 0.25, "rough": 0.25,
+}
 
 DEFAULT_N = 200
 DEFAULT_EXTENT = 12.0  # m, curbs_and_walls and rough; generate_dataset.py spawns >= 2.1 m from the
@@ -96,6 +107,12 @@ RAMPS = {
 }
 CURBS_AND_WALLS = {
     "config": WallsConfig(),  # every range lives in create_curbs_and_walls.WallsConfig: 0.2-1.0 m
+    "base_rms": (0.0, 0.0),
+    "extent": DEFAULT_EXTENT,
+}
+POLES_AND_WALLS = {
+    "config": PolesAndWallsConfig(),  # every range lives in create_poles_and_walls.
+    # PolesAndWallsConfig: 0.1-1.0 m, up to 2 of pole/wall
     "base_rms": (0.0, 0.0),
     "extent": DEFAULT_EXTENT,
 }
@@ -115,7 +132,7 @@ BASE_ROUGH = {"cutoff_wavelength": 2.0, "min_wavelength": 0.6, "beta": 2.5}
 # Stable ids feed the per-map SeedSequence -- append new categories, never reorder or reuse an id.
 # Retired: 0 = boxes (create_large_box_obstacles.build_box_map), 1 = walls (0.05-0.5 m curbs and
 # walls, superseded by curbs_and_walls).
-CATEGORY_IDS: dict[str, int] = {"ramps": 2, "rough": 3, "curbs_and_walls": 4}
+CATEGORY_IDS: dict[str, int] = {"ramps": 2, "rough": 3, "curbs_and_walls": 4, "poles_and_walls": 5}
 INDEX_WIDTH = 4
 
 
@@ -189,6 +206,14 @@ def build_ramps(rng: np.random.Generator, extent: float, cell: float) -> tuple[H
     return hmap, {**params, **base, "n_features": len(params["ramps"])}
 
 
+def build_poles_and_walls(
+    rng: np.random.Generator, extent: float, cell: float
+) -> tuple[HeightMapReader, dict]:
+    hmap, params = build_poles_and_walls_map(rng, POLES_AND_WALLS["config"], extent, cell)
+    hmap, base = add_rough_base(hmap, POLES_AND_WALLS["base_rms"], rng, extent, cell)
+    return hmap, {**params, **base, "n_features": len(params["features"])}
+
+
 def build_rough(rng: np.random.Generator, extent: float, cell: float) -> tuple[HeightMapReader, dict]:
     if rng.uniform() < ROUGH["flat_prob"]:
         rms, cutoff, rough_seed = 0.0, 0.0, -1
@@ -220,9 +245,12 @@ def build_rough(rng: np.random.Generator, extent: float, cell: float) -> tuple[H
 BUILDERS: dict[str, Callable[[np.random.Generator, float, float], tuple[HeightMapReader, dict]]] = {
     "ramps": build_ramps,
     "curbs_and_walls": build_curbs_and_walls,
+    "poles_and_walls": build_poles_and_walls,
     "rough": build_rough,
 }
-CATEGORY_CONFIGS: dict[str, dict] = {"ramps": RAMPS, "curbs_and_walls": CURBS_AND_WALLS, "rough": ROUGH}
+CATEGORY_CONFIGS: dict[str, dict] = {
+    "ramps": RAMPS, "curbs_and_walls": CURBS_AND_WALLS, "poles_and_walls": POLES_AND_WALLS, "rough": ROUGH,
+}
 
 
 def category_extent(category: str, override: float | None) -> float:
