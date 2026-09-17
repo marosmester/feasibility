@@ -9,6 +9,12 @@ with helhest_stack's own `rampmaps`), spawns the robot at each map's benchmark s
 straight at the goal in ostrich. The ridge is symmetric and full-width, so one straight drive tests
 the climb AND the descent, and there is no way around it.
 
+`+series=uphill` drives the uphill-only series instead (`feasibility.heightmap.create_uphill_series`,
+the maps `benchmarks/bench_uphill_nn.py` plans on): one full-width face and a plateau holding the
+goal, so the drive tests the climb alone. It is the ostrich check on that benchmark's assumed
+60/65 deg climb limit, which was read off the ridge runs. The robot stops on the plateau at the
+goal x; "where" reports approach / up face / plateau.
+
 How it runs
     * All maps in ONE ostrich build: `lattice_learning.tiled_terrain.TiledTerrain` puts each map on
       its own tile of one global mesh, and each world spawns on its tile. `+repeats=R` gives every
@@ -34,26 +40,29 @@ Verdict per run (chassis pose = the front-axle base frame, as everywhere in comp
 Also reported, up to the crossing: peak climb pitch (nose up), peak descend pitch (nose down), peak
 |roll|, time to cross vs nominal, final yaw and |y| drift.
 
-Output: `outputs/ostrich_ramp_crossing.h5` in comparator/provenance's schema (settle rows sliced
-off, poses shifted back to each map's own coordinates, empty `hstack/` group), so any run replays
-with:
+Output: `outputs/ostrich_ramp_crossing.h5` (`+series=uphill`: `outputs/ostrich_uphill_crossing.h5`)
+in comparator/provenance's schema (settle rows sliced off, poses shifted back to each map's own
+coordinates, empty `hstack/` group), so any run replays with:
     python src/feasibility/replay/gl_replay.py --file outputs/ostrich_ramp_crossing.h5 --id K --which ostrich
 where K = map_index * repeats + repeat (printed in the table).
 
 Hydra overrides (append as key=value; `+` for the ones below):
-    +maps_dir=PATH        ramp series dir (default: assets/ramp_series)
+    +series=ridge|uphill  map family (default: ridge)
+    +maps_dir=PATH        series dir (default: assets/ramp_series, or assets/uphill_series)
     +angles=[20,40]       only these face angles, deg (default: every map in maps_dir)
     +repeats=INT          worlds per map (default: 3)
     +v=FLOAT              forward speed, m/s (default: 0.6, lattice_learning's V_NOM)
     +slack=FLOAT          command duration as a multiple of nominal time to goal (default: 2.0)
     +mu=FLOAT             ground friction (default: 0.8, as comparator/ and the datasets)
     +settle_steps=INT     zero-command drop onto the terrain before driving (default: 20)
-    +out=PATH             output HDF5 (default: outputs/ostrich_ramp_crossing.h5)
+    +out=PATH             output HDF5 (default: outputs/ostrich_<ramp|uphill>_crossing.h5)
 
 Usage:
     python src/feasibility/heightmap/create_ramp_series.py     # maps first
     python demos/ostrich_ramp_crossing.py
     python demos/ostrich_ramp_crossing.py +repeats=5 +angles=[30,35,40,45]
+    python src/feasibility/heightmap/create_uphill_series.py
+    python demos/ostrich_ramp_crossing.py +series=uphill
     python demos/ostrich_ramp_crossing.py simulation.target_timestep_seconds=0.025
 """
 from __future__ import annotations
@@ -83,12 +92,30 @@ from feasibility.comparator.provenance import write_comparison
 from feasibility.heightmap import HeightMapReader
 from feasibility.heightmap.create_ramp_series import ASSETS_DIR
 from feasibility.heightmap.create_ramp_series import ramp_series_paths
+from feasibility.heightmap.create_uphill_series import ASSETS_DIR as UPHILL_ASSETS_DIR
+from feasibility.heightmap.create_uphill_series import uphill_series_paths
 from feasibility.lattice_learning.tiled_terrain import tile_offsets
 from feasibility.lattice_learning.tiled_terrain import TiledTerrain
 
 CONFIG_PATH = pathlib.Path(examples.__file__).parent.joinpath("conf")
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-DEFAULT_OUT = REPO_ROOT / "outputs" / "ostrich_ramp_crossing.h5"
+
+# The two map families this script drives. Both sidecars carry `up_deg`, `height`, `start` and
+# `goal`, so everything but the file layout, the defaults and the reported reference is shared.
+# blocked_deg is where helhest_stack's settle `blocked` stops the planner on that family: the
+# ridge's 15 deg descend limit, or the uphill face's 25 deg climb limit.
+SERIES = {
+    "ridge": dict(
+        paths=ramp_series_paths, assets_dir=ASSETS_DIR, glob="ramp_a*.png",
+        generator="heightmap/create_ramp_series.py", blocked_deg=15,
+        out=REPO_ROOT / "outputs" / "ostrich_ramp_crossing.h5",
+    ),
+    "uphill": dict(
+        paths=uphill_series_paths, assets_dir=UPHILL_ASSETS_DIR, glob="uphill_a*.png",
+        generator="heightmap/create_uphill_series.py", blocked_deg=25,
+        out=REPO_ROOT / "outputs" / "ostrich_uphill_crossing.h5",
+    ),
+}
 
 DEFAULT_V = 0.6  # m/s -- lattice_learning.arc.V_NOM, the speed the divergence net was trained at
 DEFAULT_REPEATS = 3
@@ -184,6 +211,9 @@ def yaw_of(q: np.ndarray) -> np.ndarray:
 def ridge_segment(x: float, meta: dict) -> str:
     """Which part of the (origin-centred) ridge a base x sits on."""
     run = meta["height"] / math.tan(math.radians(meta["up_deg"]))
+    if "crest_x" in meta:  # uphill series: no plateau end and no down face, the plateau runs on
+        crest = meta["crest_x"]
+        return "approach" if x < crest - run else "up face" if x < crest else "plateau"
     half = 0.5 * meta["plateau"]
     if x < -half - run:
         return "approach"
@@ -249,18 +279,22 @@ def ostrich_ramp_crossing(cfg: DictConfig) -> None:
     logging_config: LoggingConfig = hydra.utils.instantiate(cfg.logging)
     render_config.vis_type = "null"  # batched captured rollout; watch runs with gl_replay.py
 
-    maps_dir = pathlib.Path(cfg.get("maps_dir", ASSETS_DIR))
+    series_name = str(cfg.get("series", "ridge"))
+    if series_name not in SERIES:
+        raise SystemExit(f"+series must be one of {sorted(SERIES)}, got {series_name!r}")
+    series = SERIES[series_name]
+    maps_dir = pathlib.Path(cfg.get("maps_dir", series["assets_dir"]))
     repeats = int(cfg.get("repeats", DEFAULT_REPEATS))
     v = float(cfg.get("v", DEFAULT_V))
     slack = float(cfg.get("slack", DEFAULT_SLACK))
     mu = float(cfg.get("mu", DEFAULT_MU))
     settle_steps = int(cfg.get("settle_steps", DEFAULT_SETTLE_STEPS))
-    out = pathlib.Path(cfg.get("out", DEFAULT_OUT))
+    out = pathlib.Path(cfg.get("out", series["out"]))
     dt = float(sim_config.target_timestep_seconds)
 
-    paths = ramp_series_paths(maps_dir)
+    paths = series["paths"](maps_dir)
     if not paths:
-        raise SystemExit(f"no ramp_a*.png in {maps_dir} -- run heightmap/create_ramp_series.py first")
+        raise SystemExit(f"no {series['glob']} in {maps_dir} -- run {series['generator']} first")
     metas = [yaml.safe_load(p.with_suffix(".yaml").read_text()) for p in paths]
     if cfg.get("angles", None) is not None:
         wanted = {round(float(a), 3) for a in cfg.angles}
@@ -326,12 +360,12 @@ def ostrich_ramp_crossing(cfg: DictConfig) -> None:
             crossed_up_to = m["up_deg"]
     print(f"\nevery repeat crosses, contiguously from the shallowest map, up to: "
           f"{'none' if crossed_up_to is None else f'{crossed_up_to:.0f} deg'}   "
-          f"(helhest_stack settle 'blocked': 15 deg)")
+          f"(helhest_stack settle 'blocked': {series['blocked_deg']} deg)")
 
     write_comparison(
         out,
         root=dict(
-            name="ostrich_ramp_crossing", n=n, repeats=repeats, v=v, mu=mu, slack=slack,
+            name=out.stem, series=series_name, n=n, repeats=repeats, v=v, mu=mu, slack=slack,
             settle_steps=settle_steps, obstacle_x=0.0, maps_dir=str(maps_dir),
         ),
         per_variant=dict(
