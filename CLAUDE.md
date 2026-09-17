@@ -65,9 +65,10 @@ default checkpoint: halfway between `tau*` (the worst arc on the best path) on t
 ostrich climbs, and the 65° map, which it fails. That boundary comes from
 `demos/ostrich_ramp_crossing.py +series=uphill`: 5–60° cross in 3/3 repeats, 65–75° flip at the
 foot in 3/3. A new checkpoint needs a new calibration. `--plot-dir` writes one 2×2 bird's-eye PNG
-per map (one panel per arm, with the planned path). torch in the root env can't use the GTX 1050
-(sm_61 is not in the cu128 build), so inference runs on CPU; each map is row-invariant, so only one
-row gets evaluated (checked). `--self-test` covers the gate and the inference shortcut.
+per map (one panel per arm, with the planned path). Inference defaults to CPU (`--torch-device`);
+each map is row-invariant, so only one row gets evaluated (checked). On the ThinkPad-T15p-Gen-1
+machine only, torch from the root `.venv` can't use the GTX 1050 — for GPU torch there, activate
+`.venv-cu126` instead (`source .venv-cu126/bin/activate`, then plain `python`, not `uv run`). `--self-test` covers the gate and the inference shortcut.
 
 `demos/` is smaller and less settled — still worth treating as scratch, not architecture.
 `helhest_common.py`, `ostrich_keyboard.py`, and `ostrich_vel_cmd*.py` mirror
@@ -75,7 +76,27 @@ row gets evaluated (checked). `--self-test` covers the gate and the inference sh
 shared root env instead of `ostrich`'s own; `ostrich_speed_bump.py` recreates one bump height of
 `comparator.compare_speed_bumps` as a single-run GL-viewer-or-headless demo, reusing that
 module's `ScenarioSpec` and `comparator.common`'s wheel-servo gain rather than re-deriving them;
-`hstack_vel_cmd.py` is the helhest_stack-side counterpart. (`helhest_in_ostrich.py`, referenced
+`hstack_vel_cmd.py` is the helhest_stack-side counterpart.
+`ostrich_follow_path.py` plans on one heightmap with a `bench_uphill_nn.py` planner
+(`--planner vanilla-off|vanilla-on|nn-gated-pos|nn-gated-pitch|nn-gated-rot|nn-gated-fused`; e_rot comes from the
+pos_rot sibling checkpoint `--checkpoint-rot`, `TAU_ROT` 0.38 was picked from
+parallel-worlds runs of the uphill series -- straight paths to 55°, no path from 60°, where pure
+pursuit arrives only half the time -- not a tau* calibration; `nn-gated-fused` prunes an arc when
+the pos_rot net's e_pos > `TAU_FUSED_POS` 0.30 OR e_rot > `TAU_FUSED_ROT` 0.46, both mid-window from
+an offline planner scan of the same series, so equally uncalibrated), then drives that path in ostrich
+with a pure-pursuit Warp kernel inside the captured step (`--repeats` worlds, or `--view` for the
+live GL viewer), writing a verdict table, a bird's-eye PNG and a replayable h5 to
+`outputs/follow_path/`. It imports `benchmarks.bench_uphill_nn`, so run it as
+`python -m demos.ostrich_follow_path`. `ostrich_follow_path_parallel_worlds.py` is its batch
+form (headless, no `--view`): plans every (`--maps` × `--pairs` × `--planners`), then runs every
+(map, start/goal pair, planner, repeat) as a replicated world of ONE build — replicated worlds collide only with
+global shapes, never each other, so pairs on the same map share a footprint, and different maps sit
+on `lattice_learning.tiled_terrain` tiles with offsets added at spawn/path and subtracted from the
+logs; worlds sorted by path length, split into builds by `--worlds-per-build` (GPU memory). Pair 0
+is the sidecar's start/goal; the other `--pairs` − 1 are sampled per map (seeded by map name) from
+the heightmap alone -- start with random yaw on the map's lowest level with the terrain around each
+wheel contact under that wheel's rim, goal with a wheelbase-radius disc on its highest level.
+`<map>_p<K>_<planner>` PNG/h5 plus `summary.yaml` in `outputs/follow_path_parallel/`. (`helhest_in_ostrich.py`, referenced
 in earlier versions of this file, no longer exists.)
 
 Two things that pattern has to get right, and that any further root-level `demos/` script will

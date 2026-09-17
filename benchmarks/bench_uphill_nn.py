@@ -231,12 +231,14 @@ def build_gated_solver(ctg: CostToGo) -> EdgeGatedLatticeSolver:
 # --- network --------------------------------------------------------------------------------------
 
 
-def load_network(path: pathlib.Path, device: torch.device, ctg: CostToGo) -> ArcDivergenceNet:
+def load_network(
+    path: pathlib.Path, device: torch.device, ctg: CostToGo, label_mode: str = "pos_rpy"
+) -> ArcDivergenceNet:
     """Loads the checkpoint and asserts the pinned constants match the lattice it will gate
     (design.md section 4c): a net trained on other arcs is silently wrong, not broken."""
     model, ckpt = load_checkpoint(path, device)
     model.eval()
-    assert ckpt["label_mode"] == "pos_rpy", f"need a pos_rpy checkpoint, got {ckpt['label_mode']}"
+    assert ckpt["label_mode"] == label_mode, f"need a {label_mode} checkpoint, got {ckpt['label_mode']}"
     assert ckpt["command_mode"] == "kappa", f"expected command_mode kappa, got {ckpt['command_mode']}"
     assert math.isclose(ckpt["arc_len"], STEP), f"checkpoint arc_len {ckpt['arc_len']} != {STEP}"
     assert math.isclose(ckpt["min_turn_radius"], float(ctg.robot.min_turn_radius), rel_tol=1e-6), (
@@ -292,8 +294,9 @@ def arc_error_fields(
     ctg: CostToGo,
     chunk: int,
     device: torch.device,
+    heads: tuple[str, ...] = tuple(CRITERIA.values()),
 ) -> dict[str, np.ndarray]:
-    """{"e_pos", "e_pitch"} -> [ny, nx, n_theta, n_prim] predicted error per lattice arc. When all
+    """{head in `heads`} -> [ny, nx, n_theta, n_prim] predicted error per lattice arc. When all
     rows of the map are identical the patch cannot depend on the row (see module docstring), so row
     0 is evaluated and broadcast; otherwise every row is."""
     ny, nx = ctg.grid.cells_y, ctg.grid.cells_x
@@ -303,7 +306,7 @@ def arc_error_fields(
     pred = predict_arcs(model, terrain, lattice_poses(ctg, rows), kappas, chunk, device)
     pred = pred.reshape(len(rows), nx, N_THETA, len(kappas), -1)
     names = model.target_names
-    fields = {name: pred[..., names.index(name)] for name in CRITERIA.values()}
+    fields = {name: pred[..., names.index(name)] for name in heads}
     if row_invariant:
         fields = {k: np.ascontiguousarray(np.broadcast_to(v, (ny, *v.shape[1:]))) for k, v in fields.items()}
     return fields
