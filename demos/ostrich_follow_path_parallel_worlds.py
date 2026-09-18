@@ -13,8 +13,8 @@ How the worlds are laid out (what ostrich/newton allow)
     * The engine runs a fixed iteration count, so a flipped or finished world costs the same as a
       driving one and doesn't slow the batch. Worlds are sorted by path length and split into
       builds of at most --worlds-per-build (GPU memory); each build steps as long as its longest path.
-    * Controller: `ostrich_follow_path`'s pure-pursuit kernel reading its world's own path out of
-      one flat waypoint buffer (`path_begin[w]`, `path_count[w]`), inside the captured step.
+    * Controller: feasibility.planning.pure_pursuit's kernel, each world reading its own path out
+      of one flat waypoint buffer, inside the captured step.
 
 Start/goal pairs per map (--pairs, default 3)
     Pair 0 is always the sidecar's own start/goal (on the uphill series: the centre straight line,
@@ -30,13 +30,17 @@ Start/goal pairs per map (--pairs, default 3)
     * both keep every checked point EDGE_MARGIN inside the grid.
     Rejection sampling; a map with no admissible start or goal raises.
 
-Planning is the single-map script's own `plan_path` (planners, taus, checkpoints identical);
+Planning is feasibility.planning.planners.plan_path, as in the single-map script;
 a (map, pair, planner) with no feasible path gets no worlds and shows as "no path" in the summary.
 
 Outputs (<out-dir>/)
     <map>_p<K>_<planner>.png / .h5   as ostrich_follow_path.py writes them, one per start/goal
                                      pair K (replay with gl_replay.py --file ... --id R --which ostrich)
-    summary.yaml                     (map, pair) x planners arrived counts, the pairs, settings, wall time
+    summary.yaml                     (map, pair) x planners arrived counts, the worst arc's predicted
+                                     errors on each planned path (max_err: e_pos_rot / e_rot / fused
+                                     from the pos_rot net, also for the ungated vanilla planners, so
+                                     their outcomes can calibrate the fused taus), the pairs,
+                                     settings, wall time
 
 Run as a module (imports benchmarks/ and demos/, needs the repo root on sys.path):
     python -m demos.ostrich_follow_path_parallel_worlds
@@ -48,7 +52,7 @@ Run as a module (imports benchmarks/ and demos/, needs the repo root on sys.path
 CLI parameters:
     --maps PATH ...        map stems (PNG + YAML with start/goal), or directories whose *.png are
                            all taken (default: assets/uphill_series)
-    --planners NAME ...    any of ostrich_follow_path.PLANNERS
+    --planners NAME ...    any of feasibility.planning.planners.PLANNERS
                            (default: nn-gated-pos nn-gated-pitch nn-gated-rot nn-gated-fused)
     --pairs INT            start/goal pairs per map, the sidecar's first (default: 3)
     --seed INT             pair sampling seed, combined with each map's name (default: 0)
@@ -71,25 +75,11 @@ import zlib
 from dataclasses import dataclass
 
 import numpy as np
-import warp as wp
 import yaml
-from examples.helhest_junior.replay_real import WHEEL_DOF_OFFSET
-from helhest import dynamics
 
 from demos.ostrich_follow_path import add_shared_args
-from demos.ostrich_follow_path import CHASSIS_LOCAL_IDX
-from demos.ostrich_follow_path import judge
-from demos.ostrich_follow_path import plan_path
-from demos.ostrich_follow_path import PlanContext
-from demos.ostrich_follow_path import PLANNERS
 from demos.ostrich_follow_path import plot_run
 from demos.ostrich_follow_path import REPO_ROOT
-from demos.ostrich_follow_path import resample_polyline
-from demos.ostrich_follow_path import SEARCH_WINDOW
-from demos.ostrich_follow_path import STOP_RADIUS
-from demos.ostrich_follow_path import WAYPOINT_SPACING
-from feasibility.comparator.common import HALF_TRACK
-from feasibility.comparator.common import HelhestBatchSimulator
 from feasibility.comparator.common import K_P
 from feasibility.comparator.common import WHEEL_RADIUS
 from feasibility.comparator.provenance import write_comparison
@@ -99,6 +89,14 @@ from feasibility.lattice_learning.patch import WHEEL_CONTACTS_LOCAL
 from feasibility.lattice_learning.generate_dataset import compose_ostrich_config
 from feasibility.lattice_learning.tiled_terrain import tile_offsets
 from feasibility.lattice_learning.tiled_terrain import TiledTerrain
+from feasibility.planning.evaluation import judge
+from feasibility.planning.planners import plan_path
+from feasibility.planning.planners import PlanContext
+from feasibility.planning.planners import PlannerConfig
+from feasibility.planning.planners import PLANNERS
+from feasibility.planning.pure_pursuit import controller_kappa_max
+from feasibility.planning.pure_pursuit import PurePursuitSimulator
+from feasibility.planning.pure_pursuit import resample_polyline
 
 DEFAULT_PLANNERS = ("nn-gated-pos", "nn-gated-pitch", "nn-gated-rot", "nn-gated-fused")
 SPAWN_HEIGHT = 0.5  # [m] above the terrain, HelhestBatchSimulator's own default spawn
@@ -128,154 +126,6 @@ class Job:
     path: np.ndarray  # [P, 2] resampled waypoints, map coordinates
     path_len: float
     drive_steps: int
-
-
-# --- simulation -----------------------------------------------------------------------------------
-
-
-@wp.kernel
-def _pure_pursuit_multi_kernel(
-    body_q: wp.array(dtype=wp.transform),
-    path_flat: wp.array(dtype=wp.vec2),  # every world's waypoints back to back, tile coordinates
-    path_begin: wp.array(dtype=wp.int32),  # [W] first waypoint of world w in path_flat
-    path_count: wp.array(dtype=wp.int32),  # [W] waypoints of world w
-    progress: wp.array(dtype=wp.int32),  # [W] nearest waypoint so far, local index (monotonic)
-    stopped: wp.array(dtype=wp.int32),  # [W] latched 1 once within stop_radius of the goal
-    step_buf: wp.array(dtype=wp.int32),
-    settle_steps: int,
-    lookahead: float,
-    v: float,
-    kappa_max: float,
-    stop_radius: float,
-    wheel_radius: float,
-    half_track: float,
-    joint_target_vel: wp.array(dtype=wp.float32),
-    bodies_per_world: int,
-    dofs_per_world: int,
-    wheel_dof_offset: int,
-):
-    # ostrich_follow_path._pure_pursuit_kernel with path[k] -> path_flat[b + k], n -> path_count[w]
-    w = wp.tid()
-    base = w * dofs_per_world + wheel_dof_offset
-    tf = body_q[w * bodies_per_world + CHASSIS_LOCAL_IDX]
-    p = wp.transform_get_translation(tf)
-    b = path_begin[w]
-    n = path_count[w]
-    goal = path_flat[b + n - 1]
-    if (goal[0] - p[0]) * (goal[0] - p[0]) + (goal[1] - p[1]) * (goal[1] - p[1]) < stop_radius * stop_radius:
-        stopped[w] = 1
-    if step_buf[0] < settle_steps or stopped[w] == 1:
-        joint_target_vel[base + 0] = 0.0
-        joint_target_vel[base + 1] = 0.0
-        joint_target_vel[base + 2] = 0.0
-        return
-
-    i0 = progress[w]
-    best = i0
-    q = path_flat[b + i0]
-    best_d = (q[0] - p[0]) * (q[0] - p[0]) + (q[1] - p[1]) * (q[1] - p[1])
-    for k in range(i0 + 1, wp.min(i0 + SEARCH_WINDOW, n)):
-        q = path_flat[b + k]
-        d = (q[0] - p[0]) * (q[0] - p[0]) + (q[1] - p[1]) * (q[1] - p[1])
-        if d < best_d:
-            best = k
-            best_d = d
-    progress[w] = best
-
-    target = n - 1
-    found = int(0)
-    for k in range(best, n):
-        if found == 0:
-            q = path_flat[b + k]
-            d = (q[0] - p[0]) * (q[0] - p[0]) + (q[1] - p[1]) * (q[1] - p[1])
-            if d >= lookahead * lookahead:
-                target = k
-                found = 1
-
-    fwd = wp.quat_rotate(wp.transform_get_rotation(tf), wp.vec3(1.0, 0.0, 0.0))
-    t = path_flat[b + target]
-    dx = t[0] - p[0]
-    dy = t[1] - p[1]
-    alpha = wp.atan2(dy, dx) - wp.atan2(fwd[1], fwd[0])
-    alpha = wp.atan2(wp.sin(alpha), wp.cos(alpha))
-    dist = wp.max(wp.sqrt(dx * dx + dy * dy), 1e-3)
-    kappa = wp.clamp(2.0 * wp.sin(alpha) / dist, -kappa_max, kappa_max)
-    wz = v * kappa
-    joint_target_vel[base + 0] = (v - wz * half_track) / wheel_radius
-    joint_target_vel[base + 1] = (v + wz * half_track) / wheel_radius
-    joint_target_vel[base + 2] = v / wheel_radius
-
-
-class ParallelPathFollowSimulator(HelhestBatchSimulator):
-    """HelhestBatchSimulator whose control is the multi-path pure-pursuit kernel: world w follows
-    `paths[w]` (already in the build's tile coordinates). Headless only."""
-
-    def __init__(
-        self,
-        *args,
-        paths: list[np.ndarray],
-        settle_steps: int,
-        lookahead: float,
-        v: float,
-        kappa_max: float,
-        **kwargs,
-    ) -> None:
-        super().__init__(*args, **kwargs)
-        device = self.model.device
-        num_worlds = self.simulation_config.num_worlds
-        assert len(paths) == num_worlds, f"{len(paths)} paths for {num_worlds} worlds"
-        counts = np.array([len(p) for p in paths], np.int32)
-        begins = np.concatenate([[0], np.cumsum(counts)[:-1]]).astype(np.int32)
-        flat = np.concatenate(paths).astype(np.float32)
-        self._path_flat = wp.array(flat, dtype=wp.vec2, device=device)
-        self._path_begin = wp.array(begins, dtype=wp.int32, device=device)
-        self._path_count = wp.array(counts, dtype=wp.int32, device=device)
-        self._progress = wp.zeros(num_worlds, dtype=wp.int32, device=device)
-        self._stopped = wp.zeros(num_worlds, dtype=wp.int32, device=device)
-        self._settle_steps = int(settle_steps)
-        self._lookahead, self._v, self._kappa_max = float(lookahead), float(v), float(kappa_max)
-
-    def _batch_physics_step(self) -> None:
-        self.current_state.clear_forces()
-        self.contacts = self.model.collide(self.current_state)
-        wp.launch(
-            kernel=_pure_pursuit_multi_kernel,
-            dim=self.simulation_config.num_worlds,
-            inputs=[
-                self.current_state.body_q, self._path_flat, self._path_begin, self._path_count,
-                self._progress, self._stopped, self._step_buf, self._settle_steps, self._lookahead,
-                self._v, self._kappa_max, STOP_RADIUS, float(WHEEL_RADIUS), HALF_TRACK,
-                self.control.joint_target_vel, self.bodies_per_world, self.dofs_per_world,
-                WHEEL_DOF_OFFSET,
-            ],
-            device=self.model.device,
-        )
-        self.solver.step(
-            state_in=self.current_state,
-            state_out=self.next_state,
-            control=self.control,
-            contacts=self.contacts,
-            dt=self.clock.dt,
-        )
-        self._copy_state(self.current_state, self.next_state)
-        self._log_step(self._step_buf, self._T, self._pose_log, self._wheel_log)
-
-    def rollout(self, T: int) -> tuple[np.ndarray, np.ndarray]:
-        """One captured step launched T times. Returns pose [T, W, 7], wheel_qd [T, W, 3]."""
-        device = self.model.device
-        num_worlds = self.simulation_config.num_worlds
-        self._T = T
-        self._step_buf = wp.zeros(1, dtype=wp.int32, device=device)
-        self._pose_log = wp.zeros((T, num_worlds, 7), dtype=wp.float32, device=device)
-        self._wheel_log = wp.zeros((T, num_worlds, 3), dtype=wp.float32, device=device)
-        self._jq = wp.zeros_like(self.model.joint_q)  # _log_step's eval_ik buffers
-        self._jqd = wp.zeros_like(self.model.joint_qd)
-        with wp.ScopedCapture() as capture:
-            self._batch_physics_step()
-        for _ in range(T):
-            wp.capture_launch(capture.graph)
-        wp.synchronize()
-        return self._pose_log.numpy(), self._wheel_log.numpy()
 
 
 # --- stages ---------------------------------------------------------------------------------------
@@ -363,18 +213,18 @@ def plan_all(
     args: argparse.Namespace,
     dt: float,
 ) -> tuple[dict[tuple[int, int, str], dict], list[Job]]:
-    ctx = PlanContext(args)
+    ctx = PlanContext(PlannerConfig.from_args(args))
     plans, jobs = {}, []
     for m, (stem, terrain) in enumerate(zip(stems, terrains)):
         for k, (start, goal) in enumerate(pairs[m]):
             for planner in args.planners:
-                plan = plan_path(terrain, start, goal, planner, ctx)
+                plan = plan_path(terrain, start, goal, planner, ctx, audit=True)
                 name = f"{stem.name} p{k} {planner}" + (f" ({plan['gate']})" if plan["gate"] else "")
                 plans[(m, k, planner)] = plan
                 if not plan["reached"]:
                     print(f"  {name}: no path (V* = {plan['v_start']:.2f})")
                     continue
-                path = resample_polyline(np.vstack([plan["xy"], goal]), WAYPOINT_SPACING)
+                path = resample_polyline(np.vstack([plan["xy"], goal]))
                 path_len = float(np.linalg.norm(np.diff(path, axis=0), axis=1).sum())
                 plan.update(path=path, path_len=path_len)
                 drive_steps = int(math.ceil(args.slack * path_len / args.v / dt))
@@ -399,7 +249,7 @@ def simulate(
     else:
         offsets = tile_offsets(terrains)
         terrain = TiledTerrain(terrains, offsets)
-    kappa_max = 1.0 / float(dynamics.robot_params().min_turn_radius)
+    kappa_max = controller_kappa_max()
     order = sorted(range(len(jobs)), key=lambda j: jobs[j].drive_steps)
     poses: list[np.ndarray] = [None] * len(jobs)
     wheels: list[np.ndarray] = [None] * len(jobs)
@@ -423,7 +273,7 @@ def simulate(
         t0 = time.time()
         sim = None
         try:
-            sim = ParallelPathFollowSimulator(
+            sim = PurePursuitSimulator(
                 sim_config, render_config, engine_config, logging_config,
                 k_p=K_P, mu_front=args.mu, mu_rear=args.mu, terrain=terrain,
                 spawn_pose=spawn_pose, spawn_zpr=spawn_zpr,
@@ -508,12 +358,15 @@ def main() -> None:
 
     # --- C. verdicts + outputs ------------------------------------------------------------------
     summary: dict[str, dict[str, str]] = {}
+    path_err: dict[str, dict[str, dict[str, float]]] = {}  # worst arc on each planned path
     for m, stem in enumerate(stems):
         for k, (start, goal) in enumerate(pairs[m]):
             row_name = f"{stem.name}_p{k}"
             summary[row_name] = {}
+            path_err[row_name] = {}
             for planner in args.planners:
                 plan = plans[(m, k, planner)]
+                path_err[row_name][planner] = {h: round(float(v), 4) for h, v in plan["max_err"].items()}
                 gate = f", gate {plan['gate']}" if plan["gate"] else ""
                 if not plan["reached"]:
                     summary[row_name][planner] = "no path"
@@ -579,6 +432,7 @@ def main() -> None:
     args.out_dir.mkdir(parents=True, exist_ok=True)
     (args.out_dir / "summary.yaml").write_text(yaml.safe_dump(dict(
         arrived=summary,
+        max_err=path_err,
         pairs={f"{stem.name}_p{k}": dict(start=list(s), goal=list(g))
                for stem, map_pairs in zip(stems, pairs) for k, (s, g) in enumerate(map_pairs)},
         taus=dict(e_pos=args.tau_pos, e_pitch=args.tau_pitch, e_rot=args.tau_rot,

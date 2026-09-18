@@ -96,6 +96,7 @@ from feasibility.heightmap.create_uphill_series import ASSETS_DIR as UPHILL_ASSE
 from feasibility.heightmap.create_uphill_series import uphill_series_paths
 from feasibility.lattice_learning.tiled_terrain import tile_offsets
 from feasibility.lattice_learning.tiled_terrain import TiledTerrain
+from feasibility.planning.evaluation import pitch_roll
 
 CONFIG_PATH = pathlib.Path(examples.__file__).parent.joinpath("conf")
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -191,16 +192,6 @@ class RampCrossingSimulator(HelhestBatchSimulator):
         )
         self._copy_state(self.current_state, self.next_state)
         self._log_step(self._step_buf, self._T, self._pose_log, self._wheel_log)
-
-
-def pitch_roll(q: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """q [..., 4] (qx, qy, qz, qw) -> (pitch, roll, up_z), R = Rz@Ry@Rx. pitch is nose-up NEGATIVE
-    (helhest_stack's convention); up_z is the chassis up-vector's world z (< 0 = upside down)."""
-    qx, qy, qz, qw = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
-    r20 = 2.0 * (qx * qz - qw * qy)
-    r21 = 2.0 * (qy * qz + qw * qx)
-    r22 = 1.0 - 2.0 * (qx * qx + qy * qy)
-    return np.arcsin(np.clip(-r20, -1.0, 1.0)), np.arctan2(r21, r22), r22
 
 
 def yaw_of(q: np.ndarray) -> np.ndarray:

@@ -22,11 +22,12 @@ infeasible:
     nn_pitch  same, with e_pitch > tau_pitch
 
 The per-arc gate is a local copy of `lattice_solver._relax_lattice_pose_kernel` with one extra
-check (`EdgeGatedLatticeSolver`); helhest_stack is not modified. The network is queried at exactly
+check (`feasibility.planning.gated_lattice.EdgeGatedLatticeSolver`); helhest_stack is not modified. The network is queried at exactly
 the poses `CostToGo`'s settle judges -- (origin_x + c*cell, origin_y + r*cell, heading-bin centre)
 -- with the curvature of each of the lattice's five forward primitives (`arc.primitive_kappas`).
 
-THRESHOLDS. Two global constants, TAU_POS = 0.1741 m and TAU_PITCH = 0.0933 rad, applied to every
+THRESHOLDS. Two global constants, TAU_POS = 0.1741 m and TAU_PITCH = 0.0933 rad (kept in
+`feasibility.planning.planners`, which every gated planner reads its defaults from), applied to every
 map (override with --tau-pos / --tau-pitch). They were calibrated ONCE, for the default checkpoint:
 ostrich climbs the 60 deg face and flips at the foot of the 65 deg one
 (`demos/ostrich_ramp_crossing.py +series=uphill`, 3/3 repeats each). For each of those two maps we
@@ -47,12 +48,8 @@ CAVEATS
     * A hard gate can disconnect the lattice (lattice_learning/design.md section 7a). An unreachable
       goal is reported as such, not hidden.
 
-INFERENCE RUNS ON CPU. This env's torch (cu128) does not support the GTX 1050 (sm_61); Warp does, so
-the planning stays on CUDA. The predicted error fields cross host->device once per map. To make CPU
-inference affordable: when every row of the map is identical (true for this whole series), a
-body-frame patch depends only on (column, heading) -- `HeightMapReader.sample` clamps at the Y
-edges, which preserves the invariance exactly -- so one row is evaluated and broadcast. This is
-checked, not assumed; any other map takes the full path (~100 s/map on CPU).
+INFERENCE RUNS ON CPU, with a checked row-invariance shortcut -- see `feasibility.planning.arc_network`.
+The predicted error fields cross host->device once per map.
 
 CLI parameters:
     --dir PATH            uphill series (default: assets/uphill_series)
@@ -82,351 +79,30 @@ import warp as wp
 import yaml
 from helhest import dynamics
 from helhest.planning.costtogo import CostToGo
-from helhest.planning.lattice_solver import LatticeValueSolver
 
 from feasibility.heightmap import HeightMapReader
 from feasibility.heightmap.create_uphill_series import ASSETS_DIR
 from feasibility.heightmap.create_uphill_series import uphill_ramp
 from feasibility.heightmap.create_uphill_series import uphill_series_paths
 from feasibility.lattice_learning.arc import primitive_kappas
-from feasibility.lattice_learning.model import ArcDivergenceNet
 from feasibility.lattice_learning.patch import sample_patches
-from feasibility.lattice_learning.train import load_checkpoint
+from feasibility.planning.arc_network import arc_error_fields
+from feasibility.planning.arc_network import lattice_poses
+from feasibility.planning.arc_network import load_network
+from feasibility.planning.arc_network import predict_arcs
+from feasibility.planning.gated_lattice import arm_result
+from feasibility.planning.gated_lattice import build_gated_solver
+from feasibility.planning.gated_lattice import gated_solve
+from feasibility.planning.gated_lattice import lattice_state
+from feasibility.planning.gated_lattice import make_cost_to_go
+from feasibility.planning.gated_lattice import N_THETA
+from feasibility.planning.planners import DEFAULT_CHECKPOINT
+from feasibility.planning.planners import TAU_PITCH
+from feasibility.planning.planners import TAU_POS
 
-REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-DEFAULT_CHECKPOINT = (
-    REPO_ROOT / "outputs" / "checkpoints" / "dataset_arc_my_config_M200_R8_seed0_rpy.pt"
-)
-N_THETA = 24
-STEP = 0.3  # [m] CostToGo's default arc length -- asserted against the checkpoint's arc_len
-# One-time calibration for DEFAULT_CHECKPOINT, see THRESHOLDS in the module docstring
-TAU_POS = 0.1741  # [m]
-TAU_PITCH = 0.0933  # [rad]
 PASS_DEG, FAIL_DEG = 60.0, 65.0  # ostrich climbs / fails -- the bracket the taus were set from
 CRITERIA = {"nn_pos": "e_pos", "nn_pitch": "e_pitch"}  # arm -> network head it gates on
 ARMS = ("off", "on", *CRITERIA)
-
-
-@wp.kernel
-def _relax_gated_kernel(
-    dist_in: wp.array(dtype=wp.float32, ndim=3),
-    blocked: wp.array(dtype=wp.float32, ndim=3),
-    tilt: wp.array(dtype=wp.float32, ndim=3),
-    prim_dr: wp.array(dtype=wp.int32, ndim=2),
-    prim_dc: wp.array(dtype=wp.int32, ndim=2),
-    prim_heading: wp.array(dtype=wp.int32, ndim=2),
-    prim_cost: wp.array(dtype=wp.float32, ndim=2),
-    sweep_dr: wp.array(dtype=wp.int32, ndim=3),
-    sweep_dc: wp.array(dtype=wp.int32, ndim=3),
-    sweep_n: wp.array(dtype=wp.int32, ndim=2),
-    n_prim: wp.int32,
-    tilt_weight: wp.float32,
-    inf: wp.float32,
-    arc_error: wp.array(dtype=wp.float32, ndim=4),  # [h, w, n_theta, n_prim] predicted error
-    tau: wp.float32,  # arc pruned when arc_error > tau
-    dist_out: wp.array(dtype=wp.float32, ndim=3),
-    changed: wp.array(dtype=wp.int32),
-):
-    """lattice_solver._relax_lattice_pose_kernel, verbatim, plus ONE gate: primitive p out of pose
-    (r, c, t) is skipped when arc_error[r, c, t, p] > tau. Indexed at the source pose, like every
-    other per-arc table the relaxation reads."""
-    r, c, t = wp.tid()
-    h = dist_in.shape[0]
-    w = dist_in.shape[1]
-    if blocked[r, c, t] > 0.5:
-        dist_out[r, c, t] = inf
-        return
-    best = dist_in[r, c, t]
-    for p in range(n_prim):
-        ok = int(1)
-        if arc_error[r, c, t, p] > tau:
-            ok = 0
-        ns = sweep_n[t, p]
-        tsum = float(0.0)
-        for s in range(ns):
-            sr = r + sweep_dr[t, p, s]
-            sc = c + sweep_dc[t, p, s]
-            inb = int(0)
-            if sr >= 0 and sr < h and sc >= 0 and sc < w:
-                inb = 1
-            scr = wp.clamp(sr, 0, h - 1)
-            scc = wp.clamp(sc, 0, w - 1)
-            if inb == 0 or blocked[scr, scc, t] > 0.5:
-                ok = 0
-            tsum += tilt[scr, scc, t]
-        if ok == 1:
-            nr = r + prim_dr[t, p]
-            nc = c + prim_dc[t, p]
-            if nr >= 0 and nr < h and nc >= 0 and nc < w:
-                arc = prim_cost[t, p]
-                if ns > 0:
-                    arc = arc * (1.0 + tilt_weight * tsum / float(ns))
-                best = wp.min(best, arc + dist_in[nr, nc, prim_heading[t, p]])
-    dist_out[r, c, t] = best
-    if best < dist_in[r, c, t]:
-        changed[0] = 1
-
-
-class EdgeGatedLatticeSolver(LatticeValueSolver):
-    """LatticeValueSolver whose relaxation also prunes individual ARCS by a predicted error field.
-    Built with the same arguments CostToGo uses, so its primitive tables are identical (asserted in
-    build_gated_solver). `set_gate` must be called before `_record_solve`."""
-
-    def set_gate(self, arc_error: wp.array, tau: float) -> None:
-        assert arc_error.shape == (self.height, self.width, self.n_theta, self.n_prim)
-        self._arc_error = arc_error
-        self._tau = float(tau)
-
-    def _relax(
-        self,
-        dist_in: wp.array,
-        dist_out: wp.array,
-        blocked: wp.array,
-        tilt: wp.array,
-        tilt_weight: float,
-    ) -> None:
-        wp.launch(
-            _relax_gated_kernel,
-            dim=(self.height, self.width, self.n_theta),
-            inputs=[
-                dist_in,
-                blocked,
-                tilt,
-                self._prim_dr,
-                self._prim_dc,
-                self._prim_heading,
-                self._prim_cost,
-                self._sweep_dr,
-                self._sweep_dc,
-                self._sweep_n,
-                self.n_prim,
-                float(tilt_weight),
-                self._inf,
-                self._arc_error,
-                self._tau,
-            ],
-            outputs=[dist_out, self._changed],
-            device=self.device,
-        )
-
-
-def build_gated_solver(ctg: CostToGo) -> EdgeGatedLatticeSolver:
-    """An EdgeGatedLatticeSolver with CostToGo's own lattice, primitive tables asserted identical --
-    trace_states reads ctg.solver's tables for every arm."""
-    grid = ctg.grid
-    solver = EdgeGatedLatticeSolver(
-        grid.cell_size,
-        grid.cells_y,
-        grid.cells_x,
-        n_theta=N_THETA,
-        turn_radius=ctg.robot.min_turn_radius,
-        step=STEP,
-        device=ctg.device,
-    )
-    for name in ("_prim_dr", "_prim_dc", "_prim_heading", "_prim_cost", "_sweep_dr", "_sweep_dc"):
-        assert np.array_equal(getattr(solver, name).numpy(), getattr(ctg.solver, name).numpy()), name
-    return solver
-
-
-# --- network --------------------------------------------------------------------------------------
-
-
-def load_network(
-    path: pathlib.Path, device: torch.device, ctg: CostToGo, label_mode: str = "pos_rpy"
-) -> ArcDivergenceNet:
-    """Loads the checkpoint and asserts the pinned constants match the lattice it will gate
-    (design.md section 4c): a net trained on other arcs is silently wrong, not broken."""
-    model, ckpt = load_checkpoint(path, device)
-    model.eval()
-    assert ckpt["label_mode"] == label_mode, f"need a {label_mode} checkpoint, got {ckpt['label_mode']}"
-    assert ckpt["command_mode"] == "kappa", f"expected command_mode kappa, got {ckpt['command_mode']}"
-    assert math.isclose(ckpt["arc_len"], STEP), f"checkpoint arc_len {ckpt['arc_len']} != {STEP}"
-    assert math.isclose(ckpt["min_turn_radius"], float(ctg.robot.min_turn_radius), rel_tol=1e-6), (
-        f"checkpoint min_turn_radius {ckpt['min_turn_radius']} != robot "
-        f"{ctg.robot.min_turn_radius}"
-    )
-    # arc.primitive_kappas is in _build_primitives' `turns` order (asserted by arc.py's own
-    # self-test); pivots would append primitives the net has no curvature for
-    assert ctg.solver.n_prim == 5, f"expected 5 forward primitives (pivots off), got {ctg.solver.n_prim}"
-    return model
-
-
-@torch.no_grad()
-def predict_arcs(
-    model: ArcDivergenceNet,
-    terrain: HeightMapReader,
-    poses: np.ndarray,
-    kappas: np.ndarray,
-    chunk: int,
-    device: torch.device,
-) -> np.ndarray:
-    """poses [n, 3] -> [n, n_prim, K] physical errors (model.target_names order). The trunk runs
-    once per pose and only the head once per curvature -- the caching design.md section 5a built
-    the architecture for. Patches come from lattice_learning.patch.sample_patches itself, so the
-    input is by construction what the dataset was built from."""
-    out = np.empty((len(poses), len(kappas), len(model.target_names)), np.float32)
-    assert model.target_transform is not None
-    for i in range(0, len(poses), chunk):
-        patch = torch.from_numpy(sample_patches(terrain, poses[i : i + chunk], model.patch_spec))
-        code = model.terrain_code(patch[:, None].to(device))[..., 0, 0]  # [b, 256]
-        for p, kappa in enumerate(kappas):
-            command = torch.full((code.shape[0], 1), float(kappa), device=device)
-            y = model.target_transform.inverse(model._head(code, command))
-            out[i : i + chunk, p] = y.cpu().numpy()
-    return out
-
-
-def lattice_poses(ctg: CostToGo, rows: np.ndarray) -> np.ndarray:
-    """[len(rows) * nx * n_theta, 3] (x, y, yaw) in C order over (row, col, heading) -- exactly the
-    poses CostToGo.__init__ assigns to its settle (cell corner + bin-centre heading), so the `on`
-    arm and the network arms judge the same lattice states."""
-    grid = ctg.grid
-    rr, cc, tt = np.meshgrid(rows, np.arange(grid.cells_x), np.arange(N_THETA), indexing="ij")
-    x = grid.origin_x + cc * grid.cell_size
-    y = grid.origin_y + rr * grid.cell_size
-    yaw = (tt + 0.5) * 2.0 * np.pi / N_THETA
-    return np.stack([x, y, yaw], axis=-1).reshape(-1, 3)
-
-
-def arc_error_fields(
-    model: ArcDivergenceNet,
-    terrain: HeightMapReader,
-    ctg: CostToGo,
-    chunk: int,
-    device: torch.device,
-    heads: tuple[str, ...] = tuple(CRITERIA.values()),
-) -> dict[str, np.ndarray]:
-    """{head in `heads`} -> [ny, nx, n_theta, n_prim] predicted error per lattice arc. When all
-    rows of the map are identical the patch cannot depend on the row (see module docstring), so row
-    0 is evaluated and broadcast; otherwise every row is."""
-    ny, nx = ctg.grid.cells_y, ctg.grid.cells_x
-    kappas = np.array(primitive_kappas(float(ctg.robot.min_turn_radius)))
-    row_invariant = bool(np.all(terrain.H == terrain.H[:1]))
-    rows = np.arange(1) if row_invariant else np.arange(ny)
-    pred = predict_arcs(model, terrain, lattice_poses(ctg, rows), kappas, chunk, device)
-    pred = pred.reshape(len(rows), nx, N_THETA, len(kappas), -1)
-    names = model.target_names
-    fields = {name: pred[..., names.index(name)] for name in heads}
-    if row_invariant:
-        fields = {k: np.ascontiguousarray(np.broadcast_to(v, (ny, *v.shape[1:]))) for k, v in fields.items()}
-    return fields
-
-
-# --- planning -------------------------------------------------------------------------------------
-
-
-def lattice_state(x: float, y: float, yaw: float, ctg: CostToGo) -> tuple[int, int, int]:
-    """World pose -> (row, col, heading bin), floor mapping as _goal_cell_kernel. The small epsilon
-    keeps a start sitting exactly on a cell boundary from flooring into the previous cell."""
-    grid = ctg.grid
-    return (
-        int(math.floor((y - grid.origin_y) / grid.cell_size + 1e-6)),
-        int(math.floor((x - grid.origin_x) / grid.cell_size + 1e-6)),
-        int(math.floor((yaw % (2.0 * math.pi)) / (2.0 * math.pi / N_THETA))) % N_THETA,
-    )
-
-
-def trace_states(
-    ctg: CostToGo,
-    V: np.ndarray,
-    blocked: np.ndarray,
-    tilt: np.ndarray,
-    start_rct: tuple[int, int, int],
-    arc_error: np.ndarray | None = None,
-    tau: float = math.inf,
-    max_steps: int = 800,
-) -> tuple[list[tuple[int, int, int]], list[int], float, bool]:
-    """Follow the lattice's own policy from the start -> (states, primitive taken per step, billed
-    m, reached). helhest_stack/scripts/bench_ramp_series.py's trace_states restated (scripts/ is not
-    importable) with the arc gate added, so the NN arms trace the policy they were solved with."""
-    s = ctg.solver
-    pdr, pdc = s._prim_dr.numpy(), s._prim_dc.numpy()
-    pheading, pcost = s._prim_heading.numpy(), s._prim_cost.numpy()
-    sdr, sdc, sn = s._sweep_dr.numpy(), s._sweep_dc.numpy(), s._sweep_n.numpy()
-    tilt_weight = float(ctg.flatness_weight)
-    gr, gc = (int(v) for v in ctg._goal_rc.numpy())
-    ny, nx, _ = V.shape
-    vcap = float(ctg._vcap)
-
-    r, c, t = start_rct
-    states, prims, arc_len = [(r, c, t)], [], 0.0
-    for _ in range(max_steps):
-        if abs(r - gr) <= 1 and abs(c - gc) <= 1:
-            return states, prims, arc_len, True
-        best_p, best_val = -1, np.inf
-        for p in range(s.n_prim):
-            if arc_error is not None and arc_error[r, c, t, p] > tau:
-                continue
-            ns, ok, tsum = int(sn[t, p]), True, 0.0
-            for si in range(ns):
-                sr, sc = r + int(sdr[t, p, si]), c + int(sdc[t, p, si])
-                if not (0 <= sr < ny and 0 <= sc < nx) or blocked[sr, sc, t] > 0.5:
-                    ok = False
-                    break
-                tsum += tilt[sr, sc, t]
-            if not ok:
-                continue
-            nr, nc, nt = r + int(pdr[t, p]), c + int(pdc[t, p]), int(pheading[t, p])
-            if not (0 <= nr < ny and 0 <= nc < nx):
-                continue
-            arc = float(pcost[t, p]) * (1.0 + tilt_weight * tsum / ns if ns > 0 else 1.0)
-            val = arc + V[nr, nc, nt]
-            if val < best_val:
-                best_val, best_p = val, p
-        if best_p < 0 or best_val >= vcap * 0.9:
-            return states, prims, arc_len, False
-        arc_len += float(pcost[t, best_p])
-        prims.append(best_p)
-        r, c, t = r + int(pdr[t, best_p]), c + int(pdc[t, best_p]), int(pheading[t, best_p])
-        states.append((r, c, t))
-    return states, prims, arc_len, False
-
-
-def arm_result(
-    ctg: CostToGo,
-    V: np.ndarray,
-    arm_blocked: np.ndarray,
-    tilt: np.ndarray,
-    settle_blocked: np.ndarray,
-    fields: dict[str, np.ndarray],
-    start_rct: tuple[int, int, int],
-    arc_error: np.ndarray | None = None,
-    tau: float = math.inf,
-) -> dict:
-    """V at the start, the traced path, and an audit of that path against the settle's `blocked`
-    and against both network heads (the arcs actually taken)."""
-    V = np.minimum(V, ctg._vcap)
-    states, prims, arc_len, reached = trace_states(
-        ctg, V, arm_blocked, tilt, start_rct, arc_error, tau
-    )
-    rct = np.array(states)
-    taken = rct[:-1]
-    max_err = {
-        name: float(field[taken[:, 0], taken[:, 1], taken[:, 2], prims].max()) if prims else math.nan
-        for name, field in fields.items()
-    }
-    return dict(
-        v_start=float(V[start_rct]),
-        reachable=bool(V[start_rct] < ctg._vcap * 0.9),
-        reached=reached,
-        path_m=arc_len,
-        n_poses=len(states),
-        n_settle_bad=int((settle_blocked[rct[:, 0], rct[:, 1], rct[:, 2]] > 0.5).sum()),
-        max_err=max_err,
-        states=rct,
-    )
-
-
-def gated_solve(
-    solver: EdgeGatedLatticeSolver,
-    ctg: CostToGo,
-    zeros: wp.array,
-    tilt: wp.array,
-    arc_error: wp.array,
-    tau: float,
-) -> np.ndarray:
-    solver.set_gate(arc_error, tau)
-    return solver._record_solve(zeros, tilt, ctg._goal_rc, ctg.flatness_weight, False).numpy()
 
 
 def run_series(args: argparse.Namespace) -> None:
@@ -442,8 +118,7 @@ def run_series(args: argparse.Namespace) -> None:
         assert m["start"] == metas[0]["start"] and m["goal"] == metas[0]["goal"], p.name
 
     robot_params = dynamics.robot_params()
-    ctg = CostToGo(grid, robot_params, dynamics.planning_solver(), n_theta=N_THETA, step=STEP,
-                   device="cuda")
+    ctg = make_cost_to_go(grid)
     gated = build_gated_solver(ctg)
     torch_device = torch.device(args.torch_device)
     model = load_network(args.checkpoint, torch_device, ctg)
@@ -608,8 +283,7 @@ def self_test(args: argparse.Namespace) -> None:
     report something other than what it claims."""
     terrain = uphill_ramp(30.0, x0=-3.0, nx=60, extent_y=2.0)  # 60 x 20 cells
     elev, grid = terrain.to_hstack("cuda")
-    ctg = CostToGo(grid, dynamics.robot_params(), dynamics.planning_solver(), n_theta=N_THETA,
-                   step=STEP, device="cuda")
+    ctg = make_cost_to_go(grid)
     gated = build_gated_solver(ctg)
     goal = (2.0, 0.0)
     ctg.compute(elev, goal)
