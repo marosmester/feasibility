@@ -89,7 +89,8 @@ under-predicts at 0.26+ and 0.24 -- e_rot mid-window from an offline planner sca
 Pure pursuit clamps curvature at `KAPPA_GAIN` 2x the planner's (skid-steer slip) and also stops at the
 path's last waypoint within `GOAL_TOLERANCE` 0.3 m, which `judge` counts as arrived), then drives that path in ostrich
 with `planning.pure_pursuit`'s kernel inside the captured step (`--repeats` worlds, or `--view` for the
-live GL viewer), writing a verdict table, a bird's-eye PNG and a replayable h5 to
+live GL viewer, camera starting at the corner behind-right of the start; `--start-side`/`--goal-side`
+left|center|right shift the sidecar's start/goal perpendicular to the start -> goal line, to 1.5 m of the map edge), writing a verdict table, a bird's-eye PNG and a replayable h5 to
 `outputs/follow_path/`. The script itself keeps only the CLI (`add_shared_args`), `plot_run` and the
 output writing; it runs as `python demos/ostrich_follow_path.py` or `python -m demos.ostrich_follow_path`. `ostrich_follow_path_parallel_worlds.py` is its batch
 form (headless, no `--view`; imports the demo's CLI/plot helpers, so `python -m` only): plans every (`--maps` × `--pairs` × `--planners`), then runs every

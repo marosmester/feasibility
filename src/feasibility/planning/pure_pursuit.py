@@ -230,7 +230,7 @@ class PurePursuitSimulator(HelhestBatchSimulator):
         self._path_ends = wp.array(np.concatenate([q[1:] for q in pts]), dtype=wp.vec3, device=device)
         step = 0
         while self.viewer.is_running() and step < T:
-            if not self.viewer.is_paused():
+            if self.viewer.should_step():  # running, or "." pressed while paused
                 wp.capture_launch(graph)
                 step += 1
             self._maybe_render(step)
