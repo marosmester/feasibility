@@ -96,8 +96,9 @@ from helhest.engine import RobotParams
 
 from feasibility.comparator.provenance import terrain_from_h5
 from feasibility.heightmap import HeightMapReader
-from feasibility.lattice_learning.arc import ARC_LEN
-from feasibility.lattice_learning.arc import integrate_arc
+from feasibility.lattice_learning.arc import ARC_DURATION_S
+from feasibility.lattice_learning.arc import integrate_twist
+from feasibility.lattice_learning.arc import V_NOM
 from feasibility.lattice_learning.custom_dataset import pose_to_se3
 from feasibility.lattice_learning.custom_dataset import rpy_errors
 from feasibility.lattice_learning.custom_dataset import se3_errors
@@ -136,18 +137,22 @@ CAMERA_UP = 0.4  # camera height above max_z, as a fraction of the larger extent
 
 
 def arc_polyline_world(
-    terrain: HeightMapReader, t0_pose: np.ndarray, kappa: float, n_points: int = N_ARC_POINTS,
-    z_offset: float = ARC_LINE_Z_OFFSET,
+    terrain: HeightMapReader, t0_pose: np.ndarray, v: float, wz: float,
+    n_points: int = N_ARC_POINTS, z_offset: float = ARC_LINE_Z_OFFSET,
 ) -> np.ndarray:
-    """[n_points, 3] world (x, y, z) points along the geometric arc from `t0_pose` at curvature
-    `kappa`, via `arc.integrate_arc(t0_pose, kappa, s)` with `s = linspace(0, ARC_LEN, n_points)`
-    -- one call, no loop (`integrate_arc` broadcasts `kappa`/`length` against a single pose). `z`
-    is the terrain height directly under each (x, y) plus `z_offset`, so the guide line follows
-    the ground rather than floating on one flat plane -- same per-point ground-following
-    convention `replay/test_nn.py`'s patch-footprint outline uses."""
-    s = np.linspace(0.0, ARC_LEN, n_points)
-    xy_yaw = integrate_arc(t0_pose, kappa, s)  # [n_points, 3]
+    """[n_points, 3] world (x, y, z) points along the geometric primitive from `t0_pose` under the
+    twist (`v`, `wz`), via `arc.integrate_twist` over `linspace(0, ARC_DURATION_S, n_points)` -- one
+    call, no loop. An arc traces the body origin; a pivot (`v == 0`) leaves the origin in place, so
+    it traces the rear wheel's contact instead, the point that sweeps farthest. `z` is the terrain
+    height directly under each (x, y) plus `z_offset`, so the guide line follows the ground rather
+    than floating on one flat plane -- same per-point ground-following convention
+    `replay/test_nn.py`'s patch-footprint outline uses."""
+    t = np.linspace(0.0, ARC_DURATION_S, n_points)
+    xy_yaw = integrate_twist(t0_pose, v, wz, t)  # [n_points, 3]
     x, y = xy_yaw[:, 0], xy_yaw[:, 1]
+    if v == 0.0:
+        rear = RobotParams().rear_offset
+        x, y = x - rear * np.cos(xy_yaw[:, 2]), y - rear * np.sin(xy_yaw[:, 2])
     z = np.asarray(terrain.sample(x, y), dtype=np.float64) + z_offset
     return np.stack([x, y, z], axis=-1)
 
@@ -161,7 +166,9 @@ class Trial:
     attrs: dict
     map_index: int
     map_path: str
-    kappa: float
+    kappa: float  # NaN on a pivot row
+    v: float  # commanded twist; files without v_drive/wz_drive: (v_nom, v_nom * kappa)
+    wz: float
     valid: bool
     swept_clear: bool
     t0_pose: np.ndarray  # [3]
@@ -202,6 +209,9 @@ def load_trial(path: pathlib.Path, i: int, arc_only: bool = False) -> Trial:
             map_index=int(f["map_index"][i]),
             map_path=f["map_path"].asstr()[i],
             kappa=float(f["kappa"][i]),
+            v=float(f["v_drive"][i]) if "v_drive" in f else float(f.attrs.get("v_nom", V_NOM)),
+            wz=(float(f["wz_drive"][i]) if "wz_drive" in f
+                else float(f.attrs.get("v_nom", V_NOM)) * float(f["kappa"][i])),
             valid=bool(f["valid"][i]),
             swept_clear=bool(f["swept_clear"][i]),
             ramp_deg=float(f["ramp_deg"][i]) if "ramp_deg" in f else float("nan"),
@@ -319,7 +329,7 @@ def place_trial(scene: Scene, trial: Trial) -> None:
     """Park the frozen reference robot at the trial's ref_pose and rebuild its arc guide line;
     the ostrich robot is written every frame by the render loop."""
     scene.joint_q[scene.base_ref:scene.base_ref + 7] = trial.ref_pose
-    points = arc_polyline_world(trial.terrain, trial.t0_pose, trial.kappa).astype(np.float32)
+    points = arc_polyline_world(trial.terrain, trial.t0_pose, trial.v, trial.wz).astype(np.float32)
     device = scene.model.device
     scene.arc_starts = wp.array(points[:-1], dtype=wp.vec3, device=device)
     scene.arc_ends = wp.array(points[1:], dtype=wp.vec3, device=device)

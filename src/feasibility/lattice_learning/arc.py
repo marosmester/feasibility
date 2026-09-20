@@ -31,6 +31,15 @@ ARC_LEN: float = 0.3  # m, = CostToGo's default `step` -- design.md section 4a
 MIN_TURN_RADIUS: float = _ROBOT.min_turn_radius  # m, the router's tightest forward arc
 KAPPA_MAX: float = 1.0 / MIN_TURN_RADIUS  # 1/m
 LEVER: float = _ROBOT.rear_offset + _ROBOT.wheel_radius  # m, rear-wheel lever arm -- design.md 7a
+ARC_DURATION_S: float = ARC_LEN / V_NOM  # 0.5 s -- the time one primitive takes, arc or pivot
+
+# The in-place pivot primitive: `_build_primitives(pivot_cost > 0)` appends two point turns of +-1
+# heading bin, same cell. Pinned the same way the arc is -- one trial turns exactly one bin in the
+# same ARC_DURATION_S a forward arc takes, so OMEGA_NOM * ARC_DURATION_S == PIVOT_ANGLE mirrors
+# V_NOM * ARC_DURATION_S == ARC_LEN.
+N_THETA: int = 24  # the router's heading bin count (CostToGo's n_theta in every consumer)
+PIVOT_ANGLE: float = 2.0 * np.pi / N_THETA  # rad, 15 deg -- one heading bin
+OMEGA_NOM: float = PIVOT_ANGLE / ARC_DURATION_S  # rad/s, ~0.524 -- pinned pivot yaw rate
 
 
 def primitive_kappas(min_turn_radius: float = MIN_TURN_RADIUS) -> tuple[float, float, float, float, float]:
@@ -74,6 +83,25 @@ def integrate_arc(pose: np.ndarray, kappa: np.ndarray | float, length: np.ndarra
     return np.stack([x0 + dx, y0 + dy, yaw1], axis=-1)
 
 
+def integrate_twist(
+    pose: np.ndarray, v: np.ndarray | float, wz: np.ndarray | float, t: np.ndarray | float
+) -> np.ndarray:
+    """Exact endpoint(s) of a constant body twist (v m/s, wz rad/s) held for `t` seconds from
+    `pose` = (x, y, yaw) [..., 3] -- the primitive-agnostic form of `integrate_arc`. `v > 0` is the
+    arc of curvature wz/v over v*t metres; `v == 0` is a pivot about the body origin (the
+    front-axle midpoint), i.e. the lattice's "same cell, heading over" point turn. Broadcasts like
+    `integrate_arc`."""
+    pose = np.asarray(pose, dtype=np.float64)
+    v = np.asarray(v, dtype=np.float64)
+    wz = np.asarray(wz, dtype=np.float64)
+    t = np.asarray(t, dtype=np.float64)
+    pivot = np.abs(v) < 1e-12
+    kappa = np.where(pivot, 0.0, wz / np.where(pivot, 1.0, v))
+    arc = integrate_arc(pose, kappa, v * t)
+    spin = np.stack(np.broadcast_arrays(pose[..., 0], pose[..., 1], pose[..., 2] + wz * t), axis=-1)
+    return np.where(pivot[..., None], spin, arc)
+
+
 if __name__ == "__main__":
     from helhest.planning.lattice_solver import _build_primitives
 
@@ -108,10 +136,11 @@ if __name__ == "__main__":
     for it in range(n_theta):
         th0 = (it + 0.5) * dth
         for p, kappa in enumerate(kappas):
-            assert prim_cost[it, p] == step, "every forward arc shares length `step`"
             endpoint = integrate_arc(np.array([0.0, 0.0, th0]), kappa, step)
             x1, y1, yaw1 = endpoint
             x1_built, y1_built = prim_dc[it, p] * resolution, prim_dr[it, p] * resolution
+            # every primitive is billed its REALIZED chord (helhest_stack 373e6a6), not a flat `step`
+            assert np.isclose(prim_cost[it, p], np.hypot(x1_built, y1_built), rtol=1e-5), (it, p)
             max_err = max(max_err, abs(x1 - x1_built), abs(y1 - y1_built))
             heading_expected = int(np.floor((yaw1 % (2.0 * np.pi)) / dth)) % n_theta
             assert prim_heading[it, p] == heading_expected, (it, p, prim_heading[it, p], heading_expected)
@@ -121,5 +150,28 @@ if __name__ == "__main__":
         f"arc.py agrees with _build_primitives: max endpoint error {max_err:.2e} m over "
         f"{n_theta} headings x {n_prim} primitives"
     )
+
+    # integrate_twist at (V_NOM, V_NOM * kappa) for ARC_DURATION_S IS the arc primitive
+    rng = np.random.default_rng(0)
+    poses = np.column_stack([rng.uniform(-3, 3, 64), rng.uniform(-3, 3, 64), rng.uniform(0, 6.3, 64)])
+    kap = np.concatenate([rng.uniform(-KAPPA_MAX, KAPPA_MAX, 60), np.zeros(4)])
+    assert np.allclose(integrate_twist(poses, V_NOM, V_NOM * kap, ARC_DURATION_S),
+                       integrate_arc(poses, kap, ARC_LEN), atol=1e-12)
+
+    # ... and at (0, +-OMEGA_NOM) the pivot primitive: same cell, heading exactly one bin over
+    n_prim, prim_dr, prim_dc, prim_heading, _, _, _, _ = _build_primitives(
+        n_theta=N_THETA, resolution=0.1, step=step, turn_radius=r, max_sweep=8, nseg=200,
+        pivot_cost=1.0,
+    )
+    assert n_prim == 7
+    dth = 2.0 * np.pi / N_THETA
+    for it in range(N_THETA):
+        th0 = (it + 0.5) * dth
+        for p, sign in ((5, -1.0), (6, 1.0)):
+            end = integrate_twist(np.array([0.0, 0.0, th0]), 0.0, sign * OMEGA_NOM, ARC_DURATION_S)
+            assert end[0] == 0.0 and end[1] == 0.0 and prim_dr[it, p] == 0 and prim_dc[it, p] == 0
+            assert prim_heading[it, p] == int(np.floor((end[2] % (2.0 * np.pi)) / dth)) % N_THETA
+    print(f"integrate_twist agrees with the arc primitives and the +-1-bin pivot primitives")
     print(f"V_NOM={V_NOM} m/s  ARC_LEN={ARC_LEN} m  MIN_TURN_RADIUS={MIN_TURN_RADIUS} m  "
-          f"KAPPA_MAX={KAPPA_MAX} /m  LEVER={LEVER} m")
+          f"KAPPA_MAX={KAPPA_MAX} /m  LEVER={LEVER} m  OMEGA_NOM={OMEGA_NOM:.4f} rad/s  "
+          f"PIVOT_ANGLE={np.degrees(PIVOT_ANGLE):.1f} deg")

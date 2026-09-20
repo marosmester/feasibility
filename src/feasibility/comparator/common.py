@@ -334,6 +334,13 @@ class HelhestBatchSimulator(HelhestJuniorReplaySimulator):
             k_d=self.k_d,
             friction_left_right=self.mu_front,
             friction_rear=self.mu_rear,
+            # Anisotropic wheel friction: mu_front/mu_rear are then the LATERAL (skid)
+            # coefficients and these the longitudinal (rolling-direction) ones. The parent
+            # already accepts and stores them; this override just never forwarded them, so
+            # every batch run was isotropic whatever the caller asked for. Both default to
+            # None (= isotropic), so passing nothing is unchanged.
+            friction_long_left_right=self.mu_long_front,
+            friction_long_rear=self.mu_long_rear,
             mu_rolling=self.mu_rolling,
             ke=self.wheel_ke,
             kd=self.wheel_kd,

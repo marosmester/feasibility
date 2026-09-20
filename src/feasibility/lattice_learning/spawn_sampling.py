@@ -61,14 +61,15 @@ Three decisions, all independent of any per-map height threshold:
   - `targeted` -> `sample_trials(interact_frac)`: uniform proposals, exactly
     `round(n * interact_frac)` interacting.
   - `rotate_in_place` -> `sample_rotate_in_place_trials` (poles_and_walls maps, or any map with a
-    height edge): spawns for a STATIC trial -- generate_dataset.py commands `v=0, wz != 0` on
-    these rows rather than driving a lattice arc, so there is no forward arc to sample a curvature
-    or a relief window over. Only the spawn pose matters: the CLOSEST of the three wheels sits
-    `min_clearance` to `min_clearance + band` beyond contact from the nearest pole/wall edge
-    (`edge_field`, heightmap-only, same as `edge`) -- close enough that rotating in place is
-    likely to sweep a wheel through the feature, but never already resting on it. `kappa` is a
-    fixed 0 placeholder and `endpoint_feasible` is left at its all-True default: neither curvature
-    nor an "arc end" mean anything for a pure yaw command.
+    height edge): the router's PIVOT primitive instead of an arc -- `v = 0, wz = +-OMEGA_NOM`
+    (50/50), so the recorded ARC_DURATION_S turns exactly PIVOT_ANGLE (one heading bin), entered
+    already spinning after a warm-up at the same yaw rate. The spin's origin is placed so that the
+    CLOSEST wheel is within `min_clearance + band` beyond contact of the nearest pole/wall edge
+    (`edge_field`, heightmap-only, same as `edge`) while every wheel stays >= `min_clearance` clear
+    of it through the whole warm-up -- so the feature is met, if at all, in the recorded window,
+    never before and never by a wheel resting on it. `arc_relief`/`interact_dir` are measured over
+    the recorded spin (`spin_relief_signed`), `endpoint_feasible` is the settle at the pivot's end
+    heading, `kappa` is NaN (no curvature) and `SpawnBatch.v`/`wz` carry the command.
 
   Several strategies can share one map; `concat_batches` merges their trials and SpawnBatch
   carries `strategy`/`targeted` per row.
@@ -83,7 +84,12 @@ Three decisions, all independent of any per-map height threshold:
 
 Where the arc starts: every trial is entered at speed after a warm-up of `lead` metres along the
 same curvature (generate_dataset.py's `warmup_s * V_NOM`), so relief and the overhang check are
-evaluated from the NOMINAL arc origin `integrate_arc(spawn, kappa, lead)`, not from the spawn.
+evaluated from the NOMINAL arc origin `integrate_arc(spawn, kappa, lead)`, not from the spawn. A
+pivot's warm-up turns `OMEGA_NOM * lead / V_NOM` in place instead, so its origin is the spawn
+rotated by that much.
+
+Every SpawnBatch row carries its commanded twist `(v, wz)` -- `(V_NOM, V_NOM * kappa)` for every
+arc strategy (filled in by default), `(0, +-OMEGA_NOM)` for a pivot.
 
 Deliberately independent of `feasibility.learning`, `feasibility.grid_learning` and
 `feasibility.grid_learning_2` (design.md section 11a).
@@ -97,6 +103,7 @@ from __future__ import annotations
 import dataclasses
 import pathlib
 from typing import Callable
+from typing import Iterable
 
 import numpy as np
 import yaml
@@ -108,7 +115,9 @@ from feasibility.heightmap.create_ramps import Ramp
 from feasibility.heightmap.create_ramps import ramp_height
 from feasibility.lattice_learning.arc import ARC_LEN
 from feasibility.lattice_learning.arc import integrate_arc
-from feasibility.lattice_learning.patch import _body_to_world
+from feasibility.lattice_learning.arc import OMEGA_NOM
+from feasibility.lattice_learning.arc import PIVOT_ANGLE
+from feasibility.lattice_learning.arc import V_NOM
 from feasibility.lattice_learning.patch import patch_overhangs
 from feasibility.lattice_learning.patch import PatchSpec
 from feasibility.lattice_learning.patch import WHEEL_CONTACTS_LOCAL
@@ -131,6 +140,10 @@ MAX_PROPOSAL_ROUNDS = 64  # ~520k candidates before a stratum is declared short
 SETTLE_SLACK = 2.0  # settle this many times the still-missing count per round (~70% feasible)
 EDGE_SLACK = 0.2  # m, beyond patch reach + lead: covers generate_dataset's xy_jitter (0.12 m)
 
+FOOTPRINT_ALONG = 15  # wheel_footprint samples along the wheel plane, ~5 cm apart over 0.7 m
+FOOTPRINT_ACROSS = 3  # ... and across the 0.10 m tread (both sides + center)
+TOUCH_TOL = 0.01  # m of rim_penetration still counted as "not touching" (bilinear noise on flat)
+
 _ROBOT = RobotParams()
 
 
@@ -149,9 +162,15 @@ class SpawnBatch:
     # (negative = not on the face yet), NaN = not a ramp trial
     interact_dir: np.ndarray | None = None  # [n] int8 +1 up / -1 down / 0 not interacting
     endpoint_feasible: np.ndarray | None = None  # [n] bool, static settle at the NOMINAL arc end
+    v: np.ndarray | None = None  # [n] float32 m/s commanded body speed; default V_NOM (every arc)
+    wz: np.ndarray | None = None  # [n] float32 rad/s commanded yaw rate; default V_NOM * kappa
 
     def __post_init__(self) -> None:
         n = len(self.pose)
+        if self.v is None:
+            self.v = np.full(n, V_NOM, dtype=np.float32)
+        if self.wz is None:
+            self.wz = (V_NOM * np.asarray(self.kappa, dtype=np.float64)).astype(np.float32)
         nan = np.full(n, np.nan, dtype=np.float32)
         self.ramp_deg = nan.copy() if self.ramp_deg is None else self.ramp_deg
         self.ramp_s = nan.copy() if self.ramp_s is None else self.ramp_s
@@ -200,27 +219,97 @@ def arc_relief_signed(
     `ARC_LEN + lookahead` further along the same curvature. Plane-relative, so a uniform slope is
     ~0 while steps, kinks, drops and bumps under wheels or body register their height."""
     local = np.vstack([WHEEL_CONTACTS_LOCAL, [0.0, 0.0]])  # [4, 2]: 3 wheels + body center
-
-    def contacts(pose: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        c, s = np.cos(pose[:, 2:3]), np.sin(pose[:, 2:3])
-        return (pose[:, 0:1] + c * local[:, 0] - s * local[:, 1],
-                pose[:, 1:2] + s * local[:, 0] + c * local[:, 1])  # [n, 4] each
-
     origin = integrate_arc(spawn, kappa, lead)
-    ox, oy = contacts(origin)
-    oz = np.asarray(terrain.sample(ox[:, :3], oy[:, :3]), dtype=np.float64)
-    x0, y0 = origin[:, 0:1], origin[:, 1:2]
-    A = np.stack([np.ones_like(oz), ox[:, :3] - x0, oy[:, :3] - y0], axis=-1)  # [n, 3, 3]
-    coef = np.linalg.solve(A, oz[..., None])[..., 0]  # [n, 3] z = a + b dx + c dy
+    plane = contact_plane(terrain, origin)
 
     above = np.zeros(len(spawn))
     below = np.zeros(len(spawn))
     for s in np.linspace(lead, lead + ARC_LEN + lookahead, ARC_SAMPLES):
-        px, py = contacts(integrate_arc(spawn, kappa, s))
+        px, py = body_points(integrate_arc(spawn, kappa, s), local)
         z = np.asarray(terrain.sample(px, py), dtype=np.float64)
-        plane = coef[:, :1] + coef[:, 1:2] * (px - x0) + coef[:, 2:3] * (py - y0)
-        above = np.maximum(above, (z - plane).max(axis=1))
-        below = np.maximum(below, (plane - z).max(axis=1))
+        above = np.maximum(above, (z - plane(px, py)).max(axis=1))
+        below = np.maximum(below, (plane(px, py) - z).max(axis=1))
+    return np.maximum(above, below), np.where(above >= below, 1, -1).astype(np.int8)
+
+
+def body_points(pose: np.ndarray, local: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """([n, P] world x, [n, P] world y) of body-frame points `local` [P, 2] at `pose` [n, 3]."""
+    c, s = np.cos(pose[:, 2:3]), np.sin(pose[:, 2:3])
+    return (pose[:, 0:1] + c * local[:, 0] - s * local[:, 1],
+            pose[:, 1:2] + s * local[:, 0] + c * local[:, 1])
+
+
+def contact_plane(
+    terrain: HeightMapReader, origin: np.ndarray
+) -> Callable[[np.ndarray, np.ndarray], np.ndarray]:
+    """The plane through the three wheel contacts at `origin` [n, 3], as a function of world
+    ([n, P] x, [n, P] y) -> [n, P] z -- the reference every relief measure is taken against."""
+    ox, oy = body_points(origin, WHEEL_CONTACTS_LOCAL)
+    oz = np.asarray(terrain.sample(ox, oy), dtype=np.float64)
+    x0, y0 = origin[:, 0:1], origin[:, 1:2]
+    A = np.stack([np.ones_like(oz), ox - x0, oy - y0], axis=-1)  # [n, 3, 3]
+    coef = np.linalg.solve(A, oz[..., None])[..., 0]  # [n, 3] z = a + b dx + c dy
+    return lambda px, py: coef[:, :1] + coef[:, 1:2] * (px - x0) + coef[:, 2:3] * (py - y0)
+
+
+def wheel_footprint(margin: float = 0.0, robot: RobotParams | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """([3 * P, 2] body-frame points, [3 * P] rim height above the contact plane) sampling each
+    wheel's cylinder -- the same r = wheel_radius, `wheel_width` tread both ostrich's collision
+    cylinder and helhest_stack's cylinder envelope use -- as its ground-projected rectangle:
+    FOOTPRINT_ALONG points along the wheel plane (body x), FOOTPRINT_ACROSS across the tread. A
+    feature at along-offset u touches the rim once it rises above r - sqrt(r^2 - u^2). `margin`
+    inflates the cylinder by that much in every direction (the rim profile shifted outward), so
+    `rim_penetration(..., margin) <= 0` means "at least `margin` clear of the wheel"."""
+    robot = robot or _ROBOT
+    r = float(robot.wheel_radius)
+    hw = r if robot.wheel_width is None else float(robot.wheel_width) / 2.0  # None: the sphere
+    u = np.linspace(-(r + margin), r + margin, FOOTPRINT_ALONG)
+    w = np.linspace(-(hw + margin), hw + margin, FOOTPRINT_ACROSS)
+    uu, ww = (a.ravel() for a in np.meshgrid(u, w))
+    rim = r - np.sqrt(r * r - np.minimum(np.maximum(np.abs(uu) - margin, 0.0), r) ** 2)
+    points = np.concatenate([np.column_stack([cx + uu, cy + ww]) for cx, cy in WHEEL_CONTACTS_LOCAL])
+    return points, np.tile(rim, len(WHEEL_CONTACTS_LOCAL))
+
+
+def rim_penetration(
+    terrain: HeightMapReader, origin: np.ndarray, poses: Iterable[np.ndarray], margin: float = 0.0
+) -> np.ndarray:
+    """[n] m -- how far the terrain rises into any wheel's (`margin`-inflated) cylinder over
+    `poses` (each [n, 3]), relative to the contact plane at `origin`; <= 0 when no wheel touches."""
+    local, rim = wheel_footprint(margin)
+    plane = contact_plane(terrain, origin)
+    worst = np.full(len(origin), -np.inf)
+    for pose in poses:
+        px, py = body_points(pose, local)
+        z = np.asarray(terrain.sample(px, py), dtype=np.float64)
+        worst = np.maximum(worst, (z - plane(px, py) - rim).max(axis=1))
+    return worst
+
+
+def spin_poses(origin: np.ndarray, direction: np.ndarray, angles: np.ndarray) -> Iterable[np.ndarray]:
+    """`origin` [n, 3] turned in place by each of `angles` in `direction` [n] (+1 CCW / -1 CW)."""
+    for a in angles:
+        yield origin + np.column_stack([np.zeros((len(origin), 2)), direction * a])
+
+
+def spin_relief_signed(
+    terrain: HeightMapReader, origin: np.ndarray, direction: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """([n] m, [n] int8) -- `arc_relief_signed`'s pivot twin over the RECORDED spin (`origin` [n, 3]
+    turning PIVOT_ANGLE in `direction` [n]), against the same contact plane at `origin`. It cannot
+    reuse the arc's contact-point sampling: during a pivot the front wheels roll only ~0.1 m and
+    the rear one skids ~0.2 m sideways, so a contact point never reaches a pole its wheel is
+    already hitting -- what hits it is the front rim or the rear tread's side. So "above" is
+    `rim_penetration` of the whole wheel cylinders (a pole the wheel sweeps into scores ~its
+    height), "below" is the drop under the three contacts plus the body center, as for an arc."""
+    angles = np.linspace(0.0, PIVOT_ANGLE, ARC_SAMPLES)
+    above = np.maximum(rim_penetration(terrain, origin, spin_poses(origin, direction, angles)), 0.0)
+    local = np.vstack([WHEEL_CONTACTS_LOCAL, [0.0, 0.0]])
+    plane = contact_plane(terrain, origin)
+    below = np.zeros(len(origin))
+    for pose in spin_poses(origin, direction, angles):
+        px, py = body_points(pose, local)
+        below = np.maximum(below, (plane(px, py) - np.asarray(terrain.sample(px, py))).max(axis=1))
     return np.maximum(above, below), np.where(above >= below, 1, -1).astype(np.int8)
 
 
@@ -540,105 +629,144 @@ def sample_edge_trials(
     )
 
 
-def wheel_positions(pose: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """([n, 3] world x, [n, 3] world y) of the three wheel contacts at `pose` [n, 3] = (x, y, yaw)
-    -- `patch._body_to_world` applied to `WHEEL_CONTACTS_LOCAL`, pulled out here since
-    `sample_rotate_in_place_trials` is the only caller with no surrounding per-arc-sample loop to
-    inline it into (unlike `arc_relief_signed`'s and `_sample_face_trials`'s local `contacts()`
-    closures, which do the same rotation inline for that reason)."""
-    c, s = np.cos(pose[:, 2:3]), np.sin(pose[:, 2:3])
-    return _body_to_world(pose[:, 0:1], pose[:, 1:2], c, s, WHEEL_CONTACTS_LOCAL[:, 0], WHEEL_CONTACTS_LOCAL[:, 1])
-
-
 def sample_rotate_in_place_trials(
     terrain: HeightMapReader,
     spec: PatchSpec,
     n: int,
     rng: np.random.Generator,
     *,
+    interact_frac: float | None,
     band: float,
     min_clearance: float,
+    lead: float,
     mu: float,
     device: str,
+    interact_relief: float,
+    require_endpoint: bool = False,
     robot: RobotParams | None = None,
+    **_: object,
 ) -> SpawnBatch:
-    """`n` static spawn poses for a rotate-in-place trial (`v=0, wz != 0`, commanded elsewhere by
-    generate_dataset.py) -- see the module docstring's `rotate_in_place` entry. A candidate's
-    THREE wheel contacts (`wheel_positions`) are each looked up in `edge_field`'s per-cell distance
-    to the nearest height edge, wrapped as a `HeightMapReader` so `wheel_positions`' continuous
-    (x, y) get a bilinear-interpolated distance rather than a nearest-cell one; the CLOSEST wheel's
-    distance minus `robot.wheel_radius` (net clearance from the feature's surface, not from its
-    center) must land in `[min_clearance, min_clearance + band]` -- enough headroom that a wheel
-    is never already resting on the pole/wall (poles and walls here are thin enough, module
-    docstring, that no interior point is ever farther from an edge than `robot.wheel_radius`, so
-    this same lower bound also rules out a wheel spawning ON TOP of one), while still within reach
-    of it. Also requires the ordinary spawn checks every strategy shares: settle-feasible (chassis
-    clearance / pitch / roll / residual) and the patch reachable on mapped terrain. No `lead`: the
-    command is stationary, so the patch is sampled at the spawn itself, not a warmed-up origin."""
+    """`n` pivot trials (`v = 0, wz = +-OMEGA_NOM`, direction 50/50) -- see the module docstring's
+    `rotate_in_place` entry. Proposes the ORIGIN of the recorded spin (the pose the patch is taken
+    at, `t0_pose` in generate_dataset.py) at a random heading, from cells within `band` of the
+    farthest a wheel's rim can reach from the body origin (rear_offset + wheel_radius) of a height
+    edge, and backs the spawn out by the warm-up's own rotation, `OMEGA_NOM * lead / V_NOM` (`lead`
+    is the forward warm-up distance, so `lead / V_NOM` is exactly `trial.warmup_s`).
+
+    A candidate is kept only if no wheel cylinder comes within `min_clearance` of the terrain
+    above the contact plane anywhere in the warm-up (`rim_penetration`, spawn -> origin) -- the
+    feature is met, if at all, in the recorded window, and no wheel starts on it -- and passes the
+    checks every strategy shares: settle-feasible at the spawn, patch on the map at the origin;
+    `require_endpoint` also demands a feasible settle at the pivot's end heading. Candidates are
+    labelled by `spin_relief_signed > interact_relief` and, like `edge`, exactly
+    `round(n * interact_frac)` interact (None: no strata); a short interacting stratum is filled
+    from the non-interacting one and counted in `shortfall`. `kappa` is NaN (a pure spin has no
+    curvature) -- consumers read `v`/`wz`. Unused common keywords (`kappa_max`) are swallowed by
+    `**_`, so `dataset_config.sample_map_mix` can call every sampler alike."""
     if min_clearance < 0.0:
         raise ValueError(f"min_clearance must be >= 0, got {min_clearance}")
     if band <= 0.0:
         raise ValueError(f"band must be > 0, got {band}")
+    if interact_frac is not None and not 0.0 <= interact_frac <= 1.0:
+        raise ValueError(f"interact_frac must be in [0, 1] or None, got {interact_frac}")
     robot = robot or RobotParams()
-    wheel_r = float(robot.wheel_radius)
-    lo, hi = wheel_r + min_clearance, wheel_r + min_clearance + band
 
     field = edge_field(terrain)
-    dist_map = HeightMapReader(field.dist, origin=(terrain.x0, terrain.y0), cell=terrain.cell)
     x_lo, x_hi, y_lo, y_hi = sampling_bounds(terrain, spec, 0.0)
-
     CX, CY = cell_centers(terrain)
-    # Candidate ORIGIN cells: within `hi` of an edge, widened by the farthest wheel's own radius
-    # from the body origin (the rear wheel, `rear_offset`) -- a body origin just outside `hi` can
-    # still place that wheel inside it.
-    wheel_reach = float(np.hypot(WHEEL_CONTACTS_LOCAL[:, 0], WHEEL_CONTACTS_LOCAL[:, 1]).max())
+    rim_reach = float(np.hypot(WHEEL_CONTACTS_LOCAL[:, 0], WHEEL_CONTACTS_LOCAL[:, 1]).max()
+                      + robot.wheel_radius)
     cells = np.flatnonzero(
-        (field.dist <= hi + wheel_reach) & (CX >= x_lo) & (CX <= x_hi) & (CY >= y_lo) & (CY <= y_hi)
+        (field.dist <= rim_reach + band) & (CX >= x_lo) & (CX <= x_hi) & (CY >= y_lo) & (CY <= y_hi)
     )
     if len(cells) == 0:
         raise ValueError(
             "no map cell lies within reach of a height edge for sample_rotate_in_place_trials"
         )
 
-    got: list[np.ndarray] = []
-    count = 0
-    for _ in range(MAX_PROPOSAL_ROUNDS):
-        if count >= n:
-            break
-        m = PROPOSAL_BATCH
-        cell = cells[rng.integers(0, len(cells), m)]
-        x = CX.ravel()[cell] + rng.uniform(-0.5, 0.5, m) * terrain.cell
-        y = CY.ravel()[cell] + rng.uniform(-0.5, 0.5, m) * terrain.cell
-        yaw = rng.uniform(0.0, 2.0 * np.pi, m)
-        pose = np.column_stack([x, y, yaw])
+    warmup_angles = np.linspace(0.0, OMEGA_NOM * lead / V_NOM, ARC_SAMPLES)  # spawn -> origin
+    if interact_frac is None:
+        need = {0: n}
+    else:
+        n_int = round(n * interact_frac)
+        need = {1: n_int, 0: n - n_int}
+    got: dict[int, list[np.ndarray]] = {k: [] for k in need}
+    counts = {k: 0 for k in need}
+    n_proposed = n_interacting = 0
 
-        wx, wy = wheel_positions(pose)
-        closest = np.asarray(dist_map.sample(wx, wy)).min(axis=1)
-        close_idx = np.flatnonzero((closest >= lo) & (closest <= hi))
-        idx = close_idx[~patch_overhangs(terrain, pose[close_idx], spec)]
-        idx = idx[: int(SETTLE_SLACK * (n - count)) + 16]
-        if len(idx) == 0:
-            continue
-        derived, residual, clearance = settle_batch(terrain, pose[idx], mu, device)
-        keep = idx[settle_feasible(derived, residual, clearance, robot)][: n - count]
-        got.append(pose[keep])
-        count += len(keep)
+    def fill() -> None:
+        nonlocal n_proposed, n_interacting
+        for _ in range(MAX_PROPOSAL_ROUNDS):
+            missing = {k: need[k] - counts[k] for k in need}
+            if all(miss <= 0 for miss in missing.values()):
+                return
+            m = PROPOSAL_BATCH
+            cell = cells[rng.integers(0, len(cells), m)]
+            x = CX.ravel()[cell] + rng.uniform(-0.5, 0.5, m) * terrain.cell
+            y = CY.ravel()[cell] + rng.uniform(-0.5, 0.5, m) * terrain.cell
+            direction = np.where(rng.uniform(size=m) < 0.5, -1.0, 1.0)
+            origin = np.column_stack([x, y, rng.uniform(0.0, 2.0 * np.pi, m)])
+            spawn = origin - np.column_stack([np.zeros((m, 2)), direction * warmup_angles[-1]])
 
-    if count < n:
+            clear = rim_penetration(
+                terrain, origin, spin_poses(spawn, direction, warmup_angles), margin=min_clearance
+            ) <= TOUCH_TOL
+            cand = np.flatnonzero(clear & ~patch_overhangs(terrain, origin, spec))
+            relief, sign = spin_relief_signed(terrain, origin[cand], direction[cand])
+            interacting = relief > interact_relief
+            label = interacting.astype(int) if interact_frac is not None else np.zeros(len(cand), int)
+            n_proposed += len(cand)
+            n_interacting += int(interacting.sum())
+
+            picked = [(k, np.flatnonzero(label == k)[: int(SETTLE_SLACK * miss) + 16])
+                      for k, miss in missing.items() if miss > 0]
+            sel = np.concatenate([p for _, p in picked])  # positions into `cand`
+            if len(sel) == 0:
+                continue
+            idx = cand[sel]
+            end = origin[idx] + np.column_stack([np.zeros((len(idx), 2)), direction[idx] * PIVOT_ANGLE])
+            derived, residual, clearance = settle_batch(
+                terrain, np.concatenate([spawn[idx], end]), mu, device
+            )
+            feasible = settle_feasible(derived, residual, clearance, robot)
+            spawn_ok, end_ok = feasible[: len(idx)], feasible[len(idx):]
+            ok = spawn_ok & end_ok if require_endpoint else spawn_ok
+            row_of = {int(s): j for j, s in enumerate(sel)}
+            for k, positions in picked:
+                j = np.array([row_of[int(p)] for p in positions], dtype=int)
+                j = j[ok[j]][: need[k] - counts[k]]
+                p = sel[j]
+                got[k].append(np.column_stack(
+                    [spawn[idx[j]], direction[idx[j]], relief[p], sign[p], end_ok[j]]
+                ))
+                counts[k] += len(j)
+
+    fill()
+    shortfall = 0
+    if interact_frac is not None and counts[1] < need[1]:
+        shortfall = need[1] - counts[1]
+        need[1], need[0] = counts[1], need[0] + shortfall
+        fill()
+    if sum(counts.values()) < n:
         raise ValueError(
-            f"only found {count}/{n} settle-feasible trials with a wheel {lo:.2f}-{hi:.2f} m from "
-            "a height edge -- the map has too little qualifying ground for sample_rotate_in_place_trials"
+            f"only found {sum(counts.values())}/{n} settle-feasible pivots near a height edge and "
+            f"clear of it through the warm-up after {n_proposed} candidates -- the map has too "
+            "little qualifying ground for sample_rotate_in_place_trials"
         )
-    rows = np.concatenate(got)[:n]
+    rows = np.concatenate([np.concatenate(v) for v in got.values() if v])
     rng.shuffle(rows)
     return SpawnBatch(
-        pose=rows,
-        kappa=np.zeros(n, dtype=np.float32),
-        arc_relief=np.zeros(n, dtype=np.float32),
-        targeted=np.ones(n, dtype=bool),
-        shortfall=0,
-        proposal_interact_rate=float("nan"),
+        pose=rows[:, :3],
+        kappa=np.full(n, np.nan, dtype=np.float32),
+        arc_relief=rows[:, 4].astype(np.float32),
+        interact_dir=interaction_dir(rows[:, 4], rows[:, 5], interact_relief),
+        endpoint_feasible=rows[:, 6] > 0.5,
+        targeted=np.full(n, interact_frac is not None),
+        shortfall=shortfall,
+        proposal_interact_rate=n_interacting / max(n_proposed, 1),
         strategy=np.full(n, "rotate_in_place"),
+        v=np.zeros(n, dtype=np.float32),
+        wz=(rows[:, 3] * OMEGA_NOM).astype(np.float32),
     )
 
 
@@ -936,31 +1064,46 @@ if __name__ == "__main__":
     # Rotate-in-place: a thin wall + a small pole stand-in -- poles_and_walls features never have
     # an interior point farther than ~0.15 m from their own edge, unlike the box above (half-
     # extent 1.25 m), so this needs its own map to test the "never on the feature" guarantee for
-    # real. No forward arc (kappa/relief are 0), every trial's closest wheel clearance lands in
-    # [lo, hi], no wheel ever rests on the feature itself, spawns are settle-feasible, reproduces.
+    # real. The command is the pivot primitive in both directions (kappa NaN); no wheel cylinder
+    # comes within min_clearance of the feature anywhere in the warm-up (checked on a finer yaw grid
+    # than the sampler's); exactly interact_frac of the recorded spins sweep a wheel into it, and
+    # their stored relief re-derives from the spin origin; spawns are settle-feasible; reproduces.
     t0 = time.perf_counter()
     thin_wall = np.where((np.abs(X - 2.5) < 0.1) & (np.abs(Y) < 2.0), 1.0, 0.0)  # 0.2 m thick
     thin_pole = np.where((np.abs(X + 2.0) < 0.15) & (np.abs(Y - 1.0) < 0.15), 0.5, 0.0)  # ~0.3 m square
     thin_map = HeightMapReader(np.maximum(thin_wall, thin_pole), origin=(-8.0, -8.0), cell=0.05)
-    rot_kw = dict(band=0.5, min_clearance=0.05, mu=0.8, device=args.device)
-    lo = RobotParams().wheel_radius + rot_kw["min_clearance"]
-    hi = lo + rot_kw["band"]
+    rot_kw = dict(interact_frac=0.5, band=0.3, min_clearance=0.05, lead=lead, mu=0.8,
+                  device=args.device, interact_relief=relief_thr,
+                  kappa_max=KAPPA_MAX)  # kappa_max: swallowed, as sample_map_mix passes it
     rb2 = sample_rotate_in_place_trials(thin_map, spec, 200, rng, **rot_kw)
-    assert (rb2.strategy == "rotate_in_place").all() and rb2.shortfall == 0
-    assert (rb2.kappa == 0).all() and (rb2.arc_relief == 0).all() and rb2.endpoint_feasible.all()
-    wx, wy = wheel_positions(rb2.pose)
-    thin_field = edge_field(thin_map)
-    dist_map = HeightMapReader(thin_field.dist, origin=(thin_map.x0, thin_map.y0), cell=thin_map.cell)
-    closest = np.asarray(dist_map.sample(wx, wy)).min(axis=1)
-    assert (closest >= lo - 1e-6).all() and (closest <= hi + 1e-6).all(), (closest.min(), closest.max())
-    assert (np.asarray(thin_map.sample(wx, wy)) < 1e-6).all(), "a spawn wheel must never rest on the feature"
+    assert (rb2.strategy == "rotate_in_place").all() and rb2.shortfall == 0, rb2.shortfall
+    assert np.isnan(rb2.kappa).all() and (rb2.v == 0).all()
+    direction = np.sign(rb2.wz)
+    assert np.allclose(np.abs(rb2.wz), OMEGA_NOM) and 0 < (direction > 0).sum() < 200
+    assert int((rb2.interact_dir != 0).sum()) == 100
+    warmup_yaw = OMEGA_NOM * lead / V_NOM
+    origin = rb2.pose + np.column_stack([np.zeros((200, 2)), direction * warmup_yaw])
+    fine = np.linspace(0.0, warmup_yaw, 4 * ARC_SAMPLES)
+    warm = rim_penetration(thin_map, origin, spin_poses(rb2.pose, direction, fine), margin=0.0)
+    assert (warm <= TOUCH_TOL).all(), f"a wheel touches the feature in warm-up by {warm.max():.3f} m"
+    for pose in spin_poses(rb2.pose, direction, fine):
+        wx, wy = body_points(pose, WHEEL_CONTACTS_LOCAL)
+        assert (np.asarray(thin_map.sample(wx, wy)) < 1e-6).all(), "a wheel contact on the feature"
+    relief, _ = spin_relief_signed(thin_map, origin, direction)
+    assert np.allclose(relief, rb2.arc_relief, atol=1e-5)
     d, r, c = settle_batch(thin_map, rb2.pose, 0.8, args.device)
     assert settle_feasible(d, r, c, RobotParams()).all()
     same = [sample_rotate_in_place_trials(thin_map, spec, 16, np.random.default_rng(5), **rot_kw)
             for _ in range(2)]
-    assert np.array_equal(same[0].pose, same[1].pose)
-    print(f"rotate_in_place: 200 trials, closest-wheel clearance within [{lo:.2f}, {hi:.2f}] m, "
-          f"{time.perf_counter() - t0:.2f}s")
+    assert np.array_equal(same[0].pose, same[1].pose) and np.array_equal(same[0].wz, same[1].wz)
+    mixed_rot = concat_batches([rb2, fb], rng)
+    assert np.isnan(mixed_rot.kappa).sum() == 200 and (mixed_rot.v == 0).sum() == 200
+    assert np.allclose(mixed_rot.wz[mixed_rot.v > 0], V_NOM * mixed_rot.kappa[mixed_rot.v > 0])
+    meet = rb2.interact_dir != 0
+    print(f"rotate_in_place: 200 pivots ({int((direction > 0).sum())} CCW), 100 sweep a wheel into "
+          f"the feature (natural rate {rb2.proposal_interact_rate:.1%}, median relief "
+          f"{np.median(rb2.arc_relief[meet]):.2f} m), max warm-up penetration {warm.max():+.3f} m, "
+          f"{int((~rb2.endpoint_feasible).sum())} blocked end headings, {time.perf_counter() - t0:.2f}s")
     print("rotate-in-place checks ok")
 
     # Ramps, both directions: every trial head-on along a face, straight share ~ straight_frac,

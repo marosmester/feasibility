@@ -1,18 +1,23 @@
 """Generates a lattice_learning divergence dataset: one sample is a single body-frame terrain
-patch plus ONE scalar curvature command, replayed as the router's OWN forward-arc primitive
-(design.md sections 1, 2, 4, 7) --
+patch plus ONE commanded body twist, replayed as one of the router's OWN primitives for
+ARC_DURATION_S = 0.5 s (design.md sections 1, 2, 4, 7) --
 
-    x = (patch [24, 28] @ 0.125 m, kappa)      -- v = V_NOM, L = ARC_LEN are PINNED, not sampled
-    y = (e_pos, e_rot)  -- ostrich vs. the ARC-PLUS-SETTLE reference, computed by custom_dataset.py
+    x = (patch [24, 28] @ 0.125 m, (v_drive, wz_drive))
+    y = (e_pos, e_rot)  -- ostrich vs. the PRIMITIVE-PLUS-SETTLE reference, computed by custom_dataset.py
 
-Also writes `v_drive`/`wz_drive` (comparator.common's own naming for the commanded body twist)
-alongside `kappa` per row -- v_drive = V_NOM (constant, PINNED not sampled) and wz_drive = V_NOM *
-kappa -- so a future (v, omega)-input model variant can read them directly instead of
-recomputing wz_drive from kappa and the pinned V_NOM.
+Two primitive kinds, both pinned (arc.py), never sampled beyond their sign/curvature:
+  * forward arc: v_drive = V_NOM, wz_drive = V_NOM * kappa, travelling ARC_LEN = the lattice step;
+    `kappa` is stored too, for the kappa-input model.
+  * pivot (`rotate_in_place` rows): v_drive = 0, wz_drive = +-OMEGA_NOM, turning PIVOT_ANGLE = one
+    heading bin in place -- helhest_stack's point-turn primitive (`pivot_cost > 0`). `kappa` is
+    NaN: a pivot has no curvature, so only the (v, wz)-input model can train on these rows.
+Everything below reads the per-row twist, so the two kinds share one code path; where the text says
+"arc", a pivot's arc is the in-place turn and its "arc end" the same xy one bin over.
 
 Three things this generator does that no sibling generator does, all from design.md:
 
-* **Warm start (section 2).** Every trial is entered already moving at V_NOM: `warmup_s` seconds
+* **Warm start (section 2).** Every trial is entered already moving at its own twist -- driving
+  at V_NOM, or for a pivot already spinning at +-OMEGA_NOM: `warmup_s` seconds
   of CAPTURED, commanded ostrich rollout are prepended to the setpoint array and sliced off the
   returned log -- `t0_pose` (ostrich's actual pose row `w_o - 1`) is the arc's true origin, not
   the nominal spawn. Ostrich spawns at helhest_stack's static-settle pose at the spawn, stored as
@@ -57,6 +62,9 @@ and `targeted` also require it at the nominal arc end, `ramp_up`, `ramp_down` an
     running into it, `down_frac` of those driving down, the rest climbing up.
   - `uniform` (any map, typically rough): uniform (pose, kappa).
   - `targeted` (any map): uniform proposals, `interact_frac` of the trials meeting terrain.
+  - `rotate_in_place` (poles_and_walls / curbs_and_walls maps): PIVOTS next to a pole or wall, no
+    wheel touching it during the warm-up spin, `interact_frac` of them sweeping a wheel into it
+    during the recorded one.
 Every row stores `sampling` (its strategy), `map_category`, `arc_relief`, `interact_dir` (+1 up /
 -1 down / 0 none) and a `targeted` flag.
 
@@ -126,9 +134,12 @@ from feasibility.comparator.common import run_ostrich_batch
 from feasibility.comparator.provenance import git_provenance
 from feasibility.comparator.provenance import terrain_fields
 from feasibility.heightmap import HeightMapReader
+from feasibility.lattice_learning.arc import ARC_DURATION_S
 from feasibility.lattice_learning.arc import ARC_LEN
-from feasibility.lattice_learning.arc import integrate_arc
-from feasibility.lattice_learning.arc import twist_from_kappa
+from feasibility.lattice_learning.arc import integrate_twist
+from feasibility.lattice_learning.arc import N_THETA
+from feasibility.lattice_learning.arc import OMEGA_NOM
+from feasibility.lattice_learning.arc import PIVOT_ANGLE
 from feasibility.lattice_learning.arc import V_NOM
 from feasibility.lattice_learning.dataset_config import allocate
 from feasibility.lattice_learning.dataset_config import AllocatedMap
@@ -154,8 +165,8 @@ from feasibility.lattice_learning.tiled_terrain import TiledTerrain
 
 OSTRICH_DT = 2.5e-2  # s. The finest dt = 0.1/k dividing both ARC_LEN/V_NOM = 0.5 s and the twin's
 # DT = 0.1 s exactly; overridden on `sim_config` in code, never in the shared helhest.yaml (see
-# module docstring and design.md section 2a).
-ARC_DURATION_S = ARC_LEN / V_NOM  # 0.5 s -- the time the pinned arc itself takes to travel
+# module docstring and design.md section 2a). ARC_DURATION_S (arc.py, 0.5 s) is the time one
+# primitive takes -- a forward arc or a pivot alike.
 
 
 def _exact_steps(duration_s: float, dt: float) -> int:
@@ -200,15 +211,17 @@ def _quat_to_yaw(q: np.ndarray) -> np.ndarray:
 
 
 def swept_clear_batch(
-    terrain: HeightMapReader, t0_pose: np.ndarray, kappa: np.ndarray, mu: float, device: str,
-    robot: RobotParams,
+    terrain: HeightMapReader, t0_pose: np.ndarray, v: np.ndarray, wz: np.ndarray, mu: float,
+    device: str, robot: RobotParams,
 ) -> np.ndarray:
-    """[n] bool -- see SWEPT_SAMPLES' comment. Samples SWEPT_SAMPLES positions along the exact arc
-    from `t0_pose` [n, 3] at curvature `kappa` [n], holds heading at `t0_pose`'s own yaw for every
-    sample (the router's own convention), settles all of them at once, and ANDs feasibility."""
+    """[n] bool -- see SWEPT_SAMPLES' comment. Samples SWEPT_SAMPLES positions along the exact
+    primitive from `t0_pose` [n, 3] under the twist (`v`, `wz`) [n], holds heading at `t0_pose`'s own
+    yaw for every sample (the router's own convention), settles all of them at once, and ANDs
+    feasibility. A pivot's samples all collapse onto `t0_pose` itself -- exactly the lattice pivot's
+    sweep, the cell it stands on."""
     n = t0_pose.shape[0]
-    ss = np.linspace(0.0, ARC_LEN, SWEPT_SAMPLES)
-    poses = np.stack([integrate_arc(t0_pose, kappa, s) for s in ss], axis=0)  # [S, n, 3]
+    ts = np.linspace(0.0, ARC_DURATION_S, SWEPT_SAMPLES)
+    poses = np.stack([integrate_twist(t0_pose, v, wz, t) for t in ts], axis=0)  # [S, n, 3]
     poses[..., 2] = t0_pose[None, :, 2]
     derived, residual, clearance = settle_batch(terrain, poses.reshape(-1, 3), mu, device)
     feasible = settle_feasible(derived, residual, clearance, robot).reshape(SWEPT_SAMPLES, n)
@@ -231,9 +244,10 @@ class PreparedMap:
         return self.trials.pose.shape[0]
 
 
-def _wheel_setpoints(kappa: np.ndarray) -> np.ndarray:
-    """[n, 3] wheel velocity setpoints for travel at V_NOM along curvature `kappa` [n]."""
-    return np.stack([cmd_to_wheels(V_NOM, V_NOM * k) for k in kappa]).astype(np.float32)
+def _wheel_setpoints(v: np.ndarray, wz: np.ndarray) -> np.ndarray:
+    """[n, 3] wheel velocity setpoints for the body twists (`v`, `wz`) [n] -- (V_NOM, V_NOM * kappa)
+    for an arc, (0, +-OMEGA_NOM) for a pivot."""
+    return np.stack([cmd_to_wheels(float(a), float(b)) for a, b in zip(v, wz)]).astype(np.float32)
 
 
 def prepare_map(
@@ -315,7 +329,7 @@ def rollout_group(
     spawn_pose = np.concatenate([m.trials.pose for m in maps]).astype(np.float64)
     spawn_pose[:, :2] += row_offset
     spawn_zpr = np.concatenate([m.spawn_zpr for m in maps])
-    wheels = np.concatenate([_wheel_setpoints(m.trials.kappa) for m in maps])  # [N, 3]
+    wheels = np.concatenate([_wheel_setpoints(m.trials.v, m.trials.wz) for m in maps])  # [N, 3]
     n = spawn_pose.shape[0]
 
     pose = np.zeros((settle_steps + T_o, n, 7), dtype=np.float32)
@@ -375,12 +389,10 @@ def finish_map(
     w_o = round(warmup_s / OSTRICH_DT)
     T_o = w_o + T_RECORD_OSTRICH
     spawn_pose, kappa = trials.pose, trials.kappa
-    # (v_drive, wz_drive) restated alongside kappa for a future (v, omega)-input model
-    # (comparator.common's own ScenarioSpec/Trial naming for the commanded body twist) --
-    # v_drive is pinned at V_NOM today (see the module docstring), not sampled, but is still
-    # written per-row rather than left to the root attr v_nom so the schema stays self-contained
-    # and stays correct for free if v is ever sampled instead of pinned.
-    v_drive, wz_drive = twist_from_kappa(kappa)
+    # (v_drive, wz_drive) -- comparator.common's own naming for the commanded body twist -- is the
+    # command every row actually got: (V_NOM, V_NOM * kappa) for an arc, (0, +-OMEGA_NOM) for a
+    # pivot, whose kappa is NaN. The (v, omega)-input model reads these, not kappa.
+    v_drive, wz_drive = trials.v, trials.wz
 
     t0_pose = np.zeros((n, 3), dtype=np.float64)
     belief_pose = np.zeros((n, 3), dtype=np.float64)
@@ -398,13 +410,14 @@ def finish_map(
     for start in range(0, n, chunk):
         end = min(start + chunk, n)
         sl = slice(start, end)
-        kappa_chunk = kappa[sl]
+        v_chunk, wz_chunk = v_drive[sl], wz_drive[sl]
         last = pose_log[w_o - 1, sl]
         t0_xyyaw = np.column_stack(
             [last[:, 0], last[:, 1], _quat_to_yaw(last[:, 3:7])]
-        )  # [b, 3] -- the arc's true origin (design.md section 1c)
+        )  # [b, 3] -- the primitive's true origin (design.md section 1c)
 
-        arc_end_chunk = integrate_arc(t0_xyyaw, kappa_chunk, ARC_LEN)  # [b, 3]
+        # the arc's end, or for a pivot the same xy one heading bin over
+        arc_end_chunk = integrate_twist(t0_xyyaw, v_chunk, wz_chunk, ARC_DURATION_S)  # [b, 3]
         belief_chunk = t0_xyyaw + prepared.jitter[sl]  # design.md section 1c
 
         patch_chunk = sample_patches(terrain, belief_chunk, spec).reshape(end - start, -1)
@@ -419,7 +432,7 @@ def finish_map(
             [arc_end_chunk[:, :2], endpoint_derived[:, :1], ref_quat], axis=-1
         ).astype(np.float32)
 
-        swept_clear_chunk = swept_clear_batch(terrain, t0_xyyaw, kappa_chunk, mu, device, robot)
+        swept_clear_chunk = swept_clear_batch(terrain, t0_xyyaw, v_chunk, wz_chunk, mu, device, robot)
 
         ostrich_final_xy = pose_log[-1, sl, :2]
         displacement = np.linalg.norm(ostrich_final_xy - t0_xyyaw[:, :2], axis=1)
@@ -444,7 +457,7 @@ def finish_map(
         endpoint_blocked[sl] = ~settle_ok
         swept_clear[sl] = swept_clear_chunk
 
-    ostrich_cmd = np.tile(_wheel_setpoints(kappa)[None], (T_RECORD_OSTRICH, 1, 1))
+    ostrich_cmd = np.tile(_wheel_setpoints(v_drive, wz_drive)[None], (T_RECORD_OSTRICH, 1, 1))
     return dict(
         spawn_pose=spawn_pose.astype(np.float32),
         spawn_zpr=prepared.spawn_zpr.astype(np.float32),
@@ -507,6 +520,9 @@ def describe_trials(trials: SpawnBatch) -> str:
                      f"{int((trials.kappa[on_ramp] == 0).sum())} straight")
             if on_ramp.sum() < k.sum():
                 text += f", {int(k.sum() - on_ramp.sum())} fallback"
+        pivot = k & (trials.v == 0)
+        if pivot.any():
+            text += f", pivots {int((trials.wz[pivot] > 0).sum())} CCW/{int((trials.wz[pivot] < 0).sum())} CW"
         parts.append(text)
     short = f" ({trials.shortfall} short)" if trials.shortfall else ""
     return "; ".join(parts) + short
@@ -577,7 +593,10 @@ def generate(cfg: DatasetConfig) -> None:
     print(f"[config]   {cfg.path}")
     print(f"[arc]      v_nom={V_NOM} m/s  arc_len={ARC_LEN} m  kappa in [-{cfg.trial.kappa_max}, "
           f"{cfg.trial.kappa_max}] 1/m  duration={ARC_DURATION_S}s -> {T_RECORD_OSTRICH} ostrich steps")
-    print(f"[warmup]   {warmup_s}s -> {w_o} ostrich steps ({lead:.3f} m), entered already moving at v_nom")
+    print(f"[pivot]    omega_nom=+-{OMEGA_NOM:.4f} rad/s -> {np.degrees(PIVOT_ANGLE):.1f} deg = one of "
+          f"{N_THETA} heading bins in place, same duration")
+    print(f"[warmup]   {warmup_s}s -> {w_o} ostrich steps ({lead:.3f} m, or "
+          f"{np.degrees(OMEGA_NOM * warmup_s):.1f} deg in place), entered already moving at v_nom / omega_nom")
     print(f"[patch]    {spec.ny}x{spec.nx} cells @ {spec.cell} m, reference={spec.reference}")
     print(f"[jitter]   xy=+-{xy_jitter:.4f} m (router_cell={cfg.trial.router_cell}), "
           f"yaw=+-{yaw_jitter:.4f} rad (n_theta={cfg.trial.n_theta})")
@@ -685,6 +704,8 @@ def generate(cfg: DatasetConfig) -> None:
             # guard trio -- see arc.py; kept literal here so this file has no import-time
             # dependency beyond arc.py's already-imported constants
             kappa_min=-cfg.trial.kappa_max, kappa_max=cfg.trial.kappa_max,
+            omega_nom=OMEGA_NOM, pivot_angle=PIVOT_ANGLE, pivot_n_theta=N_THETA,  # the pivot
+            # primitive's pinned trio (arc.py), for rows with v_drive == 0
             warmup_s=warmup_s, settle_steps=settle_steps, spawn_clearance=SPAWN_CLEARANCE,
             xy_jitter=xy_jitter, yaw_jitter=yaw_jitter, router_cell=cfg.trial.router_cell,
             n_theta=cfg.trial.n_theta, interact_relief=cfg.trial.interact_relief,
@@ -711,7 +732,7 @@ def generate(cfg: DatasetConfig) -> None:
     print(f"  swept_clear {n_swept:>7d}  ({100 * n_swept / n:5.1f}%)  -- reporting split only")
     for strategy in dict.fromkeys(per_variant["sampling"].tolist()):
         k = per_variant["sampling"] == strategy
-        print(f"  {strategy:<11} {int(k.sum()):>7d} rows, {int((per_variant['valid'] & k).sum())} valid")
+        print(f"  {strategy:<15} {int(k.sum()):>7d} rows, {int((per_variant['valid'] & k).sum())} valid")
     print("=" * 60)
 
 

@@ -54,6 +54,7 @@ from feasibility.lattice_learning.spawn_sampling import required_platform_length
 from feasibility.lattice_learning.spawn_sampling import sample_edge_trials
 from feasibility.lattice_learning.spawn_sampling import sample_ramp_down_trials
 from feasibility.lattice_learning.spawn_sampling import sample_ramp_up_trials
+from feasibility.lattice_learning.spawn_sampling import sample_rotate_in_place_trials
 from feasibility.lattice_learning.spawn_sampling import sample_trials
 from feasibility.lattice_learning.spawn_sampling import SpawnBatch
 
@@ -183,6 +184,18 @@ class EdgeParams:
 
 
 @dataclasses.dataclass(frozen=True)
+class RotateParams:
+    interact_frac: float | None
+    band: float
+    min_clearance: float
+
+    def __post_init__(self) -> None:
+        _fraction("interact_frac", self.interact_frac, allow_none=True)
+        _check(self.band > 0.0, f"band must be > 0, got {self.band}")
+        _check(self.min_clearance >= 0.0, f"min_clearance must be >= 0, got {self.min_clearance}")
+
+
+@dataclasses.dataclass(frozen=True)
 class StrategySpec:
     name: str
     categories: tuple[str, ...] | None  # sidecar categories it may run on; None = any
@@ -205,6 +218,7 @@ STRATEGIES: dict[str, StrategySpec] = {
         StrategySpec("ramp_up", RAMP_CATEGORIES, RampParams, True, sample_ramp_up_trials, needs_faces=True),
         StrategySpec("ramp_down", RAMP_CATEGORIES, RampParams, True, sample_ramp_down_trials, needs_faces=True),
         StrategySpec("edge", EDGE_CATEGORIES, EdgeParams, True, sample_edge_trials),
+        StrategySpec("rotate_in_place", EDGE_CATEGORIES, RotateParams, True, sample_rotate_in_place_trials),
     )
 }
 
@@ -448,12 +462,12 @@ class Allocation:
         n = self.cfg.n
         rows = self.entry_rows()
         maps_per_cat = {c: sum(m.category == c for m in self.maps) for c in self.cfg.categories}
-        lines = [f"{'strategy':<10} {'map category':<16} {'maps':>4} {'rows':>6} {'requested':>9} "
+        lines = [f"{'strategy':<15} {'map category':<16} {'maps':>4} {'rows':>6} {'requested':>9} "
                  f"{'realized':>8}"]
         for e, entry in enumerate(self.cfg.mix):
-            lines.append(f"{entry.strategy:<10} {entry.map:<16} {maps_per_cat[entry.map]:>4} {rows[e]:>6} "
+            lines.append(f"{entry.strategy:<15} {entry.map:<16} {maps_per_cat[entry.map]:>4} {rows[e]:>6} "
                          f"{entry.percent:>8.2f}% {100.0 * rows[e] / n:>7.2f}%")
-        lines.append(f"{'total':<27} {len(self.maps):>4} {sum(rows):>6}")
+        lines.append(f"{'total':<32} {len(self.maps):>4} {sum(rows):>6}")
         return "\n".join(lines)
 
 
@@ -560,7 +574,20 @@ if __name__ == "__main__":
     raises(mutate(lambda d: d["run"].update(dry_run="yes")), "run.dry_run: expected")
     raises(mutate(lambda d: d["mix"].append(copy.deepcopy(d["mix"][0]))), "duplicate entry")
     raises(mutate(lambda d: d.update(mix=[])), "non-empty list")
-    print("[validate] 14 broken variants all rejected with the offending key named")
+    rotate = dict(map="curbs_and_walls", strategy="rotate_in_place", percent=10.0,
+                  params=dict(interact_frac=0.5, band=0.3, min_clearance=0.05))
+
+    def with_rotate(d: dict) -> None:
+        d["mix"][edge]["percent"] -= 10.0
+        d["mix"].append(copy.deepcopy(rotate))
+
+    rot_cfg = parse_config(mutate(with_rotate), "up_down")
+    assert rot_cfg.mix[-1].spec.name == "rotate_in_place" and rot_cfg.mix[-1].spec.spawn_only
+    raises(mutate(lambda d: (with_rotate(d), d["mix"][-1].update(map="ramps"))),
+           "cannot run on map category 'ramps'")
+    raises(mutate(lambda d: (with_rotate(d), d["mix"][-1]["params"].update(min_clearance=-0.1))),
+           "min_clearance must be >= 0")
+    print("[validate] 16 broken variants all rejected with the offending key named; rotate_in_place parses")
 
     # allocation on a synthetic pool, no files touched
     cfg = parse_config(base, "up_down")

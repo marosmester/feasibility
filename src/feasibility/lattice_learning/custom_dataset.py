@@ -187,6 +187,12 @@ class ArcDivergenceDataset(Dataset):
             print(f"[dataset] {self.source.name}: no v_drive/wz_drive columns, derived from "
                   f"kappa at v_nom={self.v_nom}")
         command = np.stack([columns[c] for c in COMMAND_COLUMNS[command_mode]], axis=-1)  # [n, C]
+        if command_mode == "kappa" and np.isnan(kappa[valid]).any():
+            # pivot rows (generate_dataset.py's rotate_in_place: v_drive = 0) have no curvature
+            raise ValueError(
+                f"{self.source.name} has {int(np.isnan(kappa[valid]).sum())} valid pivot row(s) with "
+                "kappa = NaN -- load it with command_mode='v_wz' (train.py --command-mode v_wz)"
+            )
 
         self.patch_spec = patch_spec_from_attrs(self.attrs)
         ny, nx = self.patch_spec.ny, self.patch_spec.nx

@@ -1,0 +1,56 @@
+# lattice_learning dataset config with in-place turns -- see default.yaml for what every key means.
+#     python src/feasibility/lattice_learning/generate_dataset.py pivot
+#
+# Pivot rows (`rotate_in_place`) have v_drive = 0, wz_drive = +-arc.OMEGA_NOM and kappa = NaN, so a
+# dataset with them trains only with `train.py --command-mode v_wz`.
+# Maps: assets/lattice_maps/2 is the first dir with a poles_and_walls category; it predates the
+# standing platforms, so no ramp_down here (check_maps refuses it).
+
+seed: 0
+
+maps:
+  dir: assets/lattice_maps/2
+  n_maps: 8
+  trials_per_map: 16
+
+trial:
+  kappa_max: 2.0
+  warmup_s: 0.375             # a pivot turns 0.375 s * OMEGA_NOM = 11.25 deg during it
+  settle_steps: 15
+  mu: 0.8
+  interact_relief: 0.05
+  router_cell: 0.24
+  n_theta: 24
+
+run:
+  chunk: 64
+  maps_per_build: 1
+  device: cuda:0
+  dry_run: false
+
+ostrich_overrides: []
+
+mix:
+  - map: poles_and_walls
+    strategy: rotate_in_place
+    percent: 50.0
+    params:
+      interact_frac: 0.5      # exact share of pivots whose recorded spin sweeps a wheel into a
+                              # pole/wall (rim penetration > interact_relief), the rest near-misses
+      band: 0.3               # m, spin origins within rim reach + this of a height edge
+      min_clearance: 0.05     # m, every wheel cylinder stays this clear of the terrain through the
+                              # warm-up spin
+
+  - map: curbs_and_walls
+    strategy: edge
+    percent: 25.0
+    params:
+      interact_frac: 0.5
+      band: 1.5
+      facing_frac: 0.7
+      down_frac: 0.5
+
+  - map: rough
+    strategy: uniform
+    percent: 25.0
+    params: {}
