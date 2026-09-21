@@ -249,6 +249,11 @@ def add_shared_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--checkpoint-rot", type=pathlib.Path, default=DEFAULT_CHECKPOINT_ROT)
     parser.add_argument("--torch-device", default="cpu")
     parser.add_argument("--chunk", type=int, default=4096)
+    parser.add_argument(
+        "--pivot-cost", type=float, default=0.0,
+        help="m-equivalent per 15 deg heading bin for an in-place point turn; > 0 lets the lattice "
+             "turn in place (vanilla planners only -- the nn gates need pivot_cost 0)",
+    )
     parser.add_argument("--v", type=float, default=0.6)
     parser.add_argument("--lookahead", type=float, default=0.4)
     parser.add_argument("--mu", type=float, default=0.8)

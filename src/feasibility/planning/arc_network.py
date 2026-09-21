@@ -26,6 +26,7 @@ from feasibility.lattice_learning.arc import primitive_kappas
 from feasibility.lattice_learning.model import ArcDivergenceNet
 from feasibility.lattice_learning.patch import sample_patches
 from feasibility.lattice_learning.train import load_checkpoint
+from feasibility.planning.gated_lattice import N_PRIM_ARC
 from feasibility.planning.gated_lattice import N_THETA
 from feasibility.planning.gated_lattice import STEP
 
@@ -45,8 +46,12 @@ def load_network(
         f"{ctg.robot.min_turn_radius}"
     )
     # arc.primitive_kappas is in _build_primitives' `turns` order (asserted by arc.py's own
-    # self-test); pivots would append primitives the net has no curvature for
-    assert ctg.solver.n_prim == 5, f"expected 5 forward primitives (pivots off), got {ctg.solver.n_prim}"
+    # self-test); pivots append primitives the net has no curvature for, so a pivot lattice cannot
+    # be indexed by this field at all -- it needs v_wz-commanded fields, not a wider tau.
+    assert ctg.solver.n_prim == N_PRIM_ARC, (
+        f"expected {N_PRIM_ARC} forward primitives (pivot_cost 0), got {ctg.solver.n_prim} -- "
+        "a kappa-indexed field cannot describe an in-place pivot"
+    )
     return model
 
 

@@ -7,7 +7,8 @@ predicted error field says arc_error[row, col, heading, p] > tau. helhest_stack 
 actually taken.
 
 `python src/feasibility/planning/gated_lattice.py` is the smoke test: an open gate reproduces the stock
-relaxation bit for bit, a shut gate makes the goal unreachable (CUDA only).
+relaxation bit for bit, a shut gate makes the goal unreachable, and `pivot_cost` > 0 appends the two
+point turns and makes a goal BEHIND the robot reachable in a corridor too narrow to loop in (CUDA only).
 """
 from __future__ import annotations
 
@@ -21,6 +22,7 @@ from helhest.planning.lattice_solver import LatticeValueSolver
 
 N_THETA = 24
 STEP = 0.3  # [m] CostToGo's default arc length -- asserted against a network checkpoint's arc_len
+N_PRIM_ARC = 5  # forward arcs in _build_primitives' `turns`; pivot_cost > 0 appends 2 point turns
 
 
 @wp.kernel
@@ -126,10 +128,32 @@ class EdgeGatedLatticeSolver(LatticeValueSolver):
         )
 
 
-def make_cost_to_go(grid, device: str = "cuda") -> CostToGo:
-    """CostToGo on `grid` with Helhest's robot/solver parameters and this lattice (N_THETA, STEP)."""
+def make_cost_to_go(grid, device: str = "cuda", pivot_cost: float = 0.0) -> CostToGo:
+    """CostToGo on `grid` with Helhest's robot/solver parameters and this lattice (N_THETA, STEP).
+
+    `pivot_cost` > 0 [m-equivalent per heading bin] appends helhest_stack's two POINT-TURN
+    primitives (same cell, heading +-1 bin) to the five forward arcs, so a route may turn in place
+    instead of looping -- and a goal behind the robot becomes reachable at all in a corridor too
+    narrow for a min_turn_radius U-turn. The lattice pivot IS one `lattice_learning` pivot trial:
+    N_THETA = 24 makes a bin `arc.PIVOT_ANGLE`, turned in `arc.ARC_DURATION_S` at `arc.OMEGA_NOM`.
+
+    It defaults to 0 -- the forward-only lattice every threshold in `planners.py` was calibrated on,
+    and the only one `arc_network`'s kappa-indexed error fields can describe (a pivot has no
+    curvature; gating one needs a v_wz checkpoint). Raising it changes `solver.n_prim` 5 -> 7, which
+    `plan_path` refuses to gate rather than mis-index.
+    """
     return CostToGo(grid, dynamics.robot_params(), dynamics.planning_solver(), n_theta=N_THETA,
-                    step=STEP, device=device)
+                    step=STEP, pivot_cost=pivot_cost, device=device)
+
+
+def pivot_cost_of(solver: LatticeValueSolver) -> float:
+    """The `pivot_cost` a BUILT solver carries: 0 with only the N_PRIM_ARC forward arcs, else the
+    point turns' own cost read back off the primitive table (`_build_primitives` writes the same
+    value into every heading row). Read back rather than passed around so `build_gated_solver` can
+    keep reconstructing CostToGo's lattice from the CostToGo alone."""
+    if solver.n_prim == N_PRIM_ARC:
+        return 0.0
+    return float(solver._prim_cost.numpy()[0, N_PRIM_ARC])
 
 
 def build_gated_solver(ctg: CostToGo) -> EdgeGatedLatticeSolver:
@@ -143,9 +167,11 @@ def build_gated_solver(ctg: CostToGo) -> EdgeGatedLatticeSolver:
         n_theta=N_THETA,
         turn_radius=ctg.robot.min_turn_radius,
         step=STEP,
+        pivot_cost=pivot_cost_of(ctg.solver),
         device=ctg.device,
     )
-    for name in ("_prim_dr", "_prim_dc", "_prim_heading", "_prim_cost", "_sweep_dr", "_sweep_dc"):
+    for name in ("_prim_dr", "_prim_dc", "_prim_heading", "_prim_cost", "_sweep_dr", "_sweep_dc",
+                 "_sweep_n"):
         assert np.array_equal(getattr(solver, name).numpy(), getattr(ctg.solver, name).numpy()), name
     return solver
 
@@ -287,4 +313,27 @@ if __name__ == "__main__":
     shut = gated_solve(gated, ctg, zeros, ctg.graded_tilt, open_gate, -1.0)
     assert shut[start_rct] >= 0.5 * float(gated._inf), "a shut gate still reaches the goal"
     print("[gate] shut gate (every arc pruned) == goal unreachable")
+    del ctg, gated
+
+    # --- pivots: pivot_cost > 0 appends the two point turns, and a goal BEHIND the robot becomes
+    # reachable in a 1.1 m corridor, where a min_turn_radius U-turn does not fit -----------------
+    from feasibility.heightmap.heightmap_reader import HeightMapReader
+
+    corridor = HeightMapReader.flat(xlim=(-2.0, 2.0), ylim=(-0.5, 0.5), cell=0.1)
+    c_elev, c_grid = corridor.to_hstack("cuda")
+    behind = {}
+    for pc in (0.0, 0.15):
+        p_ctg = make_cost_to_go(c_grid, pivot_cost=pc)
+        n_expect = N_PRIM_ARC + (2 if pc > 0.0 else 0)
+        assert p_ctg.solver.n_prim == n_expect, (pc, p_ctg.solver.n_prim, n_expect)
+        assert math.isclose(pivot_cost_of(p_ctg.solver), pc, rel_tol=1e-6), pivot_cost_of(p_ctg.solver)
+        build_gated_solver(p_ctg)  # asserts the gated lattice matches this one, pivots included
+        p_ctg.compute(c_elev, (-1.0, 0.0))  # goal behind a robot that starts facing +x
+        v_start = float(p_ctg.V.numpy()[lattice_state(1.0, 0.0, 0.0, p_ctg)])
+        behind[pc] = (v_start, v_start < float(p_ctg._vcap) * 0.9)
+        del p_ctg
+    assert not behind[0.0][1], f"forward-only lattice reached a goal behind it: V {behind[0.0][0]}"
+    assert behind[0.15][1], f"pivot lattice could not reach the goal behind it: V {behind[0.15][0]}"
+    print(f"[pivot] goal behind: pivot_cost 0 -> unreachable (V {behind[0.0][0]:.3f}), "
+          f"0.15 -> V {behind[0.15][0]:.3f}")
     print("all self-checks ok")

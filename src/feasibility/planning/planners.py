@@ -34,6 +34,7 @@ from feasibility.planning.gated_lattice import EdgeGatedLatticeSolver
 from feasibility.planning.gated_lattice import gated_solve
 from feasibility.planning.gated_lattice import lattice_state
 from feasibility.planning.gated_lattice import make_cost_to_go
+from feasibility.planning.gated_lattice import N_PRIM_ARC
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 PLANNERS = {  # name -> network head it gates on (None = no network)
@@ -82,6 +83,11 @@ class PlannerConfig:
     checkpoint_rot: pathlib.Path = DEFAULT_CHECKPOINT_ROT
     torch_device: str = "cpu"
     chunk: int = 4096  # patches per network batch
+    # [m-equiv per 15 deg heading bin] > 0 adds helhest_stack's two in-place point turns to the
+    # lattice, so a route may turn in place (see make_cost_to_go). 0 = the forward-only lattice
+    # every tau above was calibrated on; the nn-gated planners currently REQUIRE 0, since the error
+    # fields are indexed by arc curvature and a pivot has none.
+    pivot_cost: float = 0.0
 
     @classmethod
     def from_args(cls, args) -> PlannerConfig:
@@ -115,7 +121,7 @@ class PlanContext:
             self._models.clear()  # load_network checks against the lattice, so reload with it
             self._fields_key, self._fields = None, {}
             gc.collect()
-            self.ctg = make_cost_to_go(grid)
+            self.ctg = make_cost_to_go(grid, pivot_cost=self.config.pivot_cost)
             self.gated = build_gated_solver(self.ctg)
             self._grid_key = key
         self.elev = elev
@@ -169,6 +175,14 @@ def plan_path(
     head = PLANNERS[planner]
     tau = math.inf
 
+    if (head is not None or audit) and ctg.solver.n_prim != N_PRIM_ARC:
+        raise NotImplementedError(
+            f"{planner} needs a predicted error per primitive, but this lattice has "
+            f"{ctg.solver.n_prim} primitives (pivot_cost > 0) and arc_network's fields cover only "
+            f"the {N_PRIM_ARC} forward arcs -- a pivot has no curvature to index them by. Gating a "
+            "pivot lattice needs v_wz-commanded fields; until then use a vanilla planner, or "
+            "pivot_cost 0."
+        )
     audit_fields = ctx.fields(terrain, "fused") if audit and head is None else {}
     if planner == "vanilla-on":
         result = arm_result(ctg, v_on, blocked, tilt, blocked, audit_fields, start_rct)
