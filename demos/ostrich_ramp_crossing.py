@@ -87,6 +87,7 @@ from ostrich import SimulationConfig
 from feasibility.comparator.common import _batch_control_kernel
 from feasibility.comparator.common import cmd_to_wheels
 from feasibility.comparator.common import HelhestBatchSimulator
+from feasibility.comparator.common import friction_kwargs
 from feasibility.comparator.common import K_P
 from feasibility.comparator.provenance import write_comparison
 from feasibility.heightmap import HeightMapReader
@@ -318,7 +319,7 @@ def ostrich_ramp_crossing(cfg: DictConfig) -> None:
     try:
         sim = RampCrossingSimulator(
             sim_config, render_config, engine_config, logging_config,
-            k_p=K_P, mu_front=mu, mu_rear=mu, terrain=TiledTerrain(terrains, offsets),
+            k_p=K_P, **friction_kwargs(mu), terrain=TiledTerrain(terrains, offsets),
             spawn_pose=spawn_pose, spawn_zpr=spawn_zpr, stop_x=stop_x,
         )
         # settle rides in the captured rollout as leading zero rows (generate_dataset.py's pattern)

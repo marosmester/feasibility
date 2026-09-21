@@ -81,6 +81,7 @@ import numpy as np
 import warp as wp
 import yaml
 
+from feasibility.comparator.common import friction_kwargs
 from feasibility.comparator.common import K_P
 from feasibility.comparator.provenance import write_comparison
 from feasibility.heightmap import HeightMapReader
@@ -180,7 +181,7 @@ def show_parked(
     try:
         sim = PurePursuitSimulator(
             sim_config, render_config, engine_config, logging_config,
-            k_p=K_P, mu_front=args.mu, mu_rear=args.mu, terrain=terrain,
+            k_p=K_P, **friction_kwargs(args.mu), terrain=terrain,
             spawn_pose=np.array([start], np.float64), paths=[here],
             settle_steps=args.settle_steps, lookahead=args.lookahead, v=0.0, kappa_max=controller_kappa_max(),
         )
@@ -325,7 +326,7 @@ def main() -> None:
     try:
         sim = PurePursuitSimulator(
             sim_config, render_config, engine_config, logging_config,
-            k_p=K_P, mu_front=args.mu, mu_rear=args.mu, terrain=terrain,
+            k_p=K_P, **friction_kwargs(args.mu), terrain=terrain,
             spawn_pose=np.tile(np.array(start, np.float64), (repeats, 1)),
             paths=[path] * repeats, settle_steps=args.settle_steps, lookahead=args.lookahead, v=args.v,
             kappa_max=kappa_max,

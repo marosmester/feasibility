@@ -27,6 +27,13 @@ trial:                        # what one sample is -- changing these changes the
   settle_steps: 15            # ostrich steps dropping onto the terrain at zero command, before the
                               # warm-up (0.375 s at OSTRICH_DT, scaled from learning/'s 12 steps at 30 ms)
   mu: 0.8                     # ground friction, for ostrich AND helhest_stack's static settle
+  yaw_gain: 0.49              # feedforward slip compensation: ostrich realizes only this
+                              # fraction of a commanded yaw rate (measured on flat ground at
+                              # mu/MU_LAT_RATIO above, warm-started, flat to +-0.03 over the whole
+                              # commanded range), so every yaw command is DIVIDED by it and the
+                              # robot turns what the primitive actually says. Stored twist,
+                              # reference and model input stay nominal -- see _wheel_setpoints.
+                              # 1.0 = no compensation, i.e. every dataset written before this key.
   interact_relief: 0.05       # m, plane-relative terrain relief along the arc that counts as the
                               # arc meeting terrain (interact_dir != 0); low enough for the lowest curb
   router_cell: 0.24           # m, the router's own lattice cell -> belief xy jitter = router_cell / 2

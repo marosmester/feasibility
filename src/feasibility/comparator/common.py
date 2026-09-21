@@ -58,6 +58,35 @@ HALF_TRACK = float(HelhestJuniorConfig.LEFT_WHEEL_POS[1])
 # justifies it (soft enough to isolate ground slip, stiff enough not to be the bottleneck).
 K_P = 15000.0
 
+# ANISOTROPIC WHEEL FRICTION. A wheel does not grip sideways the way it grips along its rolling
+# direction, and a skid-steer turn is ENTIRELY sideways slip, so an isotropic mu makes every turn
+# too easy. Measured on flat ground (warm-started 0.5 s primitives, mu = 0.8, ostrich dt 2.5e-2):
+# isotropic, ostrich realizes only 0.41 of a commanded yaw rate at OMEGA_NOM and the realized
+# fraction itself drifts 0.33 -> 0.48 across the commanded range; at lat_ratio 0.5 it realizes
+# 0.49 and is flat to +-0.03 over the whole range. That flatness is what makes a single
+# feedforward gain well defined, so the ratio is pinned here rather than passed per caller.
+#
+# `mu` everywhere downstream is the LONGITUDINAL (rolling-direction) coefficient -- the meaning
+# the old isotropic `mu` already had for straight driving, so a config's `mu: 0.8` still says what
+# it used to. The lateral (skid) coefficient is derived: mu_lat = mu * MU_LAT_RATIO.
+MU_LAT_RATIO = 0.5  # lateral (skid) / longitudinal (rolling); 1.0 restores isotropic friction
+
+
+def friction_kwargs(mu: float, lat_ratio: float = MU_LAT_RATIO) -> dict[str, float]:
+    """The four wheel-friction kwargs `create_helhest_junior_model` takes, from ONE longitudinal
+    `mu` and the lateral ratio -- the single place the anisotropy is resolved, so every simulator
+    build in this repo gets the same physics.
+
+    `friction_left_right`/`friction_rear` are the LATERAL coefficients as soon as their
+    `friction_long_*` partners are non-None (ostrich `examples/helhest_junior/common.py`), which
+    is why they must be set together and never by hand at a call site. `lat_ratio=1.0` passes the
+    same value on both axes, i.e. the isotropic behaviour every caller had before."""
+    mu_lat = float(mu) * float(lat_ratio)
+    return dict(
+        mu_front=mu_lat, mu_rear=mu_lat,
+        mu_long_front=float(mu), mu_long_rear=float(mu),
+    )
+
 # newton.CollisionPipeline's own max_triangle_pairs default -- kept as the floor below so a
 # single-world call (every compare_*.py driver forces num_worlds=1) sees identical behavior to
 # an unconfigured pipeline.
@@ -521,11 +550,16 @@ def run_ostrich_batch(
     settle_steps: int | None = None,
     record_settle: bool = False,
     spawn_zpr: np.ndarray | None = None,
+    mu_lat_ratio: float = MU_LAT_RATIO,
 ) -> tuple[np.ndarray, ...]:
     """`spawn_pose` is either one (x, y, yaw) shared by every world (setpoints' W dimension must
     then be 1) or an [N, 3] array giving each world its own -- see HelhestBatchSimulator.
     `spawn_zpr` [N, 3] (absolute z, pitch, roll) overrides the level `terrain + 0.5` spawn; None
     keeps it, see HelhestBatchSimulator.
+
+    `mu` is the LONGITUDINAL (rolling-direction) friction coefficient and `mu_lat_ratio` scales it
+    to the lateral (skid) one -- see `friction_kwargs`/`MU_LAT_RATIO`. Pass `mu_lat_ratio=1.0` for
+    the isotropic friction every caller of this function got before that constant existed.
 
     `record_settle=True` additionally returns the settle phase's pose [S, N, 7] and wheel_qd
     [S, N, 3] (see `HelhestBatchSimulator.replay_graph_batch`); the default keeps the two-array
@@ -547,7 +581,7 @@ def run_ostrich_batch(
             # is exactly how this used to surface) still gets collected rather than adding to the
             # pile
             sim_config, render_config, engine_config, logging_config,
-            k_p=K_P, mu_front=mu, mu_rear=mu, terrain=terrain, spawn_pose=spawn_pose,
+            k_p=K_P, **friction_kwargs(mu, mu_lat_ratio), terrain=terrain, spawn_pose=spawn_pose,
             spawn_zpr=spawn_zpr,
         )
         return sim.replay_graph_batch(setpoints, settle_steps, record_settle)

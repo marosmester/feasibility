@@ -25,6 +25,14 @@ Three things this generator does that no sibling generator does, all from design
   the other generators use, which ejects the robot when a wheel starts inside a step. The sliced-off pre-roll (the `settle_steps` zero-command drop, then the
   warm-up) is still stored, as `ostrich/preroll_pose`/`preroll_wheel_qd` with negative
   `ostrich/preroll_t`, for `gl_replay_arc.py` to show; nothing in training reads it.
+* **Feedforward slip compensation (`trial.yaw_gain`).** Ideal no-slip wheel speeds do not
+  produce the yaw rate they are computed for -- a skid-steer slips, and a point turn is pure slip,
+  so ostrich realizes only ~0.49 of any commanded `wz`. Every yaw command is therefore divided by
+  `yaw_gain` before it reaches the wheels (`_wheel_setpoints`, which documents the measurement),
+  so the robot actually turns what the primitive says. The stored `v_drive`/`wz_drive`, the
+  reference, and the model's input all stay NOMINAL -- only the command moves. `yaw_gain: 1.0`
+  reproduces the uncompensated behaviour of files written before the key existed; the value used
+  is in the root attrs.
 * **`OSTRICH_DT` is re-pinned to 2.5e-2 s** (section 2a), the finest `dt = 0.1/k` that divides
   both `ARC_LEN/V_NOM = 0.5 s` and the twin's `DT = 0.1 s` exactly -- overridden in code on
   `sim_config`, never in `examples/conf/simulation/helhest.yaml` (shared with `submodule_test/`'s
@@ -129,6 +137,7 @@ from feasibility.comparator.common import CONFIG_PATH
 from feasibility.comparator.common import euler_zyx_to_quat_xyzw
 from feasibility.comparator.common import init_warp_device
 from feasibility.comparator.common import K_P
+from feasibility.comparator.common import MU_LAT_RATIO
 from feasibility.comparator.common import OUT_DIR
 from feasibility.comparator.common import run_ostrich_batch
 from feasibility.comparator.provenance import git_provenance
@@ -244,10 +253,38 @@ class PreparedMap:
         return self.trials.pose.shape[0]
 
 
-def _wheel_setpoints(v: np.ndarray, wz: np.ndarray) -> np.ndarray:
+def _wheel_setpoints(v: np.ndarray, wz: np.ndarray, yaw_gain: float) -> np.ndarray:
     """[n, 3] wheel velocity setpoints for the body twists (`v`, `wz`) [n] -- (V_NOM, V_NOM * kappa)
-    for an arc, (0, +-OMEGA_NOM) for a pivot."""
-    return np.stack([cmd_to_wheels(float(a), float(b)) for a, b in zip(v, wz)]).astype(np.float32)
+    for an arc, (0, +-OMEGA_NOM) for a pivot -- with the yaw command divided by `yaw_gain`.
+
+    THE FEEDFORWARD SLIP COMPENSATION, and the only place it is applied. `cmd_to_wheels` is ideal
+    no-slip differential drive: it computes the wheel speeds that would produce `wz` if nothing
+    slipped. A skid-steer always slips, and a point turn is nothing but slip, so ostrich realizes
+    only `yaw_gain` of whatever yaw rate is asked for. Measured on flat ground at the friction this
+    generator runs (`MU_LAT_RATIO` 0.5, mu 0.8), warm-started, over the recorded window: 0.49 at
+    OMEGA_NOM, and flat to +-0.03 across the whole commanded range 0.13 .. 1.4 rad/s -- that
+    flatness is what makes ONE scalar the right shape for this correction. Commanding `wz /
+    yaw_gain` then lands the realized rotation on the primitive's nominal value: measured
+    1.00-1.04x nominal for pivots, 0.985 for the +-1/(2R) arcs, 0.90 for the +-1/R arcs (the
+    tightest arcs command ~2.45 rad/s, past where the gain was measured flat, and still fall a
+    little short -- a single scalar cannot fix all five curvatures at once).
+
+    Uncompensated, the shortfall is a pure command-side bias with no terrain in it, and it lands
+    squarely in the label: flat ground read e_rot = 0.13 rad for a pivot and 0.34 rad for a
+    kappa_max arc, the latter 0.9x the TAU_ROT the planner gates on. Compensated it reads 0.015
+    and 0.08. What does NOT go away is e_pos: the robot's real centre of rotation sits ~0.19 m from
+    where the primitive assumes it, so a correctly-turning pivot still drifts ~0.05 m. That is a
+    rigid per-primitive offset and belongs in the router's `prim_dr`/`prim_dc`, not here.
+
+    `yaw_gain = 1.0` restores the uncompensated command every dataset before this key used.
+
+    Only the COMMAND is scaled. The stored `v_drive`/`wz_drive`, the reference the label is
+    measured against, and the model's own input all stay NOMINAL -- they are the primitive the
+    planner believes in, and compensating them would move the reference along with the robot and
+    measure nothing."""
+    return np.stack(
+        [cmd_to_wheels(float(a), float(b) / yaw_gain) for a, b in zip(v, wz)]
+    ).astype(np.float32)
 
 
 def prepare_map(
@@ -307,6 +344,7 @@ def rollout_group(
     settle_steps: int,
     warmup_s: float,
     mu: float,
+    yaw_gain: float,
 ) -> list[tuple[np.ndarray, np.ndarray]]:
     """Runs every trial of `maps` through ostrich, `chunk` worlds per model build, and returns per
     map (pose [settle_steps + T_o, n, 7], wheel_qd [settle_steps + T_o, n, 3]) in that map's own
@@ -329,7 +367,9 @@ def rollout_group(
     spawn_pose = np.concatenate([m.trials.pose for m in maps]).astype(np.float64)
     spawn_pose[:, :2] += row_offset
     spawn_zpr = np.concatenate([m.spawn_zpr for m in maps])
-    wheels = np.concatenate([_wheel_setpoints(m.trials.v, m.trials.wz) for m in maps])  # [N, 3]
+    wheels = np.concatenate(
+        [_wheel_setpoints(m.trials.v, m.trials.wz, yaw_gain) for m in maps]
+    )  # [N, 3] -- the COMPENSATED command, see _wheel_setpoints
     n = spawn_pose.shape[0]
 
     pose = np.zeros((settle_steps + T_o, n, 7), dtype=np.float32)
@@ -377,6 +417,7 @@ def finish_map(
     settle_steps: int,
     warmup_s: float,
     mu: float,
+    yaw_gain: float,
     device: str,
 ) -> dict[str, np.ndarray]:
     """Turns one map's ostrich rollout (`rollout_group`) into every per_variant/ostrich array
@@ -457,7 +498,10 @@ def finish_map(
         endpoint_blocked[sl] = ~settle_ok
         swept_clear[sl] = swept_clear_chunk
 
-    ostrich_cmd = np.tile(_wheel_setpoints(v_drive, wz_drive)[None], (T_RECORD_OSTRICH, 1, 1))
+    # what the wheels were actually told to do -- compensated, unlike the nominal v_drive/wz_drive
+    ostrich_cmd = np.tile(
+        _wheel_setpoints(v_drive, wz_drive, yaw_gain)[None], (T_RECORD_OSTRICH, 1, 1)
+    )
     return dict(
         spawn_pose=spawn_pose.astype(np.float32),
         spawn_zpr=prepared.spawn_zpr.astype(np.float32),
@@ -583,6 +627,7 @@ def generate(cfg: DatasetConfig) -> None:
     n_maps, trials_per_map = cfg.maps.n_maps, cfg.maps.trials_per_map
     maps_dir = cfg.maps.path
     warmup_s, settle_steps, mu = cfg.trial.warmup_s, cfg.trial.settle_steps, cfg.trial.mu
+    yaw_gain = cfg.trial.yaw_gain
     chunk, maps_per_build, device = cfg.run.chunk, cfg.run.maps_per_build, cfg.run.device
     w_o = warmup_steps(cfg)  # raises unless warmup_s is a multiple of OSTRICH_DT
     lead = lead_m(cfg)
@@ -597,6 +642,12 @@ def generate(cfg: DatasetConfig) -> None:
           f"{N_THETA} heading bins in place, same duration")
     print(f"[warmup]   {warmup_s}s -> {w_o} ostrich steps ({lead:.3f} m, or "
           f"{np.degrees(OMEGA_NOM * warmup_s):.1f} deg in place), entered already moving at v_nom / omega_nom")
+    print(f"[friction] mu={mu} longitudinal (rolling), {mu * MU_LAT_RATIO:.3f} lateral (skid) "
+          f"-- MU_LAT_RATIO={MU_LAT_RATIO}, see comparator.common.friction_kwargs")
+    print(f"[yaw_gain] {yaw_gain} -- yaw commands scaled by 1/{yaw_gain} = {1.0 / yaw_gain:.3f} "
+          f"(pivot commands +-{OMEGA_NOM / yaw_gain:.4f} rad/s to realize +-{OMEGA_NOM:.4f}); "
+          f"stored twist, reference and model input stay nominal"
+          + ("  [NO COMPENSATION]" if yaw_gain == 1.0 else ""))
     print(f"[patch]    {spec.ny}x{spec.nx} cells @ {spec.cell} m, reference={spec.reference}")
     print(f"[jitter]   xy=+-{xy_jitter:.4f} m (router_cell={cfg.trial.router_cell}), "
           f"yaw=+-{yaw_jitter:.4f} rad (n_theta={cfg.trial.n_theta})")
@@ -654,7 +705,7 @@ def generate(cfg: DatasetConfig) -> None:
         rollouts = rollout_group(
             prepared, sim_config=sim_config, render_config=render_config,
             engine_config=engine_config, logging_config=logging_config, chunk=chunk,
-            settle_steps=settle_steps, warmup_s=warmup_s, mu=mu,
+            settle_steps=settle_steps, warmup_s=warmup_s, mu=mu, yaw_gain=yaw_gain,
         )
         print(f"[ostrich]  maps {g + 1}..{g + len(group)} simulated in {time.time() - t_build:.1f}s")
         for m, (am, prep, (full_pose, full_wheel_qd)) in enumerate(
@@ -662,7 +713,7 @@ def generate(cfg: DatasetConfig) -> None:
         ):
             result = finish_map(
                 prep, full_pose, full_wheel_qd, spec=spec, chunk=chunk, settle_steps=settle_steps,
-                warmup_s=warmup_s, mu=mu, device=device,
+                warmup_s=warmup_s, mu=mu, yaw_gain=yaw_gain, device=device,
             )
             finished.append((m, am.path, prep.terrain, result, prep.trials))
 
@@ -711,7 +762,10 @@ def generate(cfg: DatasetConfig) -> None:
             n_theta=cfg.trial.n_theta, interact_relief=cfg.trial.interact_relief,
             valid_excludes_endpoint_settle=True,
             maps_dir=str(maps_dir), map_glob=MAP_GLOB,
-            mu=mu, k_p=K_P,
+            mu=mu, mu_lat_ratio=MU_LAT_RATIO, yaw_gain=yaw_gain, k_p=K_P,  # mu is LONGITUDINAL; the lateral
+            # (skid) coefficient is mu * mu_lat_ratio -- comparator.common.friction_kwargs.
+            # Recorded because a file generated before the anisotropy existed is isotropic
+            # (ratio 1.0) and its yaw labels are not comparable with a newer file's.
             ostrich_dt=OSTRICH_DT,
             n_maps=n_maps, trials_per_map=trials_per_map, n=n, seed=seed,
             maps_per_build=maps_per_build, chunk=chunk,

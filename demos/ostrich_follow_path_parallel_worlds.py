@@ -80,6 +80,7 @@ import yaml
 from demos.ostrich_follow_path import add_shared_args
 from demos.ostrich_follow_path import plot_run
 from demos.ostrich_follow_path import REPO_ROOT
+from feasibility.comparator.common import friction_kwargs
 from feasibility.comparator.common import K_P
 from feasibility.comparator.common import WHEEL_RADIUS
 from feasibility.comparator.provenance import write_comparison
@@ -275,7 +276,7 @@ def simulate(
         try:
             sim = PurePursuitSimulator(
                 sim_config, render_config, engine_config, logging_config,
-                k_p=K_P, mu_front=args.mu, mu_rear=args.mu, terrain=terrain,
+                k_p=K_P, **friction_kwargs(args.mu), terrain=terrain,
                 spawn_pose=spawn_pose, spawn_zpr=spawn_zpr,
                 paths=[j.path + off[i] for i, j in enumerate(chunk)],
                 settle_steps=args.settle_steps, lookahead=args.lookahead, v=args.v,

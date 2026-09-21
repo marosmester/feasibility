@@ -105,6 +105,7 @@ class TrialConfig:
     warmup_s: float
     settle_steps: int
     mu: float
+    yaw_gain: float
     interact_relief: float
     router_cell: float
     n_theta: int
@@ -114,6 +115,10 @@ class TrialConfig:
         _check(self.warmup_s >= 0.0, f"warmup_s must be >= 0, got {self.warmup_s}")
         _check(self.settle_steps >= 0, f"settle_steps must be >= 0, got {self.settle_steps}")
         _check(self.mu > 0.0, f"mu must be > 0, got {self.mu}")
+        # 1.0 = command the nominal twist and let ostrich fall short (every dataset before this
+        # key existed); above 1.0 would mean ostrich OVER-rotates, which no measurement shows and
+        # which would command less than the primitive asks for.
+        _check(0.0 < self.yaw_gain <= 1.0, f"yaw_gain must be in (0, 1], got {self.yaw_gain}")
         _check(self.interact_relief > 0.0, f"interact_relief must be > 0, got {self.interact_relief}")
         _check(self.router_cell > 0.0, f"router_cell must be > 0, got {self.router_cell}")
         _check(self.n_theta >= 1, f"n_theta must be >= 1, got {self.n_theta}")

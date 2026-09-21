@@ -65,6 +65,7 @@ except ModuleNotFoundError:
     from helhest_common import create_helhest_junior_model
 
 from feasibility.comparator.common import cmd_to_wheels
+from feasibility.comparator.common import friction_kwargs
 from feasibility.comparator.common import K_P
 from feasibility.comparator.compare_speed_bumps import spec
 from feasibility.comparator.provenance import write_run
@@ -168,6 +169,12 @@ class OstrichSpeedBumpSimulator(HelhestJuniorReplaySimulator):
             k_d=self.k_d,
             friction_left_right=self.mu_front,
             friction_rear=self.mu_rear,
+            # Anisotropic wheel friction, forwarded exactly as HelhestBatchSimulator.build_model
+            # does it: with these set, mu_front/mu_rear above are the LATERAL (skid) coefficients.
+            # The parent accepts and stores them either way, so a build_model that does not
+            # forward them silently runs isotropic whatever the caller asked for.
+            friction_long_left_right=self.mu_long_front,
+            friction_long_rear=self.mu_long_rear,
             mu_rolling=self.mu_rolling,
             ke=self.wheel_ke,
             kd=self.wheel_kd,
@@ -207,7 +214,7 @@ def ostrich_speed_bump(cfg: DictConfig):
 
     sim = OstrichSpeedBumpSimulator(
         sim_config, render_config, engine_config, logging_config,
-        k_p=K_P, mu_front=mu, mu_rear=mu, terrain=terrain,
+        k_p=K_P, **friction_kwargs(mu), terrain=terrain,
         spawn_pose=(SPEC.spawn_x, SPEC.spawn_y, SPEC.spawn_yaw),
         terrain_repr=terrain_repr, mesh_stride=mesh_stride, mesh_max_rise=mesh_max_rise,
     )
