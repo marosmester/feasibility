@@ -97,9 +97,9 @@ DEFAULT_HEAD_WIDTH = 256  # head trunk width
 
 # What the command encoder is fed. "kappa" (default): one scalar curvature per row, design.md
 # section 4b. "v_wz": the commanded body twist (v_drive, wz_drive) generate_dataset.py stores
-# alongside kappa. Note v_drive is PINNED at V_NOM in every file generate_dataset.py writes today, so
-# "v_wz" carries the same information as "kappa" until v is actually sampled -- it exists so a
-# (v, omega)-input model can be trained and checkpointed without a schema change later.
+# alongside kappa. On an ARC row v_drive is pinned at V_NOM, so there the two modes carry the same
+# information; a `rotate_in_place` PIVOT row has v_drive = 0 and kappa = NaN, and only "v_wz" can
+# express it at all -- such a file must be trained with --command-mode v_wz.
 #
 # A command is always [B, C], C = len(COMMAND_COLUMNS[mode]), the dataset file columns it is read
 # from in that order. MIRROR_SIGN is the command half of the y-mirror symmetry (design.md section

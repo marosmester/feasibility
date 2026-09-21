@@ -20,9 +20,11 @@ per design.md section 11a. What one-label-per-row changes:
   The patch's rows are body +Y (`PatchSpec.ys()`, asserted mirror-symmetric in model.py), so a row
   flip is exactly a reflection in the body XZ plane.
 
-* **`--command-mode v_wz`** feeds the net the stored `(v_drive, wz_drive)` twist instead of `kappa`
-  (see model.COMMAND_MODES for why that is equivalent today). The kappa-binned baselines and the
-  kappa~0 flat check keep using the file's `kappa` in either mode.
+* **`--command-mode v_wz`** feeds the net the stored `(v_drive, wz_drive)` twist instead of
+  `kappa`, and is REQUIRED for a file holding `rotate_in_place` pivots, whose kappa is NaN. The
+  kappa-binned baseline and the kappa~0 flat check keep reading the file's `kappa` in either mode
+  (pivots bin separately and drop out of the flat check); the swept-envelope baseline reads the
+  twist in either mode, since that is the only form a pivot's motion has.
 
 * **`--label-mode pos_rpy`** regresses (e_pos, e_roll, e_pitch, e_yaw) -- one head per column --
   instead of (e_pos, e_rot). Every metric, baseline and log key below is per head, so it follows
@@ -33,10 +35,16 @@ Baselines (design.md section 8). Non-parametric/closed-form ones are computed up
 training, so a run's val RMSE has something to be judged against immediately:
 
     global mean          one constant (e_pos, e_rot) -- a sanity floor
-    per-kappa mean       binned by kappa, each bin shrunk toward the global mean -- "uses terrain at all"
-    max-relief-in-sweep  max |relief| over the patch cells the three wheels sweep along the nominal
-                         arc, then `y ~ a*feat + b` per head by least squares -- the obvious
-                         geometric proxy the net must beat
+    per-kappa mean       binned by kappa, each bin shrunk toward the global mean -- "uses the
+                         command at all"; pivot rows (kappa NaN) form one extra bin of their own
+    max-relief-in-sweep  max |relief| over the patch cells the three wheels sweep along the
+                         primitive -- the arc, or the point turn on a pivot row -- then
+                         `y ~ a*feat + b` per head by least squares: the obvious geometric proxy
+                         the net must beat
+
+Every subset of the final report prints a `>> vs best baseline` line (per head: WIN/TIE/LOSS and
+the percentage, against whichever baseline is strongest on that head), and the run ends on a
+one-line VERDICT banner for the full val set.
 
 `--blur-terrain` (relief replaced by its per-sample mean, at train AND eval time) and
 `--head-fusion concat` need the architecture trained, so they are flags on this same loop -- run
@@ -108,10 +116,13 @@ from helhest.engine import RobotParams
 
 from feasibility.comparator.common import OUT_DIR
 from feasibility.comparator.provenance import git_provenance
+from feasibility.lattice_learning.arc import ARC_DURATION_S
 from feasibility.lattice_learning.arc import ARC_LEN
-from feasibility.lattice_learning.arc import integrate_arc
+from feasibility.lattice_learning.arc import integrate_twist
 from feasibility.lattice_learning.arc import KAPPA_MAX
 from feasibility.lattice_learning.arc import MIN_TURN_RADIUS
+from feasibility.lattice_learning.arc import OMEGA_NOM
+from feasibility.lattice_learning.arc import twist_from_kappa
 from feasibility.lattice_learning.arc import V_NOM
 from feasibility.lattice_learning.custom_dataset import ArcDivergenceDataset
 from feasibility.lattice_learning.custom_dataset import make_dataloaders
@@ -136,8 +147,12 @@ DEFAULT_KAPPA_BINS = 8
 # per_kappa_mean_table(). With a few hundred rows a bin holds a few dozen samples at best.
 KAPPA_MEAN_PSEUDO_COUNTS = 4.0
 
-# Points sampled along the nominal arc for the swept-envelope mask (both ends included).
+# Points sampled along the primitive for the swept-envelope mask (both ends included).
 SWEEP_SAMPLES = 6
+
+# A model/baseline RMSE gap smaller than this (percent of the baseline) is called a TIE rather than
+# a win: with a few hundred held-out rows, the last percent is seed noise, not skill.
+BASELINE_TIE_PCT = 1.0
 
 # The kappa~0-on-flat-ground check (design.md section 8): |kappa| below this counts as straight,
 # and patch max |relief| below FLAT_RELIEF counts as flat. Relief is already divided by
@@ -224,6 +239,27 @@ def prepare_patch(patch: torch.Tensor, blur_terrain: bool) -> torch.Tensor:
     return blur(patch) if blur_terrain else patch
 
 
+def compare_to_baselines(
+    model_rmse: torch.Tensor, baseline_rmse: dict[str, torch.Tensor], names: tuple[str, ...]
+) -> tuple[str, list[str]]:
+    """(model [K] RMSE, {baseline name: [K] RMSE}) -> (one printable line, per-head verdicts).
+
+    Each head is judged against the BEST baseline FOR THAT HEAD, not against one nominated rival:
+    the baselines are not ranked the same way on every head (the geometric proxy is usually the
+    one to beat on e_pos, the global mean on e_rot), and beating the weaker of the two is not the
+    claim anyone wants to read. Lower RMSE is better, so a negative percentage is the win, and
+    anything inside `BASELINE_TIE_PCT` is called a TIE rather than dressed up as either."""
+    parts, verdicts = [], []
+    for k, head in enumerate(names):
+        best_name = min(baseline_rmse, key=lambda b: baseline_rmse[b][k].item())
+        best = baseline_rmse[best_name][k].item()
+        delta = (model_rmse[k].item() - best) / max(best, 1e-12) * 100.0
+        verdict = "TIE" if abs(delta) < BASELINE_TIE_PCT else ("WIN" if delta < 0.0 else "LOSS")
+        verdicts.append(verdict)
+        parts.append(f"{head} {verdict} {delta:+.1f}% vs {best_name}")
+    return ", ".join(parts), verdicts
+
+
 # --- baselines (design.md section 8) -------------------------------------------------------------
 
 
@@ -235,51 +271,78 @@ def kappa_range_of(ds: ArcDivergenceDataset) -> tuple[float, float]:
 
 
 def kappa_bin_index(kappa: torch.Tensor, n_bins: int, lo: float, hi: float) -> torch.Tensor:
+    """[n] kappa -> [n] bin index in [0, n_bins]. Bins 0..n_bins-1 split [lo, hi]; bin `n_bins` is
+    the PIVOT bin, holding every row whose kappa is NaN.
+
+    A point turn (v = 0) has no curvature at all, so it belongs to no curvature bin. Folding those
+    rows into one anyway is what made this baseline meaningless on a file with pivots: `.long()`
+    on NaN is undefined and clamped to 0, so every pivot row landed in bin 0 beside the tightest
+    right-hand arcs, and bin 0's mean described neither population. Hence the NaN is tested BEFORE
+    the integer cast, and it gets a bin of its own."""
     scaled = (kappa - lo) / max(hi - lo, 1e-12) * n_bins
-    return scaled.floor().long().clamp_(0, n_bins - 1)
+    binned = scaled.floor().clamp(0.0, float(n_bins - 1))
+    return torch.where(torch.isnan(kappa), torch.full_like(binned, float(n_bins)), binned).long()
 
 
 def per_kappa_mean_table(
     kappa: torch.Tensor, y: torch.Tensor, n_bins: int, lo: float, hi: float
 ) -> torch.Tensor:
-    """[n_bins, K] train mean label per kappa bin, each SHRUNK toward the global mean with
+    """[n_bins + 1, K] train mean label per kappa bin, each SHRUNK toward the global mean with
     `KAPPA_MEAN_PSEUDO_COUNTS` pseudo-observations so a sparse bin is not mostly noise -- a noisy
-    baseline flatters the model instead of challenging it."""
+    baseline flatters the model instead of challenging it. The extra row is `kappa_bin_index`'s
+    pivot bin; on a file without pivots it stays empty and is simply the global mean."""
     bins = kappa_bin_index(kappa, n_bins, lo, hi)
     global_mean = y.mean(dim=0)
-    table = torch.empty(n_bins, y.shape[-1], dtype=y.dtype, device=y.device)
+    table = torch.empty(n_bins + 1, y.shape[-1], dtype=y.dtype, device=y.device)
     m = KAPPA_MEAN_PSEUDO_COUNTS
-    for b in range(n_bins):
+    for b in range(n_bins + 1):
         sel = bins == b
         table[b] = (y[sel].sum(dim=0) + m * global_mean) / (sel.sum() + m)
     return table
 
 
 def swept_envelope_mask(
-    kappa: np.ndarray, spec: PatchSpec, robot: RobotParams | None = None
+    v: np.ndarray,
+    wz: np.ndarray,
+    spec: PatchSpec,
+    duration: float = ARC_DURATION_S,
+    robot: RobotParams | None = None,
 ) -> np.ndarray:
-    """[n] curvatures -> [n, ny, nx] bool: patch cells within `wheel_radius` of any of the three
-    wheel contacts -- front `(0, +-half_track)`, rear `(-rear_offset, 0)` in the body frame -- at
-    `SWEEP_SAMPLES` points along the nominal arc from the body origin. The "swept envelope" of
-    design.md section 8's max-relief baseline, in the same body frame the patch is sampled in."""
+    """[n] commanded twists -> [n, ny, nx] bool: patch cells within `wheel_radius` of any of the
+    three wheel contacts -- front `(0, +-half_track)`, rear `(-rear_offset, 0)` in the body frame
+    -- at `SWEEP_SAMPLES` times across the primitive's `duration`, from the body origin. The
+    "swept envelope" of design.md section 8's max-relief baseline, in the same body frame the
+    patch is sampled in.
+
+    Driven by the (v, wz) twist rather than by kappa so that it covers BOTH primitives. For an arc
+    the two are the same envelope (t = s / v, and `integrate_twist` reduces to `integrate_arc`);
+    for a pivot kappa is NaN and the arc form degenerates to "no envelope at all", which silently
+    handed every pivot row a feature of 0. A pivot's envelope is far from trivial -- the rear wheel
+    stands `rear_offset` behind the pivot point and sweeps sideways through `rear_offset * wz *
+    duration`, which is exactly how a point turn finds a pole in the first place."""
     robot = robot or RobotParams()
     r, ht, ro = float(robot.wheel_radius), float(robot.half_track), float(robot.rear_offset)
     wheels = np.array([[0.0, ht], [0.0, -ht], [-ro, 0.0]])  # [3, 2] body frame
-    kappa = np.asarray(kappa, dtype=np.float64)
-    s = np.linspace(0.0, ARC_LEN, SWEEP_SAMPLES)  # [S]
-    poses = integrate_arc(np.zeros((1, 1, 3)), kappa[:, None], s[None, :])  # [n, S, 3]
+    v = np.asarray(v, dtype=np.float64)
+    wz = np.asarray(wz, dtype=np.float64)
+    t = np.linspace(0.0, duration, SWEEP_SAMPLES)  # [S]
+    poses = integrate_twist(np.zeros((1, 1, 3)), v[:, None], wz[:, None], t[None, :])  # [n, S, 3]
     c, sn = np.cos(poses[..., 2]), np.sin(poses[..., 2])
     wx = poses[..., 0, None] + c[..., None] * wheels[:, 0] - sn[..., None] * wheels[:, 1]
     wy = poses[..., 1, None] + sn[..., None] * wheels[:, 0] + c[..., None] * wheels[:, 1]
-    wx, wy = wx.reshape(len(kappa), -1), wy.reshape(len(kappa), -1)  # [n, S*3]
+    wx, wy = wx.reshape(len(v), -1), wy.reshape(len(v), -1)  # [n, S*3]
     gx, gy = np.meshgrid(spec.xs(), spec.ys())  # [ny, nx], rows = body Y
     d2 = (gx[None, None] - wx[:, :, None, None]) ** 2 + (gy[None, None] - wy[:, :, None, None]) ** 2
     return (d2 <= r * r).any(axis=1)
 
 
 def max_relief_in_sweep(ds: ArcDivergenceDataset) -> torch.Tensor:
-    """[len(ds)] max |relief| over each row's swept envelope -- the geometric-proxy feature."""
-    mask = swept_envelope_mask(ds.kappa.cpu().numpy(), ds.patch_spec)
+    """[len(ds)] max |relief| over each row's swept envelope -- the geometric-proxy feature. Read
+    off the stored twist, so a pivot row gets its point turn's envelope rather than an empty one;
+    the primitive's duration comes from the FILE (arc_len / v_nom), not this module's constants."""
+    duration = float(ds.attrs.get("arc_len", ARC_LEN)) / ds.v_nom
+    twist = ds.twist.cpu().numpy()
+    mask = swept_envelope_mask(twist[:, 0], twist[:, 1], ds.patch_spec, duration)
     relief = ds.patch[:, 0].abs().cpu().numpy()
     return torch.from_numpy(np.where(mask, relief, 0.0).max(axis=(1, 2))).float()
 
@@ -482,16 +545,36 @@ def final_report(
           + (", blur_terrain=ON" if blur_terrain else ""))
     model_rmse: dict[str, torch.Tensor] = {}
     summary: dict[str, float] = {}
+    all_verdicts: list[str] = []
+    headline = ""
     for subset_name, rows in subsets.items():
         n_rows = len(val_idx) if rows is None else int(rows.sum())
         print(f"[final report] val RMSE, {subset_name} ({n_rows} rows):")
+        subset_rmse: dict[str, torch.Tensor] = {}
         for name, p in table.items():
             value = rmse_per_head(p, target, rows)
+            subset_rmse[name] = value
             print(f"                 {name:<22s} {fmt(value, names)}")
             key = f"final_rmse_{subset_name}_{name}".replace(" ", "_")
             summary.update({f"{key}_{n}": v for n, v in zip(names, value.tolist())})
             if name == "model":
                 model_rmse[subset_name] = value
+
+        baseline_rmse = {n: v for n, v in subset_rmse.items() if n != "model"}
+        if baseline_rmse:
+            line, verdicts = compare_to_baselines(subset_rmse["model"], baseline_rmse, names)
+            print(f"                 {'>> vs best baseline':<22s} {line}")
+            all_verdicts += verdicts
+            key = f"final_vs_baseline_{subset_name}".replace(" ", "_")
+            summary.update({f"{key}_{n}": float(v == "WIN") for n, v in zip(names, verdicts)})
+            if subset_name == "all":
+                won = [n for n, v in zip(names, verdicts) if v == "WIN"]
+                lost = [n for n, v in zip(names, verdicts) if v != "WIN"]
+                headline = (
+                    "BETTER THAN EVERY BASELINE" if not lost
+                    else "NO BETTER THAN THE BEST BASELINE" if not won
+                    else f"MIXED -- better on {', '.join(won)}, not on {', '.join(lost)}"
+                )
 
     r2 = r_squared(pred, target)
     print(f"[final report] val R^2 per head (model):      {fmt(r2, names)}")
@@ -513,6 +596,18 @@ def final_report(
     mirror_diff = mirror_equivariance_check(model, ds, val_idx, device, blur_terrain)
     print(f"[final report] mirror-equivariance max |diff| (model space): {mirror_diff:.4e}")
     summary["final_mirror_equivariance_max_diff"] = mirror_diff
+
+    # The verdict goes LAST, and only the "all" subset decides the headline word -- the subsets are
+    # nested views of the same val rows, so counting them as independent checks would overstate it.
+    if headline:
+        won = sum(v == "WIN" for v in all_verdicts)
+        summary["final_beats_baseline_checks"] = float(won)
+        summary["final_beats_baseline_checks_total"] = float(len(all_verdicts))
+        rule = "=" * 78
+        print(f"\n{rule}\n  VERDICT: {headline}\n"
+              f"  (all {len(val_idx)} val rows; model wins {won}/{len(all_verdicts)} "
+              f"(subset, head) checks against the best baseline of each)\n{rule}")
+
     run.summary.update(summary)
     return model_rmse
 
@@ -709,9 +804,9 @@ def self_test(args: argparse.Namespace) -> None:
     assert torch.allclose(blurred.std(dim=(-2, -1)), torch.zeros(2, 1), atol=1e-6)
     print("[blur] per-sample mean preserved, structure removed")
 
-    # --- swept envelope: non-empty, covers the wheel contacts at s=0, mirrors under kappa -> -kappa
+    # --- swept envelope: non-empty, covers the wheel contacts at s=0, mirrors under wz -> -wz --
     kappas = np.array([-2.0, -0.5, 0.0, 0.5, 2.0])
-    env = swept_envelope_mask(kappas, spec)
+    env = swept_envelope_mask(*twist_from_kappa(kappas, V_NOM), spec)
     assert env.shape == (5, spec.ny, spec.nx) and env.any(axis=(1, 2)).all()
     assert np.array_equal(env[0], env[4][::-1]) and np.array_equal(env[1], env[3][::-1]), (
         "swept envelope is not mirror-symmetric under kappa -> -kappa"
@@ -719,6 +814,38 @@ def self_test(args: argparse.Namespace) -> None:
     assert np.array_equal(env[2], env[2][::-1]), "straight-ahead envelope is not y-symmetric"
     print(f"[sweep] envelope covers {env.sum(axis=(1, 2)).tolist()} cells for kappa={kappas.tolist()}, "
           "mirror-symmetric")
+
+    # A PIVOT (v = 0, kappa NaN) must sweep strictly more than the parked footprint -- the whole
+    # point of driving this off the twist. It mirrors under wz -> -wz like an arc does.
+    spin = swept_envelope_mask(np.zeros(2), np.array([OMEGA_NOM, -OMEGA_NOM]), spec)
+    parked = swept_envelope_mask(np.zeros(1), np.zeros(1), spec)[0]
+    assert spin.any(axis=(1, 2)).all() and spin[0].sum() > parked.sum(), (spin.sum(), parked.sum())
+    assert np.array_equal(spin[0], spin[1][::-1]), "pivot envelope is not mirror-symmetric in wz"
+    print(f"[sweep] pivot envelope covers {int(spin[0].sum())} cells vs {int(parked.sum())} parked")
+
+    # --- a pivot row's NaN kappa gets its own bin, not bin 0 beside the tightest right turn -----
+    bins = kappa_bin_index(torch.tensor([float("nan"), -2.0, 0.0, 1.99]), 8, -2.0, 2.0)
+    assert bins.tolist() == [8, 0, 4, 7], bins.tolist()
+    pivot_y, arc_y = torch.full((1, K), 9.0), torch.full((1, K), 1.0)
+    bin_table = per_kappa_mean_table(
+        torch.tensor([float("nan"), 1.0]), torch.cat([pivot_y, arc_y]), 8, -2.0, 2.0
+    )
+    assert bin_table.shape == (9, K), bin_table.shape
+    assert bin_table[8].max() > bin_table[:8].max(), bin_table
+    print("[per-kappa mean] pivot rows bin separately, table is n_bins + 1 rows")
+
+    # --- the verdict line reads the best baseline PER HEAD, and lower RMSE is the win ----------
+    line, verdicts = compare_to_baselines(
+        torch.tensor([0.10, 0.50]),
+        {"weak": torch.tensor([0.30, 0.45]), "strong": torch.tensor([0.20, 0.40])},
+        ("e_pos", "e_rot"),
+    )
+    assert verdicts == ["WIN", "LOSS"], (verdicts, line)
+    assert line.count("vs strong") == 2, line
+    assert compare_to_baselines(
+        torch.tensor([0.2001]), {"a": torch.tensor([0.2])}, ("e_pos",)
+    )[1] == ["TIE"]
+    print(f"[verdict] {line}")
 
     with tempfile.TemporaryDirectory() as tmp:
         path = pathlib.Path(tmp) / "dataset_arc_synthetic.h5"

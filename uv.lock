@@ -1183,31 +1183,6 @@ importers = [
     { name = "usd-core", marker = "(python_full_version < '3.14' and platform_machine != 'aarch64') or (python_full_version >= '3.14' and extra == 'extra-6-newton-torch-cu12' and extra == 'extra-6-newton-torch-cu13') or (platform_machine == 'aarch64' and extra == 'extra-6-newton-torch-cu12' and extra == 'extra-6-newton-torch-cu13')" },
     { name = "usd-exchange", marker = "(python_full_version < '3.13' and platform_machine == 'aarch64') or (python_full_version >= '3.13' and extra == 'extra-6-newton-torch-cu12' and extra == 'extra-6-newton-torch-cu13') or (platform_machine != 'aarch64' and extra == 'extra-6-newton-torch-cu12' and extra == 'extra-6-newton-torch-cu13')" },
 ]
-torch-cu12 = [
-    { name = "alphashape" },
-    { name = "cbor2" },
-    { name = "coacd", marker = "python_full_version < '3.14'" },
-    { name = "fast-simplification" },
-    { name = "gitpython" },
-    { name = "imgui-bundle" },
-    { name = "meshio" },
-    { name = "mujoco", marker = "python_full_version < '3.14'" },
-    { name = "mujoco-warp", marker = "python_full_version < '3.14'" },
-    { name = "newton-actuators" },
-    { name = "newton-usd-schemas" },
-    { name = "open3d", marker = "(python_full_version < '3.13' and platform_machine != 'aarch64') or (python_full_version < '3.13' and sys_platform != 'linux')" },
-    { name = "pillow" },
-    { name = "pycollada" },
-    { name = "pyglet" },
-    { name = "pyyaml" },
-    { name = "requests" },
-    { name = "resolve-robotics-uri-py" },
-    { name = "scipy" },
-    { name = "torch" },
-    { name = "trimesh" },
-    { name = "usd-core", marker = "python_full_version < '3.14' and platform_machine != 'aarch64'" },
-    { name = "usd-exchange", marker = "python_full_version < '3.13' and platform_machine == 'aarch64'" },
-]
 
 [package.metadata]
 requires-dist = [
@@ -1584,7 +1559,6 @@ sim = [
     { name = "matplotlib" },
     { name = "mujoco-warp" },
     { name = "newton", extra = ["examples", "importers"] },
-    { name = "newton", extra = ["torch-cu12"], marker = "extra == 'extra-6-newton-torch-cu12'" },
     { name = "nvtx" },
     { name = "openmesh" },
     { name = "pandas" },
@@ -1592,7 +1566,6 @@ sim = [
     { name = "pytest" },
     { name = "scipy" },
     { name = "taichi" },
-    { name = "torch" },
     { name = "tqdm" },
     { name = "trimesh" },
     { name = "usd-core" },
@@ -1613,24 +1586,27 @@ requires-dist = [
     { name = "mkdocs-section-index", marker = "extra == 'docs'", specifier = "==0.3.10" },
     { name = "mkdocstrings-python", marker = "extra == 'docs'", specifier = "==1.18.2" },
     { name = "mujoco-warp", marker = "extra == 'sim'", specifier = ">=3.8.0.1" },
-    { name = "newton", extras = ["examples", "importers", "torch-cu12"], marker = "extra == 'sim'", editable = "ostrich/third_party/newton" },
+    { name = "newton", extras = ["examples", "importers"], marker = "extra == 'sim'", editable = "ostrich/third_party/newton" },
+    { name = "newton", extras = ["torch-cu12"], marker = "extra == 'learning'", editable = "ostrich/third_party/newton" },
     { name = "nimblephysics", marker = "extra == 'nimble'" },
     { name = "nvtx", marker = "extra == 'sim'", specifier = "==0.2.12" },
     { name = "openmesh", marker = "extra == 'sim'", specifier = "==1.2.1" },
     { name = "ostrich", extras = ["docs"], marker = "extra == 'dev'" },
+    { name = "ostrich", extras = ["learning"], marker = "extra == 'dev'" },
     { name = "ostrich", extras = ["sim"], marker = "extra == 'dev'" },
+    { name = "ostrich", extras = ["sim"], marker = "extra == 'learning'" },
     { name = "pandas", marker = "extra == 'sim'", specifier = "==2.3.1" },
     { name = "plotly", marker = "extra == 'sim'", specifier = "==6.4.0" },
     { name = "pytest", marker = "extra == 'sim'", specifier = "==8.4.0" },
     { name = "scipy", marker = "extra == 'sim'", specifier = "==1.16.1" },
     { name = "taichi", marker = "extra == 'sim'", specifier = "==1.7.3" },
-    { name = "torch", marker = "extra == 'sim'", specifier = ">=2.9.1" },
+    { name = "torch", marker = "extra == 'learning'", specifier = ">=2.9.1" },
     { name = "tqdm", marker = "extra == 'sim'", specifier = "==4.67.1" },
     { name = "trimesh", marker = "extra == 'sim'", specifier = "==4.6.12" },
     { name = "usd-core", marker = "extra == 'sim'", specifier = "==25.5.1" },
     { name = "warp-lang", marker = "extra == 'sim'", specifier = ">=1.13.0", index = "https://pypi.nvidia.com/" },
 ]
-provides-extras = ["sim", "brax", "genesis", "nimble", "dev", "docs"]
+provides-extras = ["sim", "learning", "brax", "genesis", "nimble", "dev", "docs"]
 
 [[package]]
 name = "packaging"

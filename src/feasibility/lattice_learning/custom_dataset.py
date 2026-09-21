@@ -141,7 +141,8 @@ class ArcDivergenceDataset(Dataset):
     (e_pos, e_roll, e_pitch, e_yaw) [4] (`label_mode="pos_rpy"`) -- see the module docstring for
     how the two relate. `self.TARGET_NAMES` names whichever columns `y` actually holds.
     `swept_clear` [bool] and `map_index`/`map_path` survive alongside (design.md section 8's
-    reporting split and section 11a's map-level split, respectively).
+    reporting split and section 11a's map-level split, respectively), as do `kappa` and the
+    `twist` (v, wz) in BOTH command modes -- the baselines read them whatever the net is fed.
 
     Reads the whole file into memory eagerly -- h5py handles are not fork-safe, and even
     design.md section 7c's ~200k-trial budget at 24x28 float32 patches is a few hundred MB, not a
@@ -166,7 +167,7 @@ class ArcDivergenceDataset(Dataset):
             self.git = dict(f["git"].attrs) if "git" in f else {}
             patch = f["patch"][()].astype(np.float32)  # [n, ny*nx]
             kappa = f["kappa"][()].astype(np.float32)  # [n]
-            columns = {c: f[c][()].astype(np.float32) for c in COMMAND_COLUMNS[command_mode] if c in f}
+            twist = {c: f[c][()].astype(np.float32) for c in ("v_drive", "wz_drive") if c in f}
             ref_pose = f["ref_pose"][()].astype(np.float64)  # [n, 7]
             valid = f["valid"][()].astype(bool)  # [n]
             swept_clear = f["swept_clear"][()].astype(bool)  # [n]
@@ -180,12 +181,17 @@ class ArcDivergenceDataset(Dataset):
             ostrich_final = f["ostrich/pose"][-1].astype(np.float64)  # [n, 7]
 
         self.v_nom = float(self.attrs.get("v_nom", V_NOM))
-        if len(columns) < len(COMMAND_COLUMNS[command_mode]):
+        if len(twist) < 2:
             # Only the twist can be missing: files written before generate_dataset.py stored it.
             # v was pinned at the file's own v_nom then, so it is exactly recoverable from kappa.
-            columns["v_drive"], columns["wz_drive"] = twist_from_kappa(kappa, self.v_nom)
+            twist["v_drive"], twist["wz_drive"] = twist_from_kappa(kappa, self.v_nom)
             print(f"[dataset] {self.source.name}: no v_drive/wz_drive columns, derived from "
                   f"kappa at v_nom={self.v_nom}")
+        # The twist is read in EVERY command_mode, not only "v_wz". It is the one description of
+        # the command that survives both primitives -- on a pivot row kappa is NaN, so anything
+        # that has to reason about the MOTION rather than feed the net (train.py's swept-envelope
+        # baseline) has nothing else to work from.
+        columns = {"kappa": kappa, **twist}
         command = np.stack([columns[c] for c in COMMAND_COLUMNS[command_mode]], axis=-1)  # [n, C]
         if command_mode == "kappa" and np.isnan(kappa[valid]).any():
             # pivot rows (generate_dataset.py's rotate_in_place: v_drive = 0) have no curvature
@@ -227,6 +233,9 @@ class ArcDivergenceDataset(Dataset):
             torch.from_numpy(patch[keep].reshape(-1, ny, nx)).unsqueeze(1).to(device)
         )  # [m, 1, ny, nx]
         self.kappa = torch.from_numpy(kappa[keep]).to(device)  # [m], in every mode: baselines use it
+        self.twist = torch.from_numpy(
+            np.stack([twist["v_drive"], twist["wz_drive"]], axis=-1)[keep]
+        ).to(device)  # [m, 2] (v, wz), in every mode too -- finite on pivot rows, unlike kappa
         self.command = torch.from_numpy(command[keep]).to(device)  # [m, C], what the model is fed
         self.command_mode = command_mode
         self.y = torch.from_numpy(y[keep]).to(device)
