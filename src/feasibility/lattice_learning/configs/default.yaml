@@ -63,7 +63,8 @@ ostrich_overrides: []         # Hydra overrides applied to ostrich's "helhest" b
 # targeted   any                               interact_frac
 # ramp_up    ramps                             straight_frac, yaw_jitter_deg, fallback_interact_frac
 # ramp_down  ramps (plateau >= platform)       straight_frac, yaw_jitter_deg, fallback_interact_frac
-# edge       curbs_and_walls, walls, boxes     interact_frac, band, facing_frac, down_frac
+# edge       curbs_and_walls, poles_and_walls, walls, boxes (walls/boxes retired)
+#                                              interact_frac, band, facing_frac, down_frac
 # rotate_in_place  curbs_and_walls, poles_and_walls  interact_frac, band, min_clearance -- PIVOTS
 #            (v = 0, wz = +-arc.OMEGA_NOM, one heading bin in 0.5 s), kappa NaN; see configs/pivot.yaml
 mix:

@@ -3,13 +3,21 @@
 #
 # Pivot rows (`rotate_in_place`) have v_drive = 0, wz_drive = +-arc.OMEGA_NOM and kappa = NaN, so a
 # dataset with them trains only with `train.py --command-mode v_wz`.
-# Maps: assets/lattice_maps/2 is the first dir with a poles_and_walls category; it predates the
-# standing platforms, so no ramp_down here (check_maps refuses it).
+#
+# Read PITCH off these rows, not position. Measured on 96 rows of exactly this shape: a pivot's
+# e_pos is ~0.06 m whether or not a wheel meets the feature (ostrich's skid through a point turn,
+# which the kinematic twin has no term for at all), so e_pos is a near-constant offset the global-
+# mean baseline already predicts. e_pitch separates: median 0.227 rad interacting vs 0.0002 rad
+# near-miss, because the rim climbs the pole while the twin's three contact points stay on flat
+# ground. So train with `--label-mode pos_rpy`.
+#
+# Maps: assets/lattice_maps/4 is the first dir with a poles_and_walls category (0-3 predate it;
+# create_maps_for_lattice_learning.py's DEFAULT_RATIOS covers all four categories now).
 
 seed: 0
 
 maps:
-  dir: assets/lattice_maps/2
+  dir: assets/lattice_maps/4
   n_maps: 8
   trials_per_map: 16
 

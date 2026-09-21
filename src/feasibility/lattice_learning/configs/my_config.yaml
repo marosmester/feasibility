@@ -1,10 +1,12 @@
 # lattice_learning dataset config -- the ONLY input of generate_dataset.py:
-#     python src/feasibility/lattice_learning/generate_dataset.py default
-# (a bare name resolves to this directory; a path works too). Every key is required; see
-# dataset_config.py for the validation and generate_dataset.py's docstring for what a sample is.
-# This file documents every key -- copy it to start a new config.
+#     python src/feasibility/lattice_learning/generate_dataset.py my_config
+# (a bare name resolves to this directory; a path works too). Every key is documented in
+# configs/default.yaml; see dataset_config.py for the validation and generate_dataset.py's
+# docstring for what a sample is.
 #
-# Mix: today's pre-config behaviour, one strategy per map category, in equal thirds.
+# Mix: a quarter each of climbs up ramps, descents down ramps, curbs/walls edges and negatives, on
+# the 400-map assets/lattice_maps/0. The two ramp entries share the ramp maps, 4 up + 4 down trials
+# on each; ramp_down needs that dir's 2.1 m standing platforms (check_maps enforces it).
 
 seed: 0                       # RNG seed for map selection, trial poses, kappa and belief jitter
 
@@ -63,7 +65,10 @@ ostrich_overrides: []         # Hydra overrides applied to ostrich's "helhest" b
 # targeted   any                               interact_frac
 # ramp_up    ramps                             straight_frac, yaw_jitter_deg, fallback_interact_frac
 # ramp_down  ramps (plateau >= platform)       straight_frac, yaw_jitter_deg, fallback_interact_frac
-# edge       curbs_and_walls, walls, boxes     interact_frac, band, facing_frac, down_frac
+# edge       curbs_and_walls, poles_and_walls, walls, boxes (walls/boxes retired)
+#                                              interact_frac, band, facing_frac, down_frac
+# rotate_in_place  curbs_and_walls, poles_and_walls  interact_frac, band, min_clearance -- PIVOTS
+#            (v = 0, wz = +-arc.OMEGA_NOM, one heading bin in 0.5 s), kappa NaN; see configs/pivot.yaml
 mix:
   - map: ramps
     strategy: ramp_up         # head-on UP a face (rising face or far side, 80 deg drops included),
