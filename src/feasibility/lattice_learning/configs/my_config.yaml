@@ -14,7 +14,7 @@ maps:
   dir: assets/lattice_maps/0  # repo-root-relative or absolute directory written by
                               # heightmap/create_maps_for_lattice_learning.py; each map's sidecar
                               # `category` is what the mix's `map:` refers to
-  n_maps: 200                   # maps drawn in total, split across categories by the mix percents
+  n_maps: 100                   # maps drawn in total, split across categories by the mix percents
                               # (largest-remainder rounding, each category drawn without replacement)
   trials_per_map: 8          # rows per map, so the dataset has n_maps * trials_per_map rows
 
@@ -43,7 +43,7 @@ trial:                        # what one sample is -- changing these changes the
   n_theta: 24                 # the router's heading bin count -> belief yaw jitter = pi / n_theta
 
 run:                          # how the dataset is computed -- does not change the trials
-  chunk: 64                   # ostrich worlds per model build; lower it if the GPU runs out of memory
+  chunk: 128                   # ostrich worlds per model build; lower it if the GPU runs out of memory
   maps_per_build: 10           # maps tiled side by side into one ostrich terrain (tiled_terrain.py);
                               # 1 = one build per map, the reference path. Trials are identical either
                               # way, only ostrich's own run-to-run noise differs; raise it when
@@ -72,7 +72,7 @@ ostrich_overrides: []         # Hydra overrides applied to ostrich's "helhest" b
 mix:
   - map: ramps
     strategy: ramp_up         # head-on UP a face (rising face or far side, 80 deg drops included),
-    percent: 25            # arc origin from before its foot up to the crest
+    percent: 20            # arc origin from before its foot up to the crest
     params:
       straight_frac: 0.75     # share of trials driven straight (kappa = 0), the rest kappa ~ U(+-kappa_max)
       yaw_jitter_deg: 5.0     # mid-arc heading off the face axis, uniform +-
@@ -81,7 +81,7 @@ mix:
 
   - map: ramps
     strategy: ramp_down         # head-on UP a face (rising face or far side, 80 deg drops included),
-    percent: 25            # arc origin from before its foot up to the crest
+    percent: 20            # arc origin from before its foot up to the crest
     params:
       straight_frac: 0.75     # share of trials driven straight (kappa = 0), the rest kappa ~ U(+-kappa_max)
       yaw_jitter_deg: 5.0     # mid-arc heading off the face axis, uniform +-
@@ -90,7 +90,7 @@ mix:
 
   - map: curbs_and_walls
     strategy: edge            # arc origins near a height edge (a >45 deg step, found from the grid)
-    percent: 25
+    percent: 20
     params:
       interact_frac: 0.5      # exact share of trials whose arc meets the edge (null = no strata)
       band: 1.5               # m, arc origins at most this far from an edge
@@ -99,5 +99,15 @@ mix:
 
   - map: rough
     strategy: uniform         # flat and low-amplitude rough ground: the negatives, nothing to aim at
-    percent: 25
+    percent: 20
     params: {}
+
+  - map: poles_and_walls
+    strategy: rotate_in_place
+    percent: 20
+    params:
+      interact_frac: 0.5      # exact share of pivots whose recorded spin sweeps a wheel into a
+                              # pole/wall (rim penetration > interact_relief), the rest near-misses
+      band: 0.3               # m, spin origins within rim reach + this of a height edge
+      min_clearance: 0.05     # m, every wheel cylinder stays this clear of the terrain through the
+                              # warm-up spin

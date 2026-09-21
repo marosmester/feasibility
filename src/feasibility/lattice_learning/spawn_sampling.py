@@ -35,10 +35,11 @@ Three decisions, all independent of any per-map height threshold:
     angle (`SpawnBatch.ramp_deg`). The faces come from the sidecar's `ramps` list: each rising
     face and each far side (a down-ramp, or a steep drop -- a wall-like face driven at from its
     foot). A trial picks a face, puts the arc origin's front axle at `ramp_s` ~ U(-ARC_LEN -
-    wheel_radius, run - ARC_LEN) metres along it from the foot -- from where the front wheel just
-    reaches the foot at the arc end, up to the crest; a 0.3 m arc after a 0.225 m warm-up cannot
-    climb a long ramp from its foot, so to see the face at all the arc must also be allowed to
-    START on it -- anywhere across its top width, with the heading at MID-arc along the face +-
+    wheel_radius, max(run - ARC_LEN, -direction * wheel_radius)) metres along it from the foot --
+    from where the front wheel just reaches the foot at the arc end, up to the crest (that second
+    bound is never the binding one going UP, see `s_event`); a 0.3 m arc after a 0.225 m warm-up
+    cannot climb a long ramp from its foot, so to see the face at all the arc must also be allowed
+    to START on it -- anywhere across its top width, with the heading at MID-arc along the face +-
     `yaw_jitter_deg`. A `straight_frac` share drives straight (kappa = 0), the rest on kappa ~
     U(-kappa_max, kappa_max). Every wheel contact from spawn to arc end must stay inside the
     face's top width and on that ramp's own surface (compared against the ramp rasterised on the
@@ -48,9 +49,12 @@ Three decisions, all independent of any per-map height threshold:
   - `ramp_down` -> `sample_ramp_down_trials`: the exact mirror. The entry point is the face's
     CREST and the robot heads downhill, so `ramp_s` runs from where the front wheel just reaches
     the crest at the arc end (the robot standing on the plateau) to where the arc ends at the
-    foot. Drops are faces too, so some trials drive off an 80 deg edge. The earliest spawn needs
-    `required_platform_length` of plateau behind the crest; create_ramps.py's plateau floor is
-    sized for it and dataset_config.check_maps refuses maps whose sidecar plateaus are shorter.
+    foot -- or, on a face too short for that to reach the moment the front wheel rolls off the
+    lip, to one wheel radius past the crest (`s_event`). Drops are faces too, so some trials drive
+    off an 80 deg edge, and on those it is `s_event` that puts the drop inside the recorded window
+    instead of just beyond it. The earliest spawn needs `required_platform_length` of plateau
+    behind the crest; create_ramps.py's plateau floor is sized for it and
+    dataset_config.check_maps refuses maps whose sidecar plateaus are shorter.
   - `edge` -> `sample_edge_trials`: arc origins uniform among cells within `band` of a height
     EDGE (a cell whose neighbour is steeper than EDGE_MIN_SLOPE_DEG -- found from the heightmap
     alone, no sidecar needed), heading at the nearest edge +- EDGE_FACING_CONE_DEG with
@@ -160,7 +164,12 @@ class SpawnBatch:
     ramp_s: np.ndarray | None = None  # [n] float32 m, arc origin's front axle along the face from
     # its entry point in the direction of travel -- the foot for ramp_up, the crest for ramp_down
     # (negative = not on the face yet), NaN = not a ramp trial
-    interact_dir: np.ndarray | None = None  # [n] int8 +1 up / -1 down / 0 not interacting
+    interact_dir: np.ndarray | None = None  # [n] int8 +1 up / -1 down / 0 not interacting.
+    # The SIGN comes from a plane through three terrain samples at the arc origin, so it is
+    # ill-posed once one of those samples has passed a lip -- a `ramp_down` trial already over
+    # a short face's crest (`ramp_s` > 0 with `run` < ARC_LEN + wheel_radius) fits its plane
+    # partly on the ground below and can read +1. Magnitude and the `interact_dir != 0` test
+    # stay usable; measured 20 of 159 `ramp_down` rows on 60-81 deg faces.
     endpoint_feasible: np.ndarray | None = None  # [n] bool, static settle at the NOMINAL arc end
     v: np.ndarray | None = None  # [n] float32 m/s commanded body speed; default V_NOM (every arc)
     wz: np.ndarray | None = None  # [n] float32 rad/s commanded yaw rate; default V_NOM * kappa
@@ -858,6 +867,17 @@ def _sample_face_trials(
     local = WHEEL_CONTACTS_LOCAL
     window = np.linspace(-lead, ARC_LEN, ARC_SAMPLES)  # spawn ... arc end, relative to the origin
     s_min = -ARC_LEN - float(robot.wheel_radius)  # front wheel just reaches the entry at arc end
+    # ... and `s_event` is where the thing a face trial exists to record actually happens: driving
+    # UP, the front wheel meets the face a wheel radius BEFORE the entry (its rim touches it);
+    # driving DOWN, its contact rolls off the lip a wheel radius AFTER the entry. `run - ARC_LEN`
+    # ("the arc ends no further than the face's far end") is never below -wheel_radius, so going up
+    # it always binds and this floor changes nothing. Going down a face shorter than ARC_LEN +
+    # wheel_radius -- steeper than ~47 deg on a 0.7 m ramp -- it collapses past the event and pins
+    # every trial to the approach: measured over 78 such rows, the terrain under the body moved
+    # 0.000 m from t0 to arc end and |e_pitch| stayed at 0.0006 rad, i.e. flat-ground negatives
+    # carrying an interact_dir of -1. The spawn is still `lead` further back and still has to pass
+    # the settle, so widening this cannot start the robot beyond the lip.
+    s_event = -direction * float(robot.wheel_radius)
     surfaces = {f.ramp_index: ramp_alone(terrain, f.ramp) for f in faces}
     foot_x, foot_y, face_yaw, face_run, face_half_w, face_slope = (
         np.array([getattr(f, k) for f in faces])
@@ -879,7 +899,7 @@ def _sample_face_trials(
         ex, ey = fx + entry * run * c, fy + entry * run * s
         travel = fyaw + turn
 
-        s0 = rng.uniform(s_min, np.maximum(run - ARC_LEN, s_min))
+        s0 = rng.uniform(s_min, np.maximum(run - ARC_LEN, s_event))
         t0 = rng.uniform(-half_w, half_w)
         kappa = np.where(rng.uniform(size=m) < straight_frac, 0.0, rng.uniform(-kappa_max, kappa_max, m))
         # heading along the face at MID-arc, so a curved arc bends symmetrically about the axis
@@ -1159,11 +1179,18 @@ if __name__ == "__main__":
     steep_faces = ramp_faces({"ramps": [dataclasses.asdict(r) for r in steep]})
     sb = sample_ramp_up_trials(steep_map, steep_faces, spec, 32, rng, **ramp_kw, **kw)
     assert sb.shortfall == 0 and (sb.interact_dir > 0).mean() > 0.5, (sb.shortfall, sb.interact_dir)
+    # Driven down, the same face is an 0.7 m drop off a standing platform. `s_event` is what
+    # lets the arc reach the moment the front wheel rolls off it, so trials past the crest must
+    # exist -- and on those rows interact_dir's SIGN is ill-posed (see the field's comment), so
+    # assert it only where the whole contact plane is still on the platform.
     db = sample_ramp_down_trials(steep_map, steep_faces, spec, 32, rng, **ramp_kw, **kw)
-    assert db.shortfall == 0 and (db.interact_dir < 0).mean() > 0.5, (db.shortfall, db.interact_dir)
+    over = db.ramp_s > 0.0
+    assert db.shortfall == 0 and over.any(), (db.shortfall, db.ramp_s.max())
+    assert (db.interact_dir[~over] <= 0).mean() > 0.9, db.interact_dir[~over]
     print(f"80 deg face: up 32/32, {int((sb.interact_dir > 0).sum())} reach it, "
           f"{int((~sb.endpoint_feasible).sum())} blocked ends; down 32/32, "
-          f"{int((db.interact_dir < 0).sum())} go over the edge, "
+          f"{int(over.sum())} start past the crest, "
+          f"{int((db.interact_dir < 0).sum())} read a drop, "
           f"{int((~db.endpoint_feasible).sum())} blocked ends")
 
     mixed = concat_batches([fb, eb], rng)
