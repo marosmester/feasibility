@@ -7,10 +7,24 @@
     nn-gated-rot    same, the pos_rot net's e_rot > tau_rot
     nn-gated-fused  pruned when the pos_rot net's e_pos > tau_fused_pos OR e_rot > tau_fused_rot,
                     i.e. max(e_pos / tau_fused_pos, e_rot / tau_fused_rot) > 1
+    nn-report       vanilla-on's plan (settle `blocked`, no gate), then the v_wz net's predicted
+                    error for every primitive the traced path takes -- pivots included, the one net
+                    that can describe them -- one column per head the checkpoint carries (pos_rpy
+                    by default). Prunes nothing.
+    nn-gated-pivot  the settle's `blocked` AND a gate on the IN-PLACE TURNS only: a point turn is
+                    pruned when the v_wz net's e_pitch > tau_pivot_pitch, the five forward arcs are
+                    left open (tau inf). Needs pivot_cost > 0, or there is nothing to gate.
 
 All share one `CostToGo` (n_theta=24, 0.3 m arcs) and its `graded_tilt` soft cost, so they differ
 only in what makes a transition infeasible. The thresholds are defaults for the two checkpoints
 below; a new checkpoint needs a new calibration.
+
+`nn-gated-pivot` is the odd one out in keeping `blocked`: the other nn-gated planners were built to
+ask whether the network can REPLACE the settle, so they zero it. This one adds to it. The settle
+already refuses the walls it can see; the point turn it waves through is the one dragging a wheel
+sideways into a low curb, which tilts the body well inside the envelope and is exactly what the
+kinematic twin cannot represent. Two different instruments on two different features, not a
+substitution.
 """
 from __future__ import annotations
 
@@ -28,6 +42,9 @@ from helhest.planning.costtogo import CostToGo
 from feasibility.heightmap import HeightMapReader
 from feasibility.planning.arc_network import arc_error_fields
 from feasibility.planning.arc_network import load_network
+from feasibility.planning.arc_network import load_network_vwz
+from feasibility.planning.arc_network import path_arc_errors
+from feasibility.planning.arc_network import vwz_error_fields
 from feasibility.planning.gated_lattice import arm_result
 from feasibility.planning.gated_lattice import build_gated_solver
 from feasibility.planning.gated_lattice import EdgeGatedLatticeSolver
@@ -35,6 +52,7 @@ from feasibility.planning.gated_lattice import gated_solve
 from feasibility.planning.gated_lattice import lattice_state
 from feasibility.planning.gated_lattice import make_cost_to_go
 from feasibility.planning.gated_lattice import N_PRIM_ARC
+from feasibility.planning.gated_lattice import N_THETA
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 PLANNERS = {  # name -> network head it gates on (None = no network)
@@ -44,10 +62,56 @@ PLANNERS = {  # name -> network head it gates on (None = no network)
     "nn-gated-pitch": "e_pitch",
     "nn-gated-rot": "e_rot",
     "nn-gated-fused": "fused",
+    "nn-report": "vwz",
+    "nn-gated-pivot": "pivot",  # the v_wz net's e_pitch, on the point turns only
 }
 # pos_rpy net (e_pos, e_pitch) and its pos_rot sibling (e_pos, e_rot), trained on the same data
 DEFAULT_CHECKPOINT = REPO_ROOT / "outputs" / "checkpoints" / "dataset_arc_my_config_M200_R8_seed0_rpy.pt"
 DEFAULT_CHECKPOINT_ROT = REPO_ROOT / "outputs" / "checkpoints" / "dataset_arc_my_config_M200_R8_seed0.pt"
+# v_wz net (arcs AND pivots), what nn-report queries. Trained separately: pass --checkpoint-vwz.
+# A pos_rpy checkpoint by default, not its pos_rot sibling: both describe a pivot, but the rotation
+# axes carry very different amounts of the signal. On the 1080 pivot rows of the dataset both were
+# fit on, predicted interacting/near-miss medians separate 70.7x on pos_rpy's e_pitch against 9.2x
+# on pos_rot's e_rot -- e_rot sums the one informative axis with e_roll and e_yaw, which a pivot
+# barely moves (true separation 1.3x on e_yaw), so it arrives diluted. See `load_network_vwz`.
+DEFAULT_CHECKPOINT_VWZ = (
+    REPO_ROOT / "outputs" / "checkpoints" / "dataset_arc_my_config_M300_R8_seed0_vwz_rpy.pt"
+)
+# The POINT TURN's own threshold on DEFAULT_CHECKPOINT_VWZ's e_pitch head -- calibrated on the 200
+# pivot rows of that checkpoint's HELD-OUT MAPS (its own val split, val_frac 0.2 / seed 0 out of the
+# stored `args`), never on a map a demo plans on.
+#
+# It is a TOLERANCE, not a fitted constant. On those rows the e_pitch head is near-unbiased for a
+# point turn -- median predicted/true 1.06x over the upper half, quantiles tracking the truth to
+# q0.90 (0.043/0.070 at the median, 0.257/0.261 at q0.75, 0.445/0.448 at q0.90), Spearman 0.88 --
+# so "prune a pivot whose predicted e_pitch exceeds X" really does prune the pivots whose real
+# ostrich-vs-twin pitch error exceeds X rad, and moving the tolerance moves the best threshold with
+# it about 1:1 (2.5 deg -> 0.128, 5 -> 0.197, 10 -> 0.233, 15 -> 0.296, by a mid-gap rule). Picking
+# one is therefore a judgement about the robot, not about the network.
+#
+# 5 deg is where the near-miss population runs out: pivots placed beside a feature that no wheel
+# reaches have true e_pitch median 0.0002 and q0.975 0.089, so past ~0.09 rad a point turn is
+# outside anything flat ground produces. It prunes 80 of the 84 held-out pivots whose true error
+# exceeds it (worst miss 0.230 rad = 13 deg) and wrongly prunes 14 of the other 116 -- 10 of those
+# within 2x of tau, only 3 genuinely flat. Scored against a "bad = true e_pitch > 0.174" label it
+# is AUC 0.969.
+#
+# Checked once end to end on a map the net never saw -- every candidate point turn of
+# `heightmap.create_pivot_pocket`'s lattice, both directions, 702768 of them. Turns whose three
+# wheel centres stay clear of relief through the whole 15 deg sweep predict a median 0.010 rad;
+# turns that sweep a centre over a curb predict 0.227, and this tau prunes 85% of them. Of the 7%
+# of "clear" turns it also prunes, not one has open ground around it: every one has relief within
+# 1.0 m of a swept wheel centre and 76% within one wheel radius, i.e. the tyre is over the feature
+# even though its centre is not, which is exactly the case a centre-only audit cannot see. The ones
+# it keeps have their nearest relief 2.5 m away at the median.
+#
+# Its own constant because it gates a different population, not because the net needs two numbers:
+# a point turn's median true e_pitch is 0.043 rad against a forward arc's 0.009, so one tolerance
+# bites the two classes at very different rates (0.0873 prunes 42% of held-out pivots, 24% of
+# arcs). That is also what retires the worry that no single tau separates pivots from arcs on the
+# pocket map: a calibrated head is compared to an absolute tolerance, never ranked against the
+# other class.
+TAU_PIVOT_PITCH = 0.0873  # [rad] = 5 deg
 # One-time tau* calibration for DEFAULT_CHECKPOINT, see THRESHOLDS in benchmarks/bench_uphill_nn.py
 TAU_POS = 0.1741  # [m]
 TAU_PITCH = 0.0933  # [rad]
@@ -72,26 +136,31 @@ TAU_FUSED_ROT = 0.46
 @dataclasses.dataclass
 class PlannerConfig:
     """Thresholds, checkpoints and inference settings of the gated planners. Field names match the
-    demos' CLI dests, so `PlannerConfig.from_args(args)` picks them out of an argparse Namespace."""
+    demos' CLI dests, so `PlannerConfig.from_args(args)` picks them out of an argparse Namespace
+    (a field a demo has no flag for keeps its default)."""
 
     tau_pos: float = TAU_POS
     tau_pitch: float = TAU_PITCH
     tau_rot: float = TAU_ROT
     tau_fused_pos: float = TAU_FUSED_POS
     tau_fused_rot: float = TAU_FUSED_ROT
+    tau_pivot_pitch: float = TAU_PIVOT_PITCH
     checkpoint: pathlib.Path = DEFAULT_CHECKPOINT
     checkpoint_rot: pathlib.Path = DEFAULT_CHECKPOINT_ROT
+    checkpoint_vwz: pathlib.Path = DEFAULT_CHECKPOINT_VWZ
     torch_device: str = "cpu"
     chunk: int = 4096  # patches per network batch
     # [m-equiv per 15 deg heading bin] > 0 adds helhest_stack's two in-place point turns to the
     # lattice, so a route may turn in place (see make_cost_to_go). 0 = the forward-only lattice
-    # every tau above was calibrated on; the nn-gated planners currently REQUIRE 0, since the error
-    # fields are indexed by arc curvature and a pivot has none.
+    # TAU_POS/TAU_PITCH/TAU_ROT/TAU_FUSED_* were calibrated on, and the four kappa-gated planners
+    # REQUIRE it, since their error fields are indexed by arc curvature and a pivot has none.
+    # nn-gated-pivot is the other way round and requires pivot_cost > 0.
     pivot_cost: float = 0.0
 
     @classmethod
     def from_args(cls, args) -> PlannerConfig:
-        return cls(**{f.name: getattr(args, f.name) for f in dataclasses.fields(cls)})
+        return cls(**{f.name: getattr(args, f.name) for f in dataclasses.fields(cls)
+                      if hasattr(args, f.name)})
 
 
 class PlanContext:
@@ -112,6 +181,8 @@ class PlanContext:
         self._models: dict[str, object] = {}
         self._fields_key = None
         self._fields: dict[str, np.ndarray] = {}
+        self._vwz_key = None  # the v_wz FIELD is a separate (and far more expensive) cache
+        self._vwz: dict[str, np.ndarray] = {}
 
     def planner_for(self, terrain: HeightMapReader) -> tuple[CostToGo, EdgeGatedLatticeSolver]:
         elev, grid = terrain.to_hstack("cuda")
@@ -120,6 +191,7 @@ class PlanContext:
             self.ctg = None  # drop the old buffers before allocating new ones (3 GiB GPU)
             self._models.clear()  # load_network checks against the lattice, so reload with it
             self._fields_key, self._fields = None, {}
+            self._vwz_key, self._vwz = None, {}  # its last plane is indexed by primitive
             gc.collect()
             self.ctg = make_cost_to_go(grid, pivot_cost=self.config.pivot_cost)
             self.gated = build_gated_solver(self.ctg)
@@ -150,6 +222,43 @@ class PlanContext:
             self._fields.update(out)
         return self._fields
 
+    def vwz_model(self):
+        """The (v_drive, wz_drive)-commanded network, loaded once per lattice. Unlike the kappa
+        nets it is allowed on a pivot lattice -- describing a point turn is what it is for."""
+        if "v_wz" not in self._models:
+            self._models["v_wz"] = load_network_vwz(self.config.checkpoint_vwz, self.torch_device,
+                                                    self.ctg)
+        return self._models["v_wz"]
+
+    def vwz_fields(self, terrain: HeightMapReader) -> dict[str, np.ndarray]:
+        """{head: [ny, nx, n_theta, n_prim]} from the v_wz net, every primitive of the lattice --
+        what `nn-gated-pivot` gates on. `planner_for(terrain)` must have been called first.
+
+        One inference pass over every lattice pose, which is minutes on CPU for a map that is not
+        row-invariant (see `arc_network.vwz_error_fields`), so it is cached per map for the life of
+        this context -- plan every arm of a comparison in ONE process and it is paid once.
+        """
+        if self._vwz_key is not terrain:
+            model = self.vwz_model()
+            t0 = time.time()
+            self._vwz = vwz_error_fields(model, terrain, self.ctg, self.config.chunk,
+                                         self.torch_device, heads=tuple(model.target_names))
+            n = self.ctg.grid.cells_y * self.ctg.grid.cells_x * N_THETA
+            print(f"network inference (v_wz field, {n} lattice poses x {self.ctg.solver.n_prim} "
+                  f"primitives): {time.time() - t0:.1f} s")
+            self._vwz_key = terrain
+        return self._vwz
+
+    def vwz_path_errors(self, terrain: HeightMapReader, result: dict) -> dict[str, np.ndarray]:
+        """The v_wz net's {e_pos, e_rot} [n_steps] for the primitives of a traced `result` (see
+        `arc_network.path_arc_errors`). `planner_for(terrain)` must have been called first."""
+        t0 = time.time()
+        out = path_arc_errors(self.vwz_model(), terrain, self.ctg, result["states"],
+                              result["prims"], self.config.chunk, self.torch_device)
+        print(f"network inference (v_wz, {len(result['prims'])} path primitives): "
+              f"{time.time() - t0:.2f} s")
+        return out
+
 
 def plan_path(
     terrain: HeightMapReader,
@@ -162,7 +271,10 @@ def plan_path(
     """The planner `planner` (a PLANNERS key), solved and traced from `start`. Returns arm_result's
     dict plus `tau`, `head` (None for the vanilla planners), `gate`, a printable description of
     the threshold ("" for the vanilla planners), and `xy` [n, 2], the traced lattice poses in world
-    coordinates. `audit` also fills a vanilla plan's `max_err` from the pos_rot net's fields
+    coordinates. `nn-report` and `nn-gated-pivot` also carry `arc_errors` (one entry per checkpoint
+    head, per primitive taken, so index i is the step from pose i to i+1); for `nn-gated-pivot`
+    `tau` is the point turns' threshold alone, the forward arcs being ungated.
+    `audit` also fills a vanilla plan's `max_err` from the pos_rot net's fields
     (e_pos_rot / e_rot / fused), so ungated paths can calibrate the gate."""
     ctg, gated = ctx.planner_for(terrain)
     v_on = ctg.compute(ctx.elev, goal).numpy().copy()
@@ -175,7 +287,9 @@ def plan_path(
     head = PLANNERS[planner]
     tau = math.inf
 
-    if (head is not None or audit) and ctg.solver.n_prim != N_PRIM_ARC:
+    # nn-report and nn-gated-pivot are the v_wz planners: they describe every primitive of any
+    # lattice, so only the kappa-indexed ones are refused here
+    if ((head not in (None, "vwz", "pivot")) or audit) and ctg.solver.n_prim != N_PRIM_ARC:
         raise NotImplementedError(
             f"{planner} needs a predicted error per primitive, but this lattice has "
             f"{ctg.solver.n_prim} primitives (pivot_cost > 0) and arc_network's fields cover only "
@@ -184,12 +298,44 @@ def plan_path(
             "pivot_cost 0."
         )
     audit_fields = ctx.fields(terrain, "fused") if audit and head is None else {}
-    if planner == "vanilla-on":
+    if planner in ("vanilla-on", "nn-report"):
         result = arm_result(ctg, v_on, blocked, tilt, blocked, audit_fields, start_rct)
+        if planner == "nn-report":
+            result["arc_errors"] = ctx.vwz_path_errors(terrain, result)
     elif planner == "vanilla-off":
         v_off = ctg.solver._record_solve(zeros, ctg.graded_tilt, ctg._goal_rc, ctg.flatness_weight,
                                          False).numpy()
         result = arm_result(ctg, v_off, no_block, tilt, blocked, audit_fields, start_rct)
+    elif planner == "nn-gated-pivot":
+        if ctg.solver.n_prim == N_PRIM_ARC:
+            raise ValueError(
+                "nn-gated-pivot gates the in-place point turns, and pivot_cost 0 builds a lattice "
+                f"with only the {N_PRIM_ARC} forward arcs -- nothing to gate. Re-run with "
+                "pivot_cost > 0 (0.15 is the demos' default), or pick another planner."
+            )
+        fields = ctx.vwz_fields(terrain)
+        tau = float(ctx.config.tau_pivot_pitch)
+        # The gate, per primitive: the five forward arcs keep inf (no finite prediction exceeds it,
+        # so they are untouched) and the two point turns get the tolerance calibrated for THEM.
+        # One array rather than one number because the two classes are different populations of the
+        # same head -- see TAU_PIVOT_PITCH.
+        taus = np.full(ctg.solver.n_prim, math.inf, np.float32)
+        taus[N_PRIM_ARC:] = tau
+        err = wp.array(fields["e_pitch"], dtype=wp.float32, device=ctg.device)
+        # `ctg.blocked`, where the other gated planners pass `zeros`: they were built to ask
+        # whether the net can REPLACE the settle, this one adds to it. The settle still stops the
+        # walls; the net only adds the low curb it tolerates (see the module docstring).
+        v = gated_solve(gated, ctg, ctg.blocked, ctg.graded_tilt, err, taus)
+        result = arm_result(ctg, v, blocked, tilt, blocked, fields, start_rct, fields["e_pitch"],
+                            taus)
+        # the field is already in hand, so the path's own predictions cost nothing -- this is what
+        # `view_planned_path.py` prints per pose, the same columns nn-report gives
+        taken, prims = result["states"][:-1], result["prims"]
+        result["arc_errors"] = {
+            name: f[taken[:, 0], taken[:, 1], taken[:, 2], prims] if prims
+            else np.empty(0, np.float32)
+            for name, f in fields.items()
+        }
     else:
         fields = ctx.fields(terrain, head)
         tau = ctx.taus[head]
@@ -200,6 +346,10 @@ def plan_path(
     rct = result["states"]
     if head is None:
         gate = ""
+    elif head == "vwz":
+        gate = "none (report only)"
+    elif head == "pivot":
+        gate = f"in-place turns only: e_pitch > {tau:.4f} rad, forward arcs ungated"
     elif head == "fused":
         cfg = ctx.config
         gate = f"max(e_pos/{cfg.tau_fused_pos:.4f}, e_rot/{cfg.tau_fused_rot:.4f}) > 1"
