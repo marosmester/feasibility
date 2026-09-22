@@ -310,9 +310,11 @@ class HelhestBatchSimulator(HelhestJuniorReplaySimulator):
         terrain: HeightMapReader,
         spawn_pose: tuple[float, float, float] | np.ndarray,
         spawn_zpr: np.ndarray | None = None,
+        highlight_obstacles: bool = False,
         **kwargs,
     ):
         self.terrain = terrain
+        self.highlight_obstacles = highlight_obstacles
         # Normalize to [N, 3] up front so build_model (called from inside super().__init__())
         # only has one shape to handle.
         spawn_pose_arr = np.asarray(spawn_pose, dtype=np.float64)
@@ -350,6 +352,19 @@ class HelhestBatchSimulator(HelhestJuniorReplaySimulator):
             mesh=self.terrain.to_ostrich_mesh(),
             cfg=newton.ModelBuilder.ShapeConfig(density=0.0, mu=0.8, **self.ground_cfg_kwargs),
         )
+        if self.highlight_obstacles:
+            # non-colliding overlay, added right after the real terrain shape and still inside
+            # globals_builder -- see to_ostrich_obstacle_mesh for why a second shape is needed at
+            # all (Newton colours per shape, not per triangle) and finalize_replicated's own
+            # "leading world==-1 entities" requirement for why it has to land here, not later
+            obstacle_mesh = self.terrain.to_ostrich_obstacle_mesh()
+            if obstacle_mesh is not None:
+                globals_builder.add_shape_mesh(
+                    body=-1,
+                    mesh=obstacle_mesh,
+                    cfg=newton.ModelBuilder.ShapeConfig(density=0.0, has_shape_collision=False),
+                    color=(0.0, 0.35, 0.0),
+                )
 
         # Build the robot once, at identity -- every world gets an identical copy via
         # finalize_replicated's default (translation-only, all-zero-offset) replicate(). Actual

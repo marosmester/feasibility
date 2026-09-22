@@ -104,9 +104,13 @@ def pivot_truth(terrain: HeightMapReader, ctg, params: dict) -> tuple[np.ndarray
     it, and `feature_distances` rasterises the walls and the curb separately from the rectangles
     the map was built from, so the wall's own ramp is never mistaken for curb.
     """
+    curb_x = params["curb_x"] or garage.CURB_X
+    # the spur is read off the sidecar, not defaulted: a map written with --spur-x records None
+    # and has to be scored as the rib-only map it is
     walls, curbs = garage.garage_rects(params["wall_gap"], params["back_gap"],
-                                       params["garage_x"][1], -params["garage_x"][0],
-                                       params["curb_x"] or garage.CURB_X)
+                                       params["garage_x"][1], -params["garage_x"][0], curb_x,
+                                       params.get("spur_x") or curb_x,
+                                       params.get("spur_y") or garage.SPUR_Y)
     dist_wall, dist_curb = garage.feature_distances(terrain, walls, curbs, params["wall_height"],
                                                     params["curb_height"])
     grid = ctg.grid
@@ -393,13 +397,24 @@ def print_summary(a: dict, b: dict) -> None:
     # the honest caveat, from this run's own numbers rather than a claim
     if "clear" in a["split"] and "touch" in b["split"]:
         pct = lambda v: f"{v:.0%}"
+        # whether that already costs map A its route is this run's to say, not a fixed claim:
+        # it has been both, and it moves with every retrain
+        a_gated, a_on = a["gated"]["result"], a["on"]["result"]
+        toll = (
+            f"It has not cost map A its route here -- its gated plan is the ungated one, "
+            f"{a_on['path_m']:.2f} m --\n    but it is why that can come out longer, and it has."
+            if a_gated["reachable"] and abs(a_gated["path_m"] - a_on["path_m"]) < 1e-6 else
+            f"That, not a curb, is why map A's gated route is "
+            + ("NO ROUTE" if not a_gated["reachable"]
+               else f"{a_gated['path_m']:.2f} m against the ungated {a_on['path_m']:.2f}")
+            + "\n    rather than identical."
+        )
         print(
             f"\n    Read map A's row with the split above in mind. {pct(a['split']['clear']['over'])} of the point turns on its\n"
             f"    bare floor are already over tau, because the head reads the 1 m WALLS too: a turn\n"
             f"    with its rim close to one really does diverge, it is just not the feature this map\n"
-            f"    is about. That, not a curb, is why map A's gated route is longer instead of\n"
-            f"    identical. The curb still moves the population it is meant to -- on map B the turns\n"
-            f"    whose tyre reaches it sit at {b['split']['touch']['median']:.3f} rad against "
+            f"    is about. {toll} The curb still moves the population it is meant to -- on map B\n"
+            f"    the turns whose tyre reaches it sit at {b['split']['touch']['median']:.3f} rad against "
             f"{b['split']['clear']['median']:.3f} for the ones that do not,\n"
             f"    {pct(b['split']['touch']['over'])} of them over tau against {pct(b['split']['clear']['over'])}."
         )

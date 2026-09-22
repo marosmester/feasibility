@@ -59,20 +59,33 @@ CLI parameters:
     --view                live GL viewer instead of the headless rollout; starts PAUSED, SPACE runs
     --torch-device D      network inference device (default cuda -- nn-gated-pivot needs a
                           predicted error at EVERY lattice pose, minutes on CPU)
+    --record              save the run's trajectory to <out-dir>/<map>_<planner>.h5 (off by default)
+    --replay PATH         skip SIMULATING entirely -- play back a --record'ed h5's trajectory in the
+                          GL viewer, POSE-ONLY (no physics stepped). A live --view run steps the
+                          real contact solve every frame, which is what makes screen-recording it
+                          come out at ~4 fps; replaying a recording instead renders at whatever fps
+                          the viewer alone can hit. Re-runs PLANNING (cheap) from the h5's own
+                          map/planner/pivot_cost/start/goal and draws view_planned_path's red
+                          heading arrows + trail + goal marker over the played-back drive; starts
+                          PAUSED like --view, SPACE runs, "." steps one recorded frame
+    --replay-id N         which repeat (world) of --replay's h5 to play back (default 0)
     ... plus ostrich_follow_path.py's shared flags (--tau-*, --checkpoint*, --v, --lookahead, --mu,
         --slack, --settle-steps, --chunk, --override)
 
-Outputs (<out-dir>/<map>_<planner>.*)
-    .png       bird's-eye elevation, planned path dashed, each repeat's executed track by outcome
-    _turn.png  pitch / roll / yaw against time with the point turns shaded -- this demo's own plot
-    .h5        comparator/provenance's schema, plus the per-step phase index; replay repeat K with
-               python src/feasibility/replay/gl_replay.py --file <...>.h5 --id K --which ostrich
+Outputs (<out-dir>/<map>_<planner>.h5, only written with --record)
+    comparator/provenance's schema, plus the per-step phase index; --replay is this demo's own
+    pose-only viewer for it, or replay any repeat's ostrich/hstack pair with
+    python src/feasibility/replay/gl_replay.py --file <...>.h5 --id K --which ostrich
+    Obstacles (curb + walls) render as a separate dark-green, non-colliding overlay in the live
+    --view GL viewer and in --replay (HelhestBatchSimulator's highlight_obstacles, always on here).
 
 Run:
     python demos/ostrich_follow_plan_turning.py --map A --planner vanilla-on
     python demos/ostrich_follow_plan_turning.py --map B --planner vanilla-on     # the same plan
     python demos/ostrich_follow_plan_turning.py --map B --planner nn-gated-pivot # refused
     python demos/ostrich_follow_plan_turning.py --map A --planner nn-gated-pivot --view
+    python demos/ostrich_follow_plan_turning.py --map B --planner vanilla-on --record --repeats 1
+    python demos/ostrich_follow_plan_turning.py --replay outputs/follow_plan_turning/garage_b_vanilla-on.h5
 """
 from __future__ import annotations
 
@@ -210,52 +223,133 @@ def turn_metrics(
     )
 
 
-def plot_turn(
-    pose: np.ndarray,
-    phase: np.ndarray,
-    phases: dict[str, np.ndarray],
-    dt: float,
-    results: list[dict],
-    title: str,
-    out: pathlib.Path,
-) -> None:
-    """Pitch / |roll| and yaw against time, with the point turns shaded -- this demo's own plot.
-    The turn is where the curb acts, so shading it is what makes an A/B pair readable side by side."""
-    import matplotlib
+def replay_recording(path: pathlib.Path, replay_id: int) -> None:
+    """Play back a --record'ed h5's `ostrich` trajectory in the GL viewer, POSE-ONLY -- no physics
+    stepped. --view steps the real contact solve every frame, which is what makes screen-recording
+    it come out at ~4 fps; this instead writes `joint_q` straight from the recording each frame and
+    calls `eval_fk`, so it renders at whatever fps the viewer alone can hit. Reuses
+    `feasibility.replay.gl_replay`'s wheel-angle integration/interpolation (the h5 only logs wheel
+    angular VELOCITY, not angle) rather than re-deriving them, but builds its own single-robot scene
+    -- gl_replay.py is compare_*.h5-shaped (a fixed side camera at a recorded obstacle_x, an
+    optional SECOND hstack robot) -- so this instead reuses this demo's own bird's-eye camera and
+    green obstacle overlay, matching what --view showed live.
 
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    Also re-runs the PLANNING step (`map`/`planner`/`pivot_cost` from the h5's own root attrs, the
+    exact recorded start from `spawn_pose`, the goal from `goal` if the file has it, else the map's
+    own sidecar) and draws `view_planned_path`'s red heading arrows + amber trail + goal marker over
+    it, the same as --view's controller was steering towards -- just not the controller or the
+    physics that drove it, which is the expensive part. Planning is cheap (no network for
+    vanilla-*; an nn-gated one re-queries its checkpoint at PlannerConfig's defaults, which is a
+    mismatch only if the original run overrode a --tau-*/--checkpoint* flag)."""
+    import h5py
+    import newton
+    from examples.helhest_junior.common import create_helhest_junior_model
+    from ostrich.core.model_builder import OstrichModelBuilder
 
-    n = pose.shape[1]
-    t = np.arange(len(pose)) * dt
-    fig, (ax0, ax1) = plt.subplots(2, 1, figsize=(11, 6.5), sharex=True, layout="constrained")
-    is_pivot = phases["kind"] == KIND_PIVOT
-    mask = is_pivot[np.clip(phase[:, 0], 0, len(is_pivot) - 1)]  # world 0 sets the shading
-    edges = np.diff(np.concatenate([[0], mask.astype(int), [0]]))
-    for lo, hi in zip(np.nonzero(edges == 1)[0], np.nonzero(edges == -1)[0]):
-        ax0.axvspan(t[lo], t[min(hi, len(t) - 1)], color="0.85", zorder=0)
-        ax1.axvspan(t[lo], t[min(hi, len(t) - 1)], color="0.85", zorder=0,
-                    label="_" if lo else "turning in place")
-    for w in range(n):
-        pitch, roll, _ = pitch_roll(pose[:, w, 3:7])
-        c = ofp.STATUS_COLORS[results[w]["status"]]
-        ax0.plot(t, np.degrees(pitch), "-", lw=1.2, color=c, label=f"pitch {w} ({results[w]['status']})")
-        ax0.plot(t, np.degrees(np.abs(roll)), "--", lw=1.0, color=c, alpha=0.7, label=f"|roll| {w}")
-        ax1.plot(t, np.degrees(np.unwrap(yaw_of(pose[:, w, 3:7]))), "-", lw=1.2, color=c,
-                 label=f"yaw {w}")
-    for target in phases["target"][is_pivot]:
-        ax1.axhline(math.degrees(target), color="black", lw=0.6, ls=":", alpha=0.6)
-    ax0.set_ylabel("pitch (nose-up < 0) and |roll| [deg]")
-    ax0.axhline(0.0, color="black", lw=0.6)
-    ax0.legend(fontsize=7, ncol=2, loc="upper left")
-    ax1.set_ylabel("yaw [deg], dotted = the planned bin centres")
-    ax1.set_xlabel("t [s]")
-    ax1.legend(fontsize=7, loc="upper left")
-    ax0.set_title(title, fontsize=10)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out, dpi=110)
-    plt.close(fig)
-    print(f"saved {out}")
+    from feasibility.comparator.provenance import terrain_from_h5
+    from feasibility.replay.gl_replay import integrate_wheel_angle
+    from feasibility.replay.gl_replay import interp_pose
+    from feasibility.replay.gl_replay import interp_series
+
+    with h5py.File(path, "r") as f:
+        n = int(f.attrs["n"])
+        if not (0 <= replay_id < n):
+            raise SystemExit(f"--replay-id must be in [0, {n}), got {replay_id}")
+        name = str(f.attrs["name"])
+        status = f["status"].asstr()[replay_id]
+        map_path = pathlib.Path(str(f.attrs["map"]))
+        planner = str(f.attrs["planner"])
+        pivot_cost = float(f.attrs["pivot_cost"])
+        start = tuple(float(v) for v in f["spawn_pose"][replay_id])
+        goal = tuple(float(v) for v in f.attrs["goal"]) if "goal" in f.attrs else None
+        terrain = terrain_from_h5(f, replay_id)
+        t = f["ostrich"]["t"][:]
+        pose = f["ostrich"]["pose"][:, replay_id, :]
+        wheel_theta = integrate_wheel_angle(t, f["ostrich"]["wheel_qd"][:, replay_id, :])
+
+    if goal is None:  # a file recorded before `goal` was added to root attrs -- fall back to the map
+        meta = yaml.safe_load(map_path.with_suffix(".yaml").read_text())
+        goal = tuple(float(v) for v in meta["goal"])
+
+    wp.init()
+    print(f"planning {map_path.name} with {planner}, pivot_cost {pivot_cost} (for the red path only "
+          f"-- the driving below is the recorded ostrich trajectory, not this plan re-run)")
+    ctx = PlanContext(PlannerConfig(pivot_cost=pivot_cost))
+    plan = plan_path(terrain, start, goal, planner, ctx)
+    del ctx
+    gc.collect()
+    draw_path = plan["reachable"] and plan["reached"]
+    if not draw_path:
+        print("re-plan found no route from the recorded start -- no red path to draw")
+
+    builder = OstrichModelBuilder()
+    builder.add_shape_mesh(body=-1, mesh=terrain.to_ostrich_mesh(),
+                           cfg=newton.ModelBuilder.ShapeConfig(mu=0.8))
+    obstacle_mesh = terrain.to_ostrich_obstacle_mesh()
+    if obstacle_mesh is not None:
+        builder.add_shape_mesh(
+            body=-1, mesh=obstacle_mesh,
+            cfg=newton.ModelBuilder.ShapeConfig(density=0.0, has_shape_collision=False),
+            color=(0.0, 0.35, 0.0),
+        )
+    create_helhest_junior_model(builder, xform=wp.transform_identity())
+    joints = {"base": 0, "left": 1, "right": 2, "rear": 3}  # create_helhest_junior_model's fixed order
+
+    model = builder.finalize()
+    viewer = newton.viewer.ViewerGL()
+    viewer.set_model(model)
+    pos, pitch, yaw, dist = ofp.bird_eye_camera(terrain, viewer.camera.fov)
+    viewer.set_camera(pos=wp.vec3(*pos), pitch=pitch, yaw=yaw)
+    viewer.camera.sync_pivot_to_view(dist)
+    state = model.state()
+
+    dev = viewer.device
+    if draw_path:
+        poses = vpp.path_poses(plan)
+        starts, ends = vpp.arrow_segments(poses, terrain, vpp.ARROW_LEN)
+        arrow_a = wp.array(starts, dtype=wp.vec3, device=dev)
+        arrow_b = wp.array(ends, dtype=wp.vec3, device=dev)
+        trail_a = wp.array(starts[:-1], dtype=wp.vec3, device=dev)
+        trail_b = wp.array(starts[1:], dtype=wp.vec3, device=dev)
+        goal_pt = wp.array([[goal[0], goal[1], float(terrain.sample(*goal)) + vpp.ARROW_Z]],
+                           dtype=wp.vec3, device=dev)
+        goal_r = wp.array([vpp.GOAL_RADIUS], dtype=wp.float32, device=dev)
+        goal_c = wp.array([vpp.COLOR_GOAL], dtype=wp.vec3, device=dev)
+
+    q_start = model.joint_q_start.numpy()
+    joint_q = model.joint_q.numpy().copy()
+    joint_q_wp = wp.array(joint_q, dtype=wp.float32, device=model.device)
+    joint_qd_wp = wp.zeros_like(model.joint_qd)  # eval_fk only needs joint_q for body_q
+
+    t_end = float(t[-1])
+    frame_dt = float(np.median(np.diff(t))) if len(t) > 1 else 0.0  # a "." single-step's advance
+    print(f"replaying {path.name} repeat {replay_id}/{n - 1} ({name}, status={status}), "
+          f"duration {t_end:.2f}s -- starts PAUSED, SPACE runs, \".\" steps")
+
+    viewer._paused = True  # no public setter -- see the live --view setup above
+    sim_t, last = 0.0, time.time()
+    while viewer.is_running():
+        now = time.time()
+        real_dt, last = now - last, now
+        if viewer.should_step():  # consumes a pending "." while paused; always True while running
+            sim_t = min(sim_t + (frame_dt if viewer.is_paused() else real_dt), t_end)
+        base = q_start[joints["base"]]
+        joint_q[base : base + 7] = interp_pose(t, pose, sim_t)
+        theta = interp_series(t, wheel_theta, sim_t)
+        for wheel_name, angle in zip(("left", "right", "rear"), theta):
+            joint_q[q_start[joints[wheel_name]]] = angle
+        joint_q_wp.assign(joint_q)
+        newton.eval_fk(model, joint_q_wp, joint_qd_wp, state)
+        contacts = model.collide(state)
+        viewer.begin_frame(sim_t)
+        viewer.log_state(state)
+        viewer.log_contacts(contacts, state)
+        if draw_path:
+            viewer.log_arrows("planned_path", arrow_a, arrow_b, vpp.COLOR_PATH)
+            viewer.log_lines("planned_trail", trail_a, trail_b, vpp.COLOR_TRAIL)
+            viewer.log_points("goal", goal_pt, goal_r, goal_c)
+        viewer.end_frame()
+        wp.synchronize()
 
 
 def main() -> None:
@@ -282,7 +376,19 @@ def main() -> None:
     parser.add_argument("--view", action="store_true")
     parser.add_argument("--out-dir", type=pathlib.Path,
                         default=REPO_ROOT / "outputs" / "follow_plan_turning")
+    parser.add_argument("--record", action="store_true",
+                        help="save the run's trajectory to <out-dir>/<map>_<planner>.h5, for --replay")
+    parser.add_argument("--replay", type=pathlib.Path,
+                        help="skip planning/simulating -- play back a --record'ed h5 (e.g. "
+                             "outputs/follow_plan_turning/garage_b_vanilla-on.h5) in the GL viewer, "
+                             "pose-only, for smoother screen recording than a live --view run")
+    parser.add_argument("--replay-id", type=int, default=0,
+                        help="which repeat (world) of --replay's h5 to play back (default 0)")
     args = parser.parse_args()
+
+    if args.replay is not None:
+        replay_recording(args.replay, args.replay_id)
+        return
 
     map_path = resolve_map(args.map, args.map_dir)
     if not map_path.with_suffix(".png").exists():
@@ -316,7 +422,7 @@ def main() -> None:
         msg = f"{args.planner}{gate}: {why} (V* = {plan['v_start']:.2f}) -- nothing to simulate"
         if args.view:
             print(f"{msg}; opening the viewer at the start pose, robot parked")
-            ofp.show_parked(args, terrain, start, goal)
+            ofp.show_parked(args, terrain, start, goal, highlight_obstacles=True, bird_eye=True)
         raise SystemExit(msg)
 
     # --- 2. what the plan intends ---------------------------------------------------------------
@@ -346,14 +452,15 @@ def main() -> None:
             sim_config, render_config, engine_config, logging_config,
             k_p=K_P, **friction_kwargs(args.mu), terrain=terrain,
             spawn_pose=np.tile(np.array(start, np.float64), (repeats, 1)),
+            highlight_obstacles=True,
             paths=[path] * repeats, phases=[phases] * repeats, settle_steps=args.settle_steps,
             lookahead=args.lookahead, v=args.v, kappa_max=controller_kappa_max(),
             omega=args.omega, yaw_tol=math.radians(args.yaw_tol), pivot_timeout_steps=budget,
         )
         if args.view:
-            pos, pitch, yaw, dist = ofp.corner_camera(terrain, start, path, sim.viewer.camera.fov)
+            pos, pitch, yaw, dist = ofp.bird_eye_camera(terrain, sim.viewer.camera.fov)
             sim.viewer.set_camera(pos=wp.vec3(*pos), pitch=pitch, yaw=yaw)
-            sim.viewer.camera.sync_pivot_to_view(dist)  # mouse orbit turns around the path's midpoint
+            sim.viewer.camera.sync_pivot_to_view(dist)  # mouse orbit turns around the scene's centre
             sim.viewer._paused = True  # start paused: SPACE runs, "." steps (no public setter)
         pose, wheel_qd, phase_log = sim.rollout(T, args.view)
         timeouts = sim.timeouts()
@@ -394,10 +501,9 @@ def main() -> None:
               "--pivot-slack is too tight")
 
     # --- 5. outputs -----------------------------------------------------------------------------
-    title = (f"{map_path.name}: {args.planner}{gate}\nplanned {plan['path_m']:.1f} m with "
-             f"{intent['n_pivot']} point turns, {n_ok}/{repeats} arrived in ostrich")
-    ofp.plot_run(terrain, plan, path, results, start, title, args.out_dir / f"{run_name}.png")
-    plot_turn(pose, phase_log, phases, dt, results, title, args.out_dir / f"{run_name}_turn.png")
+    if not args.record:
+        print("\nnot recorded (pass --record to save the trajectory for --replay)")
+        return
     write_comparison(
         args.out_dir / f"{run_name}.h5",
         root=dict(
@@ -407,7 +513,7 @@ def main() -> None:
             pivot_cost=args.pivot_cost, omega=args.omega, yaw_tol=args.yaw_tol,
             anchor_yaw=anchor, curb_height=curb, n_pivot=intent["n_pivot"],
             planned_turn_deg=intent["turn_deg"], worst_pivot_relief=intent["worst_relief"],
-            obstacle_x=0.5 * (start[0] + goal[0]),
+            obstacle_x=0.5 * (start[0] + goal[0]), goal=np.array(goal, np.float64),
         ),
         per_variant=dict(
             spawn_pose=np.tile(np.array(start, np.float32), (repeats, 1)),

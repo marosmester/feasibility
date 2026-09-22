@@ -322,3 +322,39 @@ class HeightMapReader:
             compute_inertia=False,
             is_solid=False,
         )
+
+    def to_ostrich_obstacle_mesh(
+        self,
+        threshold: float = 1e-3,
+        z_offset: float = 0.003,
+        stride: int = 1,
+        max_rise_per_tile: float | None = None,
+    ) -> newton.Mesh | None:
+        """Visual-only twin of `to_ostrich_mesh` (same triangulation), kept only where a triangle
+        clears `threshold` and raised `z_offset` [m] so it doesn't z-fight the real terrain mesh it
+        sits on top of.
+
+        Newton colours a mesh per SHAPE INSTANCE, not per triangle, so the single global terrain
+        shape `comparator.common` builds is one flat colour in the GL viewer -- an obstacle (a
+        curb, a wall, a box) reads by elevation on that shape's own colour, not as a distinct
+        feature. Adding this as a SECOND, non-colliding shape (`has_shape_collision=False`) with
+        its own `color` is what lets one be told apart from flat ground at a glance; the underlying
+        collision mesh (and the physics) is untouched. Returns None if nothing clears `threshold`
+        (an all-flat map), so the caller can skip adding a shape for it.
+        """
+        base = self.to_ostrich_mesh(stride=stride, max_rise_per_tile=max_rise_per_tile)
+        verts, tris = base.vertices, base.indices.reshape(-1, 3)
+        keep = verts[tris, 2].max(axis=1) > threshold
+        if not keep.any():
+            return None
+        used = np.unique(tris[keep])
+        remap = np.full(len(verts), -1, np.int64)
+        remap[used] = np.arange(len(used))
+        out_verts = verts[used].copy()
+        out_verts[:, 2] += z_offset
+        return newton.Mesh(
+            out_verts,
+            remap[tris[keep]].ravel().astype(np.int32),
+            compute_inertia=False,
+            is_solid=False,
+        )

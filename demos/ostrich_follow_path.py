@@ -107,6 +107,7 @@ SIDES = ("left", "center", "right")
 SIDE_MARGIN = 1.5  # [m] from the map edge to a side-shifted start/goal (robot ~0.4 m + judge's 0.5 m)
 CAMERA_AZIMUTH = 60.0  # [deg] of the camera from straight behind the start, towards its right
 CAMERA_ELEVATION = 30.0  # [deg] above the horizontal, looking down at the path's midpoint
+BIRD_EYE_ZOOM = 0.65  # < 1 pulls bird_eye_camera closer than "the whole diagonal just fits"
 STATUS_COLORS = {"arrived": "tab:green", "flipped": "tab:red", "off_map": "tab:orange",
                  "stalled": "white", "nonfinite": "magenta"}
 
@@ -165,14 +166,35 @@ def corner_camera(
     return pos, pitch, yaw, dist
 
 
+def bird_eye_camera(terrain: HeightMapReader, fov_deg: float) -> tuple[np.ndarray, float, float, float]:
+    """Camera directly above the terrain's centre, looking straight down -- a bird's-eye view of the
+    WHOLE mapped scene, not just the planned path. Newton's `Camera._clamp_pitch` caps pitch at 89 deg
+    (`get_front` is degenerate exactly at +-90, `get_right` in particular), so this is as close to
+    perpendicular as the viewer allows; yaw is arbitrary at that pitch (front no longer depends on it,
+    the classic gimbal-lock symptom) and 0 is picked only so +x reads left-to-right on screen."""
+    extent_x, extent_y = terrain.nx * terrain.cell, terrain.ny * terrain.cell
+    target = np.array([terrain.x0 + 0.5 * extent_x, terrain.y0 + 0.5 * extent_y, float(terrain.H.mean())])
+    radius = 0.5 * math.hypot(extent_x, extent_y) + 0.5
+    dist = BIRD_EYE_ZOOM * radius / math.tan(math.radians(0.5 * fov_deg))
+    pos = target + np.array([0.0, 0.0, dist])
+    return pos, -89.0, 0.0, dist
+
+
 def show_parked(
     args: argparse.Namespace,
     terrain: HeightMapReader,
     start: tuple[float, float, float],
     goal: tuple[float, float],
+    highlight_obstacles: bool = False,
+    bird_eye: bool = False,
 ) -> None:
     """No path to follow: open the GL viewer on the robot settled at `start`, commanded to stand
-    still (v = 0 and a one-point path, so the pursuit kernel stops at once), until the window closes."""
+    still (v = 0 and a one-point path, so the pursuit kernel stops at once), until the window closes.
+
+    `highlight_obstacles`/`bird_eye` default off so this module's own --view (which frames the
+    start -> goal line the planner could not connect with `corner_camera`, no green overlay) is
+    unchanged; `ostrich_follow_plan_turning.py` passes both True so a `nn-gated-pivot` "no route"
+    verdict is still framed and coloured like its own --view, not this module's default."""
     sim_config, render_config, engine_config, logging_config = compose_ostrich_config(tuple(args.override))
     render_config.vis_type = "gl"
     sim_config.num_worlds = 1
@@ -183,10 +205,13 @@ def show_parked(
             sim_config, render_config, engine_config, logging_config,
             k_p=K_P, **friction_kwargs(args.mu), terrain=terrain,
             spawn_pose=np.array([start], np.float64), paths=[here],
+            highlight_obstacles=highlight_obstacles,
             settle_steps=args.settle_steps, lookahead=args.lookahead, v=0.0, kappa_max=controller_kappa_max(),
         )
-        # frame the start -> goal line the planner could not connect
-        pos, pitch, yaw, dist = corner_camera(terrain, start, np.array([goal]), sim.viewer.camera.fov)
+        if bird_eye:
+            pos, pitch, yaw, dist = bird_eye_camera(terrain, sim.viewer.camera.fov)
+        else:  # frame the start -> goal line the planner could not connect
+            pos, pitch, yaw, dist = corner_camera(terrain, start, np.array([goal]), sim.viewer.camera.fov)
         sim.viewer.set_camera(pos=wp.vec3(*pos), pitch=pitch, yaw=yaw)
         sim.viewer.camera.sync_pivot_to_view(dist)
         sim.rollout(args.settle_steps, view=True)  # the settle drop, then held until closed
@@ -206,6 +231,9 @@ def plot_run(
     start: tuple[float, float, float],
     title: str,
     out: pathlib.Path,
+    highlight_above: float | None = None,
+    highlight_label: str = "obstacle",
+    highlight_color: str = "green",
 ) -> None:
     import matplotlib
 
@@ -216,6 +244,14 @@ def plot_run(
     extent = (t.x0, t.x0 + t.nx * t.cell, t.y0, t.y0 + t.ny * t.cell)
     fig, ax = plt.subplots(figsize=(12, 5.5), layout="constrained")
     im = ax.imshow(t.H, origin="lower", extent=extent, cmap="viridis", interpolation="nearest")
+    if highlight_above is not None:
+        # every raised cell -- curb, spur and walls alike -- flat colour regardless of height, so
+        # the curb (which viridis's own scale, set by the tall walls, otherwise renders almost the
+        # same colour as flat ground) reads as an obstacle at a glance rather than by elevation
+        overlay = np.zeros((*t.H.shape, 4))
+        overlay[t.H > highlight_above] = matplotlib.colors.to_rgba(highlight_color, alpha=0.9)
+        ax.imshow(overlay, origin="lower", extent=extent, interpolation="nearest")
+        ax.plot([], [], "s", color=highlight_color, label=highlight_label)
     ax.plot(plan["xy"][:, 0], plan["xy"][:, 1], "--", color="black", lw=2, label="planned path")
     for i, r in enumerate(results):
         ax.plot(r["xy"][:, 0], r["xy"][:, 1], "-", lw=1.2, color=STATUS_COLORS[r["status"]],

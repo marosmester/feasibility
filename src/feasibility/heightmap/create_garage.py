@@ -3,74 +3,82 @@
 Two maps, identical but for one feature, built for `demos/garage_gate.py`:
 
     garage_a   three walls, empty floor
-    garage_b   the same, plus ONE curb across the floor, parallel to the garage door
+    garage_b   the same, plus ONE curb on the floor: a rib across it parallel to the garage
+               door, with a SPUR off the rib reaching back towards the robot
 
-The robot is parked deep inside, facing a SIDE wall. The opening is 90 deg away, so it has to
-reverse nothing and loop nothing -- it just has to turn on the spot and drive out. In map B that
-turn drags the REAR wheel sideways into a 0.20 m curb: the body tilts 15 deg, which the settle
-tolerates, while ostrich's wheel climbs a vertical face the kinematic twin has no term for. That
-gap is the thing `planning.planners.TAU_PIVOT_PITCH` is calibrated to catch.
+The robot is parked deep inside, facing a SIDE wall, 90 deg from the opening -- no reverse
+or loop needed, just a turn on the spot and out. In map B that turn drags the REAR wheel
+sideways into a 0.20 m curb: the body tilts 15 deg (which the settle tolerates) while
+ostrich's wheel climbs a vertical face the kinematic twin has no term for. That gap is what
+`planning.planners.TAU_PIVOT_PITCH` is calibrated to catch.
 
     y
     ^   +-------------------------+      tall walls (WALL_H, the settle blocks these)
     |   |                     | | |      low curb (CURB_H, INVISIBLE to the settle)
   --+---           ^ start    | | |      start faces the +y side wall
-    |   |          R          | | |
-    |   |                     | | |
-    |   +-------------------------+
+    |   |          R      +---+ | |
+    |   |                 | spur| |      the spur reaches back on the side the rear wheel
+    |   +-----------------+---+---+      swings through -- see WHERE THE CURB GOES
         ^ door (open to -x)     ^ curb   ^ back wall
 
-WHY 90 DEG NEEDS AN ASYMMETRIC GARAGE. Everything below is measured off `RobotParams` by
-`clearances()` and printed by `main()`; the numbers here are its output at the defaults.
+WHY 90 DEG NEEDS AN ASYMMETRIC GARAGE (measured off `RobotParams` by `clearances()`, printed
+by `main()`). Over a 90 deg point turn the wheel RIMS stay inside x in [-0.71, +1.09], y in
+[-1.09, +0.71] of the reference point; the tightest FORWARD 90 deg turn instead throws the
+outer front wheel 1.13 m sideways. So the faced wall must sit in the window
+0.71 m < WALL_GAP < 1.13 m -- close enough that no forward arc swings the nose round, far
+enough a point turn still fits. That window sits ABOVE the 1.09 m the turn needs BEHIND the
+robot, so a centred robot has no valid width at all; it must be parked close to the wall it
+faces, which is what a garage looks like anyway. `WALL_GAP` 0.95 m / `BACK_GAP` 1.35 m give
+2.30 m clear width with ~0.2 m margin on both bounds, both asserted.
 
-Over a 90 deg point turn the wheel RIMS stay inside x in [-0.71, +1.09], y in [-1.09, +0.71] of the
-front-axle reference point -- the rear wheel orbits at `rear_offset`, the fronts at `half_track`,
-each dilated by `wheel_radius`. The tightest FORWARD 90 deg turn (`min_turn_radius`, the lattice's
-0.3 m arcs) instead throws the outer front wheel rim 1.13 m to the side. So the wall the robot
-faces has to sit in the window
+WHERE THE CURB GOES is the delicate part -- `create_pivot_pocket.py` is the cautionary tale
+of a feature argued from the start pose alone turning out to be avoidable. Three
+constraints:
 
-    0.71 m  <  WALL_GAP  <  1.13 m
+  * CLEAR OF THE START. The settle dilates the heightmap by `wheel_radius`, so a curb ramp
+    foot within 0.35 m of a start wheel CENTRE blocks the spawn. At `CURB_X` 0.90 m the
+    nearest start wheel sits 0.50 m off it.
+  * REACHED IN PRACTICE, not just in the plan -- what `SPUR_X` is for; see THE SPUR below.
+  * ONLY THE REAR WHEEL. A front wheel lifted `CURB_H` rolls past `max_roll` (the settle
+    blocks it, no network needed); the rear wheel pitches only 14.9 deg, INSIDE
+    `max_pitch_down`, so `blocked` stays 0 and the net is the only instrument left.
 
--- close enough that no forward arc can swing the nose round, far enough that a point turn still
-fits. That window is ABOVE the 1.09 m the same point turn needs BEHIND the robot, so a garage with
-the robot on its centreline has no valid width at all: the robot must be parked close to the wall
-it faces, which is what a garage looks like anyway. `WALL_GAP` 0.95 m and `BACK_GAP` 1.35 m give
-2.30 m of clear width and about 0.2 m of margin on both bounds -- two cells, and both are asserted.
+THE PREMISE IS A REACHABILITY CLAIM, and `reach_closure` makes it one: a breadth-first walk
+over the lattice states `CostToGo` plans on, run three ways --
 
-WHERE THE CURB GOES is the delicate part, and `create_pivot_pocket.py` is the cautionary tale: a
-feature argued from the start pose alone turned out to be avoidable, and the planner found the gap.
-Two local constraints, and then one global one that is the real check:
-
-  * CLEAR OF THE START. The settle dilates the heightmap by `wheel_radius`, so a curb whose ramp
-    foot is within 0.35 m of a start wheel CENTRE blocks the spawn even though the centre is on
-    flat ground. At `CURB_X` 0.90 m the nearest start wheel has 0.50 m to spare.
-  * ONLY THE REAR WHEEL. A front wheel lifted `CURB_H` rolls the body `atan(h / 2*half_track)`,
-    which at 0.20 m is outside `max_roll` and the settle would simply block it -- no network
-    needed. The rear wheel lifted the same amount pitches `atan(h / rear_offset)` = 14.9 deg,
-    INSIDE `max_pitch_down`, so `blocked` stays 0 and the only instrument left is the net. The
-    geometry is arranged so the fronts never reach the curb during a pivot, and `write_map`
-    asserts the pitch is inside the envelope (it is the whole premise; 0.15 m is the fallback if a
-    future robot config tightens it).
-
-THE PREMISE IS A REACHABILITY CLAIM, not a statement about any one pose, and `reach_closure` makes
-it one: a breadth-first walk over the very lattice states `CostToGo` plans on, run three times.
-
-    forward arcs only                 must NOT get out -- the garage does need a point turn
+    forward arcs only                 must NOT get out -- the garage needs a point turn
     point turns free                  must get out     -- there is a route to find
     only CURB-FREE point turns        must NOT get out -- pruning them is what closes it
 
-The third is the map. It is also what caught the first draft of this generator: point turns near
-the door ARE curb-free (the curb cannot be closer to the start than the spawn footprint allows, so
-ground more than a rear-wheel orbit in front of it is clean), and with the mouth 1.5 m away the
-robot could shuffle down to that ground on short arcs and turn there. What shuts it is `WALL_GAP`
--- at 1.00 m of curb offset the shuffle works, at 0.90 m it does not -- which is exactly the kind
-of thing no amount of arguing from constants would have found. `demos/garage_gate.py` then measures
-the same three arms on the real planner and the real network.
+The third caught the first draft: point turns near the door were curb-free, and with the
+mouth 1.5 m away the robot could shuffle there on short arcs. `WALL_GAP` is what shuts that
+(the shuffle works at 1.00 m of curb offset, not at 0.90 m) -- a finding no amount of
+constant-arguing would have produced. `demos/garage_gate.py` measures the same three arms on
+the real planner and network.
+
+THE SPUR: a rib alone is reached by the PLANNED turn (rear rim 0.05 m over it) but
+`demos/ostrich_follow_plan_turning.py` shows the wheel missing it in practice, because an
+in-place skid-steer turn DRIFTS -- the reference point slides ~0.22 m back toward the door,
+so the rear wheel ends its 45 deg pivot 0.24 m short of where the plan put it. A curb sized
+against the plan measures nothing in physics. The rib can't simply move closer (the start's
+front wheel pins any full-width rib at x >= 0.71), but the wheel that pins it and the wheel
+that must reach it sit at DIFFERENT y -- so `SPUR_X`/`SPUR_Y` extend the rib 0.40 m further
+back over just the far half of the floor, clear of every spawn wheel (asserted at both the
+start yaw and the lattice's bin centre).
+
+How far the spur may reach is a WINDOW: the settle is blind to a TYRE over the curb but NOT
+to a wheel CENTRE on it (a centre on it lifts the wheel the full height and blocks the pose,
+which would let map B plan around it and break the controlled A/B pair). The spur is placed
+to leave the centre just outside and the tyre well in (0.10 m / 0.25 m here); `write_map`
+asserts both edges plus what tyre survives the drift -- a two-cell-wide target on a 0.1 m
+grid, which is why every number here is measured rather than assumed.
 
 Usage:
     python src/feasibility/heightmap/create_garage.py
     python src/feasibility/heightmap/create_garage.py --curb-height 0.15
-    python src/feasibility/heightmap/create_garage.py --out-dir assets/garage --extent 8.0
+    python src/feasibility/heightmap/create_garage.py --spur-x 0.50 --spur-y -0.55
+    # (--spur-x at or past the rib drops the spur -- the old map B, which the asserts below
+    #  now refuse: it leaves 0.05 m of tyre over the curb and the drift spends all of it)
 """
 from __future__ import annotations
 
@@ -109,12 +117,34 @@ CURB_T = 0.20  # m curb thickness, along x
 START = (0.0, 0.0, math.pi / 2.0)  # reference point at the origin, facing the +y side wall
 GOAL = (-3.0, 0.0)  # outside the door
 EXIT_BINS = 6  # heading bins of the point turn that gets the robot out: 6 * 15 deg = 90 deg
+# of those bins, how many the planner really turns ON THE SPOT: after 45 deg the forward arcs
+# clear the faced wall and driving is cheaper, so the plan pivots three times and arcs out (what
+# `demos/view_planned_path.py` draws and `demos/ostrich_follow_plan_turning.py` reports). The curb
+# has to be reached inside THOSE bins -- the last three of the 90 deg never happen on the spot.
+DRIVEN_BINS = 3
+# [m] where the turn ostrich really drives ends up relative to the plan: an in-place skid-steer
+# turn slides, measured at (-0.22, -0.10) over this exit by
+# `demos/ostrich_follow_plan_turning.py` -- back towards the door, away from the curb. Applied
+# as one rigid offset, which over-states the early bins but matches the late (curb-reaching) ones
+# -- the conservative reading.
+PIVOT_DRIFT = (-0.22, -0.10)
+CONTACT_MARGIN = 0.10  # m of rear tyre that must still be over the curb once drifted
+PLANNED_OVERLAP = 0.20  # m of rear tyre over it in the PLAN -- what the drift is spent out of
 
 WALL_GAP = 0.95  # m, START to the inner face of the wall it FACES (the 0.71 .. 1.13 window)
 BACK_GAP = 1.35  # m, START to the inner face of the far side wall -> 2.30 m clear width
 DEPTH_BACK = 1.35  # m, START to the inner face of the closed end
 DEPTH_DOOR = 1.50  # m, START to the open mouth -> a 2.85 m deep garage
 CURB_X = 0.90  # m, the curb's centreline, parallel to the door (i.e. a rib spanning y)
+# [m] the SPUR: the same curb, extended back over the far half of the floor so the turn
+# ostrich really drives reaches it, not just the plan (see module doc). SPUR_X is its near
+# face, SPUR_Y the y it starts at -- both the middle of a window bounded BELOW by the spawn
+# (wheels need `wheel_radius` clearance; kept 0.40 m) and ABOVE by the settle, which is blind
+# to a rim over the curb but not to a wheel CENTRE on it (one cell further and the settle
+# blocks the pivot pose, breaking the A/B pair). Both edges are a cell away, so `write_map`
+# asserts each rather than arguing them.
+SPUR_X = 0.45
+SPUR_Y = -0.60
 
 RELIEF = 0.05  # m, what counts as terrain relief (lattice_learning's trial.interact_relief)
 
@@ -199,25 +229,23 @@ def reach_closure(
     n_kappa: int = 21,
     max_states: int = 60000,
 ) -> dict:
-    """Can the robot get OUT -- past `stop_x` -- and what does it need to do it? A breadth-first
-    walk over the same (row, col, heading bin) states `CostToGo` plans on, from `start`.
+    """Can the robot get OUT -- past `stop_x`? A breadth-first walk over the same (row, col,
+    heading bin) states `CostToGo` plans on, from `start`.
 
-    Three arms of the map's design, all three predicted here from geometry alone before a network
-    is loaded (`demos/garage_gate.py` then measures the same three on the real planner):
+    Three arms of the map's design, predicted here from geometry alone before any network is
+    loaded (`demos/garage_gate.py` then measures the same three on the real planner):
 
         allow_pivots=False                  must NOT escape -- the garage needs a point turn
         allow_pivots=True                   must escape     -- there is a route when pivots are free
-        allow_pivots=True, gate_curb=True   must NOT escape -- pruning the point turns that touch
-                                                               the curb takes that route away
+        allow_pivots=True, gate_curb=True   must NOT escape -- pruning curb-touching point turns
+                                                               takes that route away
 
-    A forward arc is drivable when no wheel centre comes within `wheel_radius` of a wall anywhere
-    ALONG it -- the settle's spherical envelope, and the sweep test `_relax_gated_kernel` applies.
-    Curvature is swept continuously over the steerable range rather than at the lattice's five
-    `arc.primitive_kappas`, so the closure is a SUPERSET of what the planner can really drive:
-    whatever it does not reach, the planner certainly cannot. A point turn is one heading bin, the
-    lattice's own pivot primitive, checked at sub-headings across the bin because the wheel sweeps
-    continuously through it; with `gate_curb` it also has to stay clear of the curb, which is
-    exactly the primitive `TAU_PIVOT_PITCH` would leave alone.
+    A forward arc is drivable when no wheel centre comes within `wheel_radius` of a wall
+    anywhere ALONG it (the settle's spherical envelope). Curvature is swept continuously
+    rather than at the lattice's five `primitive_kappas`, so this closure is a SUPERSET of
+    what the planner can really drive -- whatever it can't reach here, the planner certainly
+    can't. A point turn is one heading bin, checked at sub-headings since the wheel sweeps
+    continuously through it; with `gate_curb` it must also stay clear of the curb.
     """
     r, cell = float(_ROBOT.wheel_radius), terrain.cell
     x0, x1, y0, y1 = bounds
@@ -298,11 +326,17 @@ def garage_rects(
     depth_back: float = DEPTH_BACK,
     depth_door: float = DEPTH_DOOR,
     curb_x: float = CURB_X,
+    spur_x: float = SPUR_X,
+    spur_y: float = SPUR_Y,
 ) -> tuple[list, list]:
     """(wall rectangles, curb rectangles) as `rects_layer` takes them -- (w, d, cx, cy, yaw), w
     along x. Split out so `feature_distances` can rasterise each feature ALONE: telling the two
     apart by a height threshold would file the walls' own 80 deg ramp, which passes through the
-    curb's height on its way up, as curb."""
+    curb's height on its way up, as curb.
+
+    The curb is the rib plus its spur, two rectangles at the SAME height: `rects_layer` merges
+    them by an elementwise maximum, so they fuse into one solid with no seam and the spur's near
+    face is the only new edge. `spur_x` at or beyond the rib's own near face means no spur."""
     back_x, door_x = depth_back, -depth_door
     width = wall_gap + back_gap  # clear, inner face to inner face
     mid_y = (wall_gap - back_gap) / 2.0  # the garage's own centreline, which START is NOT on
@@ -315,6 +349,10 @@ def garage_rects(
     ]
     # one rib spanning the full clear width, parallel to the door: no sideways way past it
     curbs = [(CURB_T, width, curb_x, mid_y, 0.0)]
+    if spur_x < curb_x - CURB_T / 2.0:  # the spur, back to the far side wall so nothing gets past
+        far = curb_x + CURB_T / 2.0  # runs into the rib's far face, so the two fuse
+        curbs.append((far - spur_x, spur_y + back_gap, (spur_x + far) / 2.0,
+                      (spur_y - back_gap) / 2.0, 0.0))
     return walls, curbs
 
 
@@ -326,6 +364,8 @@ def build_garage(
     depth_back: float = DEPTH_BACK,
     depth_door: float = DEPTH_DOOR,
     curb_x: float = CURB_X,
+    spur_x: float = SPUR_X,
+    spur_y: float = SPUR_Y,
     extent: float = DEFAULT_EXTENT,
     cell: float = DEFAULT_CELL,
 ) -> tuple[HeightMapReader, dict]:
@@ -337,7 +377,7 @@ def build_garage(
     """
     back_x, door_x = depth_back, -depth_door
     width = wall_gap + back_gap  # clear, inner face to inner face
-    walls, curbs = garage_rects(wall_gap, back_gap, depth_back, depth_door, curb_x)
+    walls, curbs = garage_rects(wall_gap, back_gap, depth_back, depth_door, curb_x, spur_x, spur_y)
     H = rects_layer(walls, wall_height, INCLINE_DEG, extent, cell)
     if curb_height > 0.0:
         H = np.maximum(H, rects_layer(curbs, curb_height, INCLINE_DEG, extent, cell))
@@ -354,6 +394,8 @@ def build_garage(
         "curb_height": float(curb_height),
         "curb_thickness": float(CURB_T),
         "curb_x": float(curb_x) if curb_height > 0.0 else None,
+        "spur_x": float(spur_x) if curb_height > 0.0 and len(curbs) > 1 else None,
+        "spur_y": float(spur_y) if curb_height > 0.0 and len(curbs) > 1 else None,
         "incline_deg": float(INCLINE_DEG),
         "garage_x": [float(door_x), float(back_x)],
         "exit_bins": int(EXIT_BINS),
@@ -371,13 +413,12 @@ def feature_distances(
     curb_height: float,
     relief: float = RELIEF,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """(dist_wall, dist_curb) [ny, nx] in metres: how far each cell is from the WALL structure and
-    from the CURB, each rasterised on its own from the rectangles the map was built from, ramps
-    included. Two fields because they play opposite roles -- a wheel within `wheel_radius` of a
-    wall is a pose the settle refuses, a wheel within `wheel_radius` of the curb is a pose the
-    settle accepts and only the network can catch. Distance to the footprint rather than height
-    under the centre, because the settle dilates the heightmap by the wheel's own radius: the tyre
-    reaches a feature well before the centre does."""
+    """(dist_wall, dist_curb) [ny, nx] in metres: distance from each cell to the WALL structure
+    and to the CURB, each rasterised from its own rectangles (ramps included). Two fields
+    because they play opposite roles -- a wheel within `wheel_radius` of a wall is a pose the
+    settle refuses, one within `wheel_radius` of the curb is a pose the settle accepts and only
+    the network can catch. Distance to the footprint, not height under the centre, since the
+    settle dilates the heightmap by the wheel radius and the tyre reaches a feature first."""
     extent, cell = (terrain.nx - 1) * terrain.cell, terrain.cell
     dist = lambda m: distance_transform_edt(~m) * cell
     # The wall's blocking footprint is only the part tall enough to break the tilt envelope: a
@@ -439,7 +480,7 @@ def write_map(args: argparse.Namespace, curb_height: float, stem: str) -> None:
     """Build, assert the design and write one garage."""
     terrain, params = build_garage(
         curb_height, args.wall_height, args.wall_gap, args.back_gap, args.depth_back,
-        args.depth_door, args.curb_x, args.extent, args.cell,
+        args.depth_door, args.curb_x, args.spur_x, args.spur_y, args.extent, args.cell,
     )
     r, c = float(_ROBOT.wheel_radius), clearances()
     pivot_ahead = max(c["pivot_ccw"]["ahead"], c["pivot_cw"]["ahead"])
@@ -473,12 +514,15 @@ def write_map(args: argparse.Namespace, curb_height: float, stem: str) -> None:
             "the settle would block the pivot on its own and the network would have nothing to add"
         )
     walls, curbs = garage_rects(args.wall_gap, args.back_gap, args.depth_back, args.depth_door,
-                                args.curb_x)
+                                args.curb_x, args.spur_x, args.spur_y)
     dist_wall, dist_curb = feature_distances(terrain, walls, curbs, args.wall_height, curb_height)
+    # both spawn poses: the yaw the robot is really placed at, and the bin centre the lattice
+    # rounds it to -- the settle has to accept the second or the planner has nowhere to start
     start_w = wheel_xy(START)
+    spawn_w = np.stack([start_w, wheel_xy((START[0], START[1], bin_centre(START[2])))])
     for i, (wx, wy) in enumerate(start_w):
         assert abs(terrain.sample(wx, wy)) < 1e-9, f"start wheel {i} is not on flat ground"
-    start_clear = float(sample_dist(dist_curb, terrain, start_w).min())
+    start_clear = float(sample_dist(dist_curb, terrain, spawn_w).min())
     assert start_clear >= r, (
         f"a start wheel centre is {start_clear:.2f} m from the curb, inside the settle's own "
         f"{r:.2f} m wheel envelope -- the spawn pose would be blocked before the robot moves"
@@ -513,14 +557,33 @@ def write_map(args: argparse.Namespace, curb_height: float, stem: str) -> None:
             f"({gated['n_pivots']} of them) -- the curb is avoidable, so a correct network would "
             "predict a low error for the turn the planner takes and the map would prove nothing"
         )
-        # and the START turn specifically -- the one the demo plans, and the one the report shows.
-        # CCW is the exit: it swings the rear wheel towards the closed end, over the curb. CW turns
-        # the nose into the back wall instead and takes the rear wheel the other way, which is why
-        # only one direction is asserted here and `reach_closure` above is what covers the rest.
-        d_ccw = float(sample_dist(dist_curb, terrain, pivot_wheels(START, EXIT_BINS, True)).min())
-        assert d_ccw < r, (
-            f"the 90 deg exit turn at START keeps every wheel {d_ccw:.2f} m clear of the curb -- "
-            "the plan the demo draws would have nothing on it for the network to see"
+        # And the START turn specifically -- the one the demo plans and reports. CCW is the exit
+        # (swings the rear wheel over the curb toward the closed end); CW turns the nose into the
+        # back wall instead, so only CCW is asserted here (`reach_closure` above covers the rest).
+        # How deep it takes the rear wheel into the curb must land in a WINDOW: too shallow and
+        # only the rim grazes (the drift below wipes it out); too deep and the wheel CENTRE is on
+        # the curb, which the settle DOES see and blocks -- breaking the A/B pair.
+        driven = pivot_wheels(START, DRIVEN_BINS, True)
+        d_ccw = float(sample_dist(dist_curb, terrain, driven)[:, 2].min())
+        assert 0.0 < d_ccw < r - PLANNED_OVERLAP, (
+            f"the exit turn's rear wheel centre passes {d_ccw:.2f} m from the curb over the "
+            f"{DRIVEN_BINS} bins the planner turns on the spot, outside the "
+            f"(0, {r - PLANNED_OVERLAP:.2f}) m window: " + (
+                "the centre is ON the curb, which the settle blocks -- map B will plan a "
+                "different route from map A and the two are no longer one plan over two terrains"
+                if d_ccw <= 0.0 else
+                f"that leaves only {max(r - d_ccw, 0.0):.2f} m of tyre over it, and the drift "
+                "below spends more than that"
+            )
+        )
+        # ... and the same turn where ostrich really puts it: still a tyre on the curb, or the
+        # physics side of this map measures nothing (see THE SPUR in the module doc)
+        d_drift = float(sample_dist(dist_curb, terrain, driven + np.asarray(PIVOT_DRIFT))[:, 2].min())
+        assert d_drift < r - CONTACT_MARGIN, (
+            f"displaced by the {np.hypot(*PIVOT_DRIFT):.2f} m an in-place turn really slides, the "
+            f"rear wheel centre passes {d_drift:.2f} m from the curb, leaving "
+            f"{max(r - d_drift, 0.0):.2f} m of tyre over it against the {CONTACT_MARGIN:.2f} m "
+            "this map is built to guarantee -- the curb has to reach further back"
         )
         audit = pivot_primitive_audit(terrain, dist_wall, dist_curb, (door_x, args.depth_back),
                                       (-args.back_gap, args.wall_gap))
@@ -550,8 +613,11 @@ def write_map(args: argparse.Namespace, curb_height: float, stem: str) -> None:
         f"{math.degrees((blocked_at - 1) * ARC_STEP / float(_ROBOT.min_turn_radius)) if blocked_at else 90.0:.0f}"
         f" deg of the {90} it needs\n"
         + (
-            f"  curb    {curb_height:.2f} m at x = {args.curb_x:.2f}, spanning the full width; "
-            f"rear wheel on it pitches {math.degrees(pitch):.1f} deg "
+            f"  curb    {curb_height:.2f} m at x = {args.curb_x:.2f}, spanning the full width"
+            + (f", with a spur back to x = {args.spur_x:.2f} over y < {args.spur_y:.2f} "
+               f"(start wheels {start_clear:.2f} m clear, needs {r:.2f}); "
+               if len(curbs) > 1 else "; ")
+            + f"rear wheel on it pitches {math.degrees(pitch):.1f} deg "
             f"(max_pitch_down {math.degrees(_ROBOT.max_pitch_down):.0f}, so the settle is BLIND), "
             f"a front wheel would roll {math.degrees(roll):.1f} deg "
             f"(max_roll {math.degrees(_ROBOT.max_roll):.0f}, so the settle "
@@ -559,6 +625,11 @@ def write_map(args: argparse.Namespace, curb_height: float, stem: str) -> None:
             f"  turns   {audit['n_touch']} of the {audit['n_legal']} single-bin point turns the "
             f"settle allows in the garage touch it ({audit['n_touch'] / audit['n_legal']:.0%}); "
             f"the rest sit near the door, the nearest at x = {audit['free_x']:.2f}\n"
+            f"  reach   over the {DRIVEN_BINS} bins the planner turns on the spot the rear wheel "
+            f"centre passes {d_ccw:.2f} m from the curb, {r - d_ccw:.2f} m of tyre over it "
+            f"(centre ON it and the settle would block the pose); displaced by the "
+            f"{np.hypot(*PIVOT_DRIFT):.2f} m ostrich really slides, {r - d_drift:.2f} m of tyre "
+            f"is still over it (needs {CONTACT_MARGIN:.2f})\n"
             f"  premise forward arcs alone cannot get out ({no_pivot['n_states']} states); with "
             f"point turns it can; with only CURB-FREE point turns it cannot again "
             f"({gated['n_states']} states, {gated['n_pivots']} turns) -- so pruning them is what "
@@ -584,6 +655,10 @@ def main() -> None:
     ap.add_argument("--depth-back", type=float, default=DEPTH_BACK)
     ap.add_argument("--depth-door", type=float, default=DEPTH_DOOR)
     ap.add_argument("--curb-x", type=float, default=CURB_X)
+    ap.add_argument("--spur-x", type=float, default=SPUR_X,
+                    help="[m] near face of the curb's spur; >= curb-x drops it (the rib-only map)")
+    ap.add_argument("--spur-y", type=float, default=SPUR_Y,
+                    help="[m] the y the spur starts at, running from there to the far side wall")
     ap.add_argument("--extent", type=float, default=DEFAULT_EXTENT)
     ap.add_argument("--cell", type=float, default=DEFAULT_CELL)
     ap.add_argument("--only", choices=("a", "b"), help="write just one of the two maps")
