@@ -25,6 +25,13 @@ Gating needs a predicted error at EVERY lattice pose, not just along a path, so 
 defaults to cuda for that reason; the root .venv's cu128 torch covers this GPU, and CLAUDE.md's
 note about needing `.venv-cu126` applies to the ThinkPad's GTX 1050, not here.
 
+`--view` then draws what the arms decided, in the Newton GL viewer: the garage mesh, the Helhest
+Junior parked at the start pose, and one RED ARROW per planned pose of the chosen arm's path (a
+point turn spirals up, as in `view_planned_path.py`, whose drawing this reuses). An arm that found
+NO ROUTE -- map B under the gate, which is the result the demo exists for -- still gets its scene,
+so the robot is visible boxed in where the plan gave up, but no path is drawn over it and the
+console says so. With both maps, RIGHT/N and LEFT/P switch between them in the one window.
+
 CLI parameters:
     --map A|B|both    which garage to run (default both)
     --map-dir PATH    where create_garage.py wrote them (default assets/garage)
@@ -32,12 +39,19 @@ CLI parameters:
     --tau-sweep       also report which taus keep a route open, once the field is in hand
     --torch-device D  cuda (default) or cpu
     --pivot-cost M    m-equivalent per 15 deg bin for a point turn (default 0.15)
+    --view            after the numbers, open the GL viewer on the plan
+    --view-arm NAME   which arm --view draws: nn-gated-pivot (default), vanilla-on,
+                      vanilla-on-pivot0
+    --arrow-len M     arrow length (default view_planned_path.ARROW_LEN)
+    --no-robot        skip the scale model; --no-trail drops the line linking the poses
 
 Usage:
     python demos/garage_gate.py
     python demos/garage_gate.py --map B --tau-sweep
+    python demos/garage_gate.py --view                 # both maps, gated plan, side by side
+    python demos/garage_gate.py --map A --view --view-arm vanilla-on
     python demos/view_planned_path.py --map assets/garage/garage_b --planner nn-gated-pivot \
-        --torch-device cuda            # the same plan, drawn
+        --torch-device cuda            # the same plan, drawn, with its per-pose table
 """
 from __future__ import annotations
 
@@ -61,18 +75,24 @@ from feasibility.planning.planners import PlannerConfig
 from feasibility.planning.planners import TAU_PIVOT_PITCH
 
 try:  # `python demos/garage_gate.py` puts demos/ on sys.path, `python -m demos.…` puts the root
-    from demos.view_planned_path import path_poses
-    from demos.view_planned_path import wheel_relief
+    from demos import view_planned_path as vpp
 except ModuleNotFoundError:  # pragma: no cover - the bare-script path
-    from view_planned_path import path_poses
-    from view_planned_path import wheel_relief
+    import view_planned_path as vpp
+
+path_poses, wheel_relief = vpp.path_poses, vpp.wheel_relief
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 DEFAULT_MAP_DIR = REPO_ROOT / "assets" / "garage"
 RELIEF = 0.05  # m, what counts as a wheel standing on something (trial.interact_relief)
-# Bunched around TAU_PIVOT_PITCH, because that is where the two maps part company and the width of
-# the window they part in is the thing worth knowing.
-TAU_SWEEP = (0.03, 0.05, 0.07, 0.0873, 0.095, 0.105, 0.12, 0.15, 0.20, 0.30)
+# --view-arm name -> the key run_map files that arm's result under
+VIEW_ARMS = {"nn-gated-pivot": "gated", "vanilla-on": "on", "vanilla-on-pivot0": "no_pivot"}
+# Spread across the band `planning.tune_pivot_tau.py` puts the gate's threshold in (0.06-0.11 on
+# the current checkpoint) and below it, because the width of the window the two maps part company
+# in -- and whether the calibrated tau is inside it -- is the thing worth knowing. TAU_PIVOT_PITCH
+# itself is always evaluated too, wherever it currently sits.
+TAU_SWEEP = tuple(sorted(  # sorted/deduped, so the rows read in order wherever the constant sits
+    {0.03, 0.05, 0.07, 0.0873, 0.095, 0.105, 0.12, 0.15, 0.20, 0.30, TAU_PIVOT_PITCH}
+))
 
 
 def pivot_truth(terrain: HeightMapReader, ctg, params: dict) -> tuple[np.ndarray, np.ndarray]:
@@ -174,8 +194,8 @@ def run_map(path: pathlib.Path, args: argparse.Namespace) -> dict:
 
     # forward arcs only: no inference, and it is the premise everything else rests on
     zero = PlanContext(PlannerConfig(pivot_cost=0.0, torch_device=args.torch_device))
-    print_arm("vanilla-on, pivot_cost 0", run_arm(terrain, start, goal, "vanilla-on", zero),
-              args.tau)
+    no_pivot = run_arm(terrain, start, goal, "vanilla-on", zero)
+    print_arm("vanilla-on, pivot_cost 0", no_pivot, args.tau)
     del zero
 
     ctx = PlanContext(PlannerConfig(pivot_cost=args.pivot_cost, torch_device=args.torch_device,
@@ -213,9 +233,102 @@ def run_map(path: pathlib.Path, args: argparse.Namespace) -> dict:
             print(f"      tau {tau:6.4f} ({math.degrees(tau):4.1f} deg)  "
                   f"{'route' if sweep[tau] else 'NO ROUTE':>8}   "
                   f"prunes {pruned:4.0%} of the garage's point turns")
-    out = dict(name=path.name, curb=curb, on=on, gated=gated, split=split, sweep=sweep)
-    del ctx
+    out = dict(name=path.name, curb=curb, no_pivot=no_pivot, on=on, gated=gated, split=split,
+               sweep=sweep, terrain=terrain, start=start, goal=goal)
+    del ctx  # the CostToGo's settle buffers go before the viewer builds its own model (3 GiB GPU)
     return out
+
+
+def view_scenes(rows: list[dict], arm: str, args: argparse.Namespace) -> None:
+    """The A/B drawn: terrain mesh, the Helhest Junior parked at the start pose for scale, and one
+    RED ARROW per planned pose of `arm`'s plan -- `view_planned_path.py`'s drawing reused rather
+    than re-derived, point-turn spiral (ARROW_DZ per pose sharing a cell) and amber trail included.
+
+    A map whose chosen arm found NO ROUTE -- which is the whole point of map B under the gate --
+    still gets its scene, so the robot can be seen boxed in where the plan gave up, but nothing is
+    drawn over it: no arrows, no trail, no goal marker, and the console says so. Passing None to
+    log_arrows/log_lines/log_points clears those batches, so a path does not linger from the map
+    shown before it.
+
+    With both maps in hand this is one viewer cycling between them (terrain_browser.py's pattern:
+    the rebuild happens in the render loop, never inside pyglet's key callback), since two ViewerGL
+    windows in one process is not a thing worth finding out about.
+
+    newton/pyglet are imported here rather than at module top so the headless run -- the normal
+    one, the numbers being the deliverable -- never needs a GL stack.
+    """
+    import newton
+    import pyglet
+
+    viewer = newton.viewer.ViewerGL()
+    pending = {"step": 0}
+    if len(rows) > 1:
+        def on_key_press(symbol: int, modifiers: int) -> None:
+            if symbol in (pyglet.window.key.RIGHT, pyglet.window.key.N):
+                pending["step"] += 1
+            elif symbol in (pyglet.window.key.LEFT, pyglet.window.key.P):
+                pending["step"] -= 1
+
+        viewer.renderer.register_key_press(on_key_press)
+
+    def load(i: int) -> dict:
+        row = rows[i]
+        terrain, start, result = row["terrain"], row["start"], row[arm]["result"]
+        model = vpp.build_model(terrain, start, not args.no_robot)
+        viewer.set_model(model)  # may rebind viewer.device, so take it after
+        state = model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+        label = f"[{i + 1}/{len(rows)}] {row['name']} -- {arm}"
+        viewer.renderer.set_title(label)
+        draw = dict(state=state, arrow_a=None, arrow_b=None, trail_a=None, trail_b=None,
+                    goal_pt=None, goal_r=None, goal_c=None)
+        if not result["reachable"]:
+            print(f"  {label}: NO PATH FOUND -- terrain and robot only, nothing to draw")
+            return draw
+        dev = viewer.device
+        poses = path_poses(result)
+        starts, ends = vpp.arrow_segments(poses, terrain, args.arrow_len)
+        goal = row["goal"]
+        draw["arrow_a"] = wp.array(starts, dtype=wp.vec3, device=dev)
+        draw["arrow_b"] = wp.array(ends, dtype=wp.vec3, device=dev)
+        if len(poses) > 1 and not args.no_trail:  # a one-pose plan has no segment to link
+            draw["trail_a"] = wp.array(starts[:-1], dtype=wp.vec3, device=dev)
+            draw["trail_b"] = wp.array(starts[1:], dtype=wp.vec3, device=dev)
+        draw["goal_pt"] = wp.array(
+            [[goal[0], goal[1], float(terrain.sample(*goal)) + vpp.ARROW_Z]],
+            dtype=wp.vec3, device=dev,
+        )
+        # log_points hands radii/colors straight to a kernel, so both have to be arrays even for
+        # the single goal point -- see view_planned_path.py's note.
+        draw["goal_r"] = wp.array([vpp.GOAL_RADIUS], dtype=wp.float32, device=dev)
+        draw["goal_c"] = wp.array([vpp.COLOR_GOAL], dtype=wp.vec3, device=dev)
+        print(f"  {label}: {len(poses)} red heading arrows, {result['path_m']:.2f} m planned")
+        return draw
+
+    index = 0
+    draw = load(index)
+    first = rows[0]["terrain"]
+    cx = first.x0 + first.nx * first.cell / 2.0
+    cy = first.y0 + first.ny * first.cell / 2.0
+    extent = max(first.nx, first.ny) * first.cell
+    viewer.set_camera(
+        pos=wp.vec3(cx, cy - vpp.CAMERA_BACK * extent, first.max_z + vpp.CAMERA_UP * extent),
+        pitch=vpp.CAMERA_PITCH,
+        yaw=vpp.CAMERA_YAW,
+    )
+    print("  orbit with the mouse, F re-frames, ESC quits"
+          + (", RIGHT/N and LEFT/P switch maps" if len(rows) > 1 else ""))
+    while viewer.is_running():
+        if pending["step"]:
+            index = (index + pending["step"]) % len(rows)
+            pending["step"] = 0
+            draw = load(index)
+        viewer.begin_frame(0.0)
+        viewer.log_state(draw["state"])
+        viewer.log_arrows("planned_path", draw["arrow_a"], draw["arrow_b"], vpp.COLOR_PATH)
+        viewer.log_lines("planned_trail", draw["trail_a"], draw["trail_b"], vpp.COLOR_TRAIL)
+        viewer.log_points("goal", draw["goal_pt"], draw["goal_r"], draw["goal_c"])
+        viewer.end_frame()
 
 
 def main() -> None:
@@ -229,6 +342,14 @@ def main() -> None:
     ap.add_argument("--tau-sweep", action="store_true")
     ap.add_argument("--torch-device", default="cuda")
     ap.add_argument("--pivot-cost", type=float, default=0.15)
+    ap.add_argument("--view", action="store_true",
+                    help="after the numbers, draw the plan in the Newton GL viewer")
+    ap.add_argument("--view-arm", choices=tuple(VIEW_ARMS), default="nn-gated-pivot",
+                    help="which arm's plan --view draws (default the gated one, which is the arm "
+                         "the two maps part company on)")
+    ap.add_argument("--arrow-len", type=float, default=vpp.ARROW_LEN)
+    ap.add_argument("--no-robot", action="store_true", help="skip the scale model")
+    ap.add_argument("--no-trail", action="store_true", help="drop the line linking the poses")
     args = ap.parse_args()
 
     names = {"A": ["garage_a"], "B": ["garage_b"], "both": ["garage_a", "garage_b"]}[args.map]
@@ -241,9 +362,15 @@ def main() -> None:
 
     wp.init()
     rows = [run_map(p, args) for p in paths]
-    if len(rows) < 2:
-        return
-    a, b = rows
+    if len(rows) == 2:
+        print_summary(*rows)
+    if args.view:
+        print(f"\n=== drawing the {args.view_arm} plan ===")
+        view_scenes(rows, VIEW_ARMS[args.view_arm], args)
+
+
+def print_summary(a: dict, b: dict) -> None:
+    """The A/B verdict, printed once both maps have been run."""
     print(f"\n=== {a['name']} vs {b['name']}, the only difference being the curb ===")
     for tag, row in (("without the curb", a), ("with it", b)):
         g = row["gated"]["result"]

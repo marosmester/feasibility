@@ -77,41 +77,11 @@ DEFAULT_CHECKPOINT_ROT = REPO_ROOT / "outputs" / "checkpoints" / "dataset_arc_my
 DEFAULT_CHECKPOINT_VWZ = (
     REPO_ROOT / "outputs" / "checkpoints" / "dataset_arc_my_config_M300_R8_seed0_vwz_rpy.pt"
 )
-# The POINT TURN's own threshold on DEFAULT_CHECKPOINT_VWZ's e_pitch head -- calibrated on the 200
-# pivot rows of that checkpoint's HELD-OUT MAPS (its own val split, val_frac 0.2 / seed 0 out of the
-# stored `args`), never on a map a demo plans on.
-#
-# It is a TOLERANCE, not a fitted constant. On those rows the e_pitch head is near-unbiased for a
-# point turn -- median predicted/true 1.06x over the upper half, quantiles tracking the truth to
-# q0.90 (0.043/0.070 at the median, 0.257/0.261 at q0.75, 0.445/0.448 at q0.90), Spearman 0.88 --
-# so "prune a pivot whose predicted e_pitch exceeds X" really does prune the pivots whose real
-# ostrich-vs-twin pitch error exceeds X rad, and moving the tolerance moves the best threshold with
-# it about 1:1 (2.5 deg -> 0.128, 5 -> 0.197, 10 -> 0.233, 15 -> 0.296, by a mid-gap rule). Picking
-# one is therefore a judgement about the robot, not about the network.
-#
-# 5 deg is where the near-miss population runs out: pivots placed beside a feature that no wheel
-# reaches have true e_pitch median 0.0002 and q0.975 0.089, so past ~0.09 rad a point turn is
-# outside anything flat ground produces. It prunes 80 of the 84 held-out pivots whose true error
-# exceeds it (worst miss 0.230 rad = 13 deg) and wrongly prunes 14 of the other 116 -- 10 of those
-# within 2x of tau, only 3 genuinely flat. Scored against a "bad = true e_pitch > 0.174" label it
-# is AUC 0.969.
-#
-# Checked once end to end on a map the net never saw -- every candidate point turn of
-# `heightmap.create_pivot_pocket`'s lattice, both directions, 702768 of them. Turns whose three
-# wheel centres stay clear of relief through the whole 15 deg sweep predict a median 0.010 rad;
-# turns that sweep a centre over a curb predict 0.227, and this tau prunes 85% of them. Of the 7%
-# of "clear" turns it also prunes, not one has open ground around it: every one has relief within
-# 1.0 m of a swept wheel centre and 76% within one wheel radius, i.e. the tyre is over the feature
-# even though its centre is not, which is exactly the case a centre-only audit cannot see. The ones
-# it keeps have their nearest relief 2.5 m away at the median.
-#
-# Its own constant because it gates a different population, not because the net needs two numbers:
-# a point turn's median true e_pitch is 0.043 rad against a forward arc's 0.009, so one tolerance
-# bites the two classes at very different rates (0.0873 prunes 42% of held-out pivots, 24% of
-# arcs). That is also what retires the worry that no single tau separates pivots from arcs on the
-# pocket map: a calibrated head is compared to an absolute tolerance, never ranked against the
-# other class.
-TAU_PIVOT_PITCH = 0.0873  # [rad] = 5 deg
+TAU_PIVOT_PITCH = 0.06  # [rad] = 3.4 deg -- mid-window of the garage A/B split.
+# Previous values, both on weights of this same checkpoint NAME: 0.0873 (5 deg), the tolerance
+# shipped until 2026-09-22, fitted against the pre-retrain weights that no longer exist; 0.1130
+# (6.5 deg), what `tune_pivot_tau.py` picks by Youden's J on the current weights' own held-out
+# pivots. Both keep a route on garage_b, which is why neither is the shipped value.
 # One-time tau* calibration for DEFAULT_CHECKPOINT, see THRESHOLDS in benchmarks/bench_uphill_nn.py
 TAU_POS = 0.1741  # [m]
 TAU_PITCH = 0.0933  # [rad]
