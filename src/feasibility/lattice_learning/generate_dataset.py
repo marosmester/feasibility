@@ -105,7 +105,11 @@ Hydra overrides, and the sampling mix with each strategy's params) lives in that
 alone reproduces a dataset; the h5 embeds its text as the root attr `config_yaml`.
 `configs/default.yaml` documents every key; `dataset_config.py` validates it.
 
-Output: outputs/dataset_arc_<config name>_M<n_maps>_R<trials_per_map>_seed<seed>.h5
+Output: outputs/dataset_arc_<config name>_maps<maps dir name>_M<n_maps>_R<trials_per_map>_seed<seed>.h5
+-- `<maps dir name>` is `maps.dir`'s own terminal path component (`assets/lattice_maps/<seed>`'s
+`<seed>`, per `heightmap/create_maps_for_lattice_learning.py`). Two configs sharing a name and a
+sampling `seed` but pointing at different map-generation seeds would otherwise collide on the same
+output filename and silently overwrite each other's dataset -- this tag is what keeps them apart.
 
 Usage:
     python src/feasibility/lattice_learning/generate_dataset.py default    # configs/default.yaml
@@ -746,7 +750,9 @@ def generate(cfg: DatasetConfig) -> None:
     # Negative times, so preroll_t continues straight into t (the arc's first step is t=0).
     ostrich["preroll_t"] = (np.arange(n_preroll, dtype=np.float32) - n_preroll) * OSTRICH_DT
 
-    out_path = OUT_DIR / f"dataset_arc_{cfg.name}_M{n_maps}_R{trials_per_map}_seed{seed}.h5"
+    out_path = OUT_DIR / (
+        f"dataset_arc_{cfg.name}_maps{maps_dir.name}_M{n_maps}_R{trials_per_map}_seed{seed}.h5"
+    )
     write_arc_dataset(
         out_path,
         root=dict(

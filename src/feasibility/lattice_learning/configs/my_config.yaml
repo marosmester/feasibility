@@ -11,7 +11,7 @@
 seed: 0                       # RNG seed for map selection, trial poses, kappa and belief jitter
 
 maps:
-  dir: assets/lattice_maps/2  # repo-root-relative or absolute directory written by
+  dir: assets/lattice_maps/1  # repo-root-relative or absolute directory written by
                               # heightmap/create_maps_for_lattice_learning.py; each map's sidecar
                               # `category` is what the mix's `map:` refers to
   n_maps: 300                   # maps drawn in total, split across categories by the mix percents
