@@ -94,7 +94,10 @@ Very close to `lattice_learning`: the same config-driven `generate_dataset.py`, 
 * Each trial records **twin vs ostrich** under the same time-varying command profile.
 * Each trial starts with a warm-up that brings the robot to a sampled entry speed rather than the
   window's own command. That speed is not one of the four command inputs; whether it becomes a
-  fifth input or stays a data-only randomisation is open (§7).
+  fifth input or stays a data-only randomisation is open (§7). Only ostrich runs the warm-up. The
+  twin starts at ostrich's **realized** state at the window start (pose, wheel speeds, body
+  twist), with MPPI's `planning_solver`, the way every MPPI replan starts from the measured
+  state. The patch is taken at that same pose.
 * Everything else carries over: the label heads (`pos_rot` / `pos_rpy`), `TargetTransform`, the
   mirror augmentation and the self-checks.
 
@@ -164,10 +167,11 @@ A 1 s window at up to 1.4 m/s travels ~5× further, along a curve that is not a 
    `wmin` = 0 plus pivots. It converts them to `(v_mean, v_slope, wz_mean, wz_slope)` and to
    per-step ostrich setpoints. The self-test checks the linear-in-window assumption (§2): the
    residual of the linear fit stays within the jitter.
-2. **`twin.py`**: runs helhest_stack's `ForwardSimulator` batched over the same profiles, from
-   the same spawn and entry state, and returns the twin pose at each window end. This replaces
-   `lattice_learning`'s "ideal arc + settle" label. The self-test checks that on flat ground and
-   at low speed twin ≈ ostrich.
+2. **`twin.py`**: runs helhest_stack's `ForwardSimulator` with `planning_solver` (motor lag
+   included) batched over the same profiles. It starts from ostrich's state at the window start
+   (§5) and returns the twin pose at each window end. This replaces `lattice_learning`'s
+   "ideal arc + settle" label. The flat-ground twin ≈ ostrich check needs ostrich, so it belongs
+   to `generate_dataset.py`'s `dry_run`.
 3. **`spawn_sampling.py`**: the rewritten strategies above (warm-up to a sampled entry speed,
    then one window), with the same self-tests as `lattice_learning`'s. The one extra self-test is
    the §4 lateral-extent assert.

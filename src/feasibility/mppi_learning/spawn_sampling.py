@@ -11,6 +11,12 @@ A trial is: a window ORIGIN (the pose the patch is taken at), an ENTRY twist `(v
 `warmup_s` before it (the spawn is the origin backed out along that constant twist), and one
 window's wheel-speed profile from `command.sample_window_commands`.
 
+The origin is NOMINAL -- ideal no-slip kinematics from the spawn, which ostrich's warm-up (motor
+lag, skid-steer turn resistance, terrain) never reproduces exactly. Placement only needs it to be
+close. The label and the patch must use ostrich's REALIZED state at the end of the warm-up: the
+patch is sampled there, and `twin.run_twin` starts from it (pose, wheel speeds, body twist), as
+MPPI starts every replan from the measured state.
+
 What carries over from `lattice_learning`, unchanged in meaning:
 
 * **Validity** -- helhest_stack's static settle feasible at the spawn (`settle.settle_feasible`)
@@ -160,7 +166,7 @@ class WindowBatch:
     """One map's trials. Row fields mirror `lattice_learning`'s `SpawnBatch` where they mean the same."""
 
     pose: np.ndarray  # [n, 3] float64 spawn (x, y, yaw) -- where ostrich and the twin start
-    origin: np.ndarray  # [n, 3] float64 the window start, `warmup_s` of entry twist after the spawn
+    origin: np.ndarray  # [n, 3] float64 NOMINAL window start (ideal kinematics); label/patch use ostrich's realized one
     omega: np.ndarray  # [n, WINDOW_STEPS, 3] float32 wheel speeds on the MPPI grid
     family: np.ndarray  # [n] int8
     entry: np.ndarray  # [n, 2] float32 (v, wz)

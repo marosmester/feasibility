@@ -9,15 +9,19 @@ helhest_stack's `_sample_target_wheel_omega_kernel` -- restricted to what the ne
   * `ostrich_setpoints`: the same profile held over ostrich's finer steps (`upsample`),
   * `encode`: `(v_mean, v_slope, wz_mean, wz_slope)`, the net's command input.
 
-Everything is numpy and host-side: a window is 10 x 3 numbers per trial, and this file must
-import without warp (the twin, which needs the GPU, lives in `twin.py`).
+Everything is numpy and host-side: a window is 10 x 3 numbers per trial, and nothing here needs
+the GPU (the twin, which does, lives in `twin.py`).
 
 Mirrors the kernel rather than importing it: its priors are a Warp kernel keyed on device RNG
 streams, which cannot be called for a batch of independent one-window trials.
     * WIDE / STRAIGHT / SPIN are noise-free, exactly linear in the window (SPIN constant);
-    * only NARROW carries knot noise and per-step jitter, and the kernel draws ONE jitter per
-      (step, candidate) and adds it to BOTH wheels -- a common-mode wobble that moves `v` and never
-      `wz`. Copied on purpose: an independent-per-wheel jitter would be a different distribution.
+    * only NARROW carries knot noise and per-step jitter. The kernel seeds ONE rng state per
+      (step, candidate) but calls `wp.randn` on it once per wheel, and Warp advances the state on
+      every call, so the two wheels' jitters are independent draws -- it wobbles `wz` as well as `v`.
+    * NARROW's nominal is MPPI's current `U`, which this cannot know; a uniform constant over the
+      box stands in for it.
+    * the PIVOT prior is left out: the proposal runs it with `pivot_frac` 0, and with `wmin` = 0 it
+      would only clamp to forward arcs WIDE already covers.
 
 Usage:
     python src/feasibility/mppi_learning/command.py
@@ -27,11 +31,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+from helhest import dynamics
 from helhest.engine import RobotParams
 
 _ROBOT = RobotParams()
 
-MPPI_DT: float = 0.1  # s, helhest_stack's `dynamics.DT` (the twin's step), pinned here to stay torch/warp-free
+MPPI_DT: float = dynamics.DT  # s, 0.1: the twin's step, and MPPI's
 WINDOW_STEPS: int = 10  # MPPI steps per window = the knot spacing (H = 10 * (n_knots - 1) + 1)
 WINDOW_S: float = WINDOW_STEPS * MPPI_DT  # 1.0 s
 WHEEL_RADIUS: float = _ROBOT.wheel_radius  # m
@@ -96,11 +101,11 @@ def sample_window_commands(
     mag = np.where(rng.random(n) < 0.5, -mag, mag)
     spin = np.broadcast_to(np.stack([-mag, mag], axis=-1), (WINDOW_STEPS, n, 2))
 
-    # NARROW: spline noise around a constant nominal, plus a jitter shared by both wheels
+    # NARROW: spline noise around a constant nominal, plus an independent jitter per wheel
     nominal = uniform(n, 2)  # [N, 2]
     knot_noise = spec.sigma_knot * rng.standard_normal((2, n, 2))
     spline = nominal + (1 - frac[:, :, None]) * knot_noise[0] + frac[:, :, None] * knot_noise[1]
-    jitter = spec.sigma * rng.standard_normal((WINDOW_STEPS, n, 1))
+    jitter = spec.sigma * rng.standard_normal((WINDOW_STEPS, n, 2))
     narrow = spline + jitter
 
     f = family[None, :, None]
