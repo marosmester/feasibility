@@ -177,15 +177,13 @@ whenever the gain or friction changes.
   many windows to evaluate at all, are left for later.
 * MPPI's sampling is restricted to forward motion and pivots (`wmin` = 0 plus the spin prior,
   see Chosen values), which is the net's training envelope.
-* helhest_stack gets a **torch-free hook** in `MppiGpu`: a stable device buffer the cost kernel
-  reads, like `set_lattice`. The network and everything that fills that buffer stay here, in
-  `src/feasibility/`, since helhest_stack must not import this tree.
+* helhest_stack gets a **torch-free hook** in `MppiGpu`. The network and everything that fills
+  it stay here, in `src/feasibility/`, since helhest_stack must not import this tree. How the
+  net runs inside MPPI's CUDA graph is §9.
 
 ## 7. Later
 
-* **Real-time inference.** Once the net is trained: cache the command-free trunk as a code field
-  at routing cadence, run only the head per rollout window, and move inference into the CUDA
-  graph (e.g. by exporting to TensorRT). Nothing above depends on how this is done.
+* **Real-time inference** of every window, not just the first: §9e.
 * **Entry speed as an input.** With the entry mostly continuing into the window, the start speed
   is readable from the command (`v_mean − v_slope/2`). Decide from data whether the jump share
   still needs the realized start twist as a fifth input.
@@ -272,9 +270,180 @@ A 1 s window at up to 1.4 m/s travels ~5× further, along a curve that is not a 
    `lattice_learning/test_nn.py`'s scoring and figure. It rebuilds the checkpoint's own files,
    row filters and held-out-MAP split, and warns when the data's `LABEL_ATTRS` differ from the
    checkpoint's. The viewer is `gl_dataset_browser.py`.
-10. **MPPI hook** (§6): first the torch-free buffer + cost term in helhest_stack's `MppiGpu`,
-    then `mppi_learning/mppi_cost.py`, which fills it from the net (eager torch first, TensorRT
-    later, §7).
+10. **MPPI hook** (§6, planned in §9): the cost hook in helhest_stack's `MppiGpu` (done:
+    `set_cost_hook`), then `nn_mppi/mppi_cost.py`, which charges the first window exactly from
+    the net (done, checks 9d.1–5), then a closed-loop MPPI-in-ostrich check
+    (`nn_mppi/closed_loop.py`; driver done, the experiments open). The scripts
+    that put the net into MPPI live in `src/feasibility/nn_mppi/`, beside this tree.
 
 Steps 1–3 are independent of training and can be checked on their own. Step 5 is the first
 GPU-expensive one.
+
+## 9. Running the net inside MPPI
+
+The plan for §8 step 10. The numbers below were measured 2026-09-29 on the development GPU (a GTX
+1050, fp32, torch 2.11 in `.venv-cu126`) with the first 200-map checkpoint. The robot has a Jetson
+Orin and torch; nothing has been measured on it yet.
+
+### 9a. What the net costs
+
+| what | time |
+|---|---|
+| full net, one patch | **214 µs** (the same from 512 to 36,864 patches) |
+| the same, captured in a CUDA graph | no faster (105 vs 108 ms for 512 patches): the GPU is busy, not waiting on launches |
+| the same in fp16 | slower (138 ms for 512): Pascal has no fast fp16. The Orin does, so this does not transfer |
+| head only (terrain code given), 12,288 rows | **6.8 ms** |
+| trunk over one rotated 12 m map (24 × 24 codes at 0.5 m), 24 headings | 105 ms |
+
+Most of the full net's time is not convolution. The profiler gives `ChannelLayerNorm`'s
+LayerNorm 57 %, the permutes around it ~16 %, replicate padding 11 % and the convolutions ~15 %.
+Computing that LayerNorm channels-first gives the same output to 5e-6 and cuts a patch to
+141 µs; the convolutions alone, padding included, take 72 µs. A fused runtime would land
+somewhere between those.
+
+At the deployed batch this rules out the full net on every window: 4096 rollouts × 3 windows × 3
+refines is 36,864 patches, **7.9 s per frame**. Even 512 rollouts on the first window only is
+1,536 patches, 324 ms.
+
+### 9b. The first window is exact and cheap
+
+`MppiGpu.replan` starts every rollout at the same pose, so **window 0 has one patch, shared by
+all rollouts**; only the command differs. The trunk therefore runs once per replan, and only the
+head runs per rollout. No approximation, no retraining, and the head for 4096 rollouts × 3
+refines is about 7 ms on the 1050. Windows 1 and 2 start at each rollout's own pose, so they are
+not covered by this; they wait for §9e.
+
+The horizon is the one the net was trained for: `H` = 31, `n_knots` = 4 (Chosen values, §3), so
+window 0 is exactly steps [0, 10), between knots 0 and 1.
+
+### 9c. Design
+
+**helhest_stack** (additive; a planner without a hook runs exactly as before):
+
+* `MppiGpu.set_cost_hook(fn)`. `_refine` calls `fn(planner)` right after `_cost_kernel` and before
+  the robust reduction. `fn` may only launch device work (no host sync, no allocation, no torch),
+  so it is captured into the refine's graph, and it adds its term to `planner.J` in place. All
+  `n_mu` replicas of a candidate share its command, so the term is the same in each and the
+  reduction's worst/mean split does not matter for it. Setting a hook drops the captured graph,
+  so the next `replan` recaptures.
+
+**`nn_mppi/mppi_cost.py`** (torch outside the graph, Warp inside it):
+
+* `WindowCost.from_checkpoint(path, planner, weights)` loads the net with `train.load_checkpoint`
+  and refuses a planner it was not trained for: `H` ≠ 31 or `n_knots` ≠ 4, a twin `k_turn` other than the
+  checkpoint's `label_attrs`, or `wmin` ≠ 0. It copies the head's weights and the
+  `TargetTransform` into Warp arrays once.
+* `update(state)`, called before each `planner.replan`: the patch at the start pose, sampled by a
+  Warp kernel from the planner's own elevation grid with helhest's `sample_field` (the same
+  cell-centre bilinear and edge clamping as `patch.sample_patches`, wheel-contact reference,
+  divided by `wheel_radius`), then the torch trunk on it zero-copy, then the 256-number terrain
+  code, copied into a fixed Warp buffer. torch runs on Warp's stream, so the graph never reads a
+  half-written code.
+* The hook, in Warp, per rollout:
+  * window 0's command from `target_wheel_omega[0:10]`, with the same least-squares mean + slope as
+    `command.encode`;
+  * the 7 features, the FiLM head and `TargetTransform`'s inverse;
+  * the result, `w_pos · e_pos + w_rot · e_rot`, added to `J`.
+
+  The weights live in device scalars, so tuning them needs no recapture. The head runs over
+  `n_cand` rows (the mu replicas share a command) and its term is added to every replica.
+
+  **What it costs** (GTX 1050, 4096 rollouts, 3 refines): 31 ms per replan without the hook,
+  44 ms with it — about 3.9 ms per refine for the head plus 1.3 ms for `update`. The planned
+  "one thread per (rollout, neuron)" layer took 30–40 ms for one 256 × 256 layer (uncoalesced
+  weight reads, 13 GFLOP/s). Transposed weights with 8 rows × 4 outputs per thread take ~2 ms,
+  about cuBLAS's speed on this GPU. `baseline="flat"` (9d.6) adds ~10 ms (54 ms), because the
+  LayerNorm and the two trunk layers run twice. The LayerNorm runs one tile block per row (0.33 ms instead
+  of 2.3 ms for a thread per row). `wp.tile_matmul` does not compile for the 1050 (sm_61:
+  MathDx fails to build its kernel), so it cannot be tried here. On the Orin (sm_87) it should,
+  and it is the thing to try if the Orin misses its budget.
+
+### 9d. Checks, in order
+
+1. **Patch:** the Warp sampler matches `sample_patches` on the same grid and pose.
+2. **Command:** the kernel's encoding matches `command.encode` on sampled `target_wheel_omega`.
+3. **Head:** the Warp head matches `net.predict` for the same code and commands, to float tolerance.
+4. **No hook, no change:** the refine's `U` is bit-identical to the unhooked planner's.
+5. **Timing:** a refine at 4096 rollouts with and without the hook.
+
+Checks 1–5 are `nn_mppi/mppi_cost.py`'s self-test (`--checkpoint` for a trained net, `--bench`
+for 5); check 4 is also helhest_stack's `tests/control/test_mppi.py` (`selftest_cost_hook`).
+6. **Closed loop in ostrich:** MPPI plans with the twin, ostrich executes, replanning at the ROS
+   node's cadence. Run it with and without the cost, on maps where the twin is wrong (edges,
+   ramps, pivots beside walls) and on flat ground, where the cost must change little. The driver
+   is `nn_mppi/closed_loop.py`. It also re-runs the twin over every executed 1 s window and
+   reports the actual twin-vs-ostrich error along the driven path next to the net's prediction.
+   This run decides the cost's shape and weights, and whether window 0 alone is enough.
+
+   **First result, flat ground, the first 200-map checkpoint (2026-09-29):** the cost does NOT
+   change little. Arrival over 8 m: vanilla 9.7 s; weights (e_pos, e_rot) 3/3: 10.7 s; 10/10:
+   12.6 s; 30/30 and 100/100: not in 25 s (100/100 also veers 2 m off the line). On flat ground
+   the net's prediction grows with speed, so `w · e` acts as a speed penalty. It also
+   over-predicts there: 0.06 m predicted against 0.02 m actual, correlation 0.3 over ~500
+   windows. Two ways out: charge only the error above the net's own prediction on a
+   FLAT patch for the same command (the terrain's share; a second, all-zero terrain code, and
+   the head run twice), or a better flat-ground fit from more data.
+
+   **The level baseline (`WindowCost(..., baseline="flat")`, closed_loop's `nnflat` arms),
+   2026-09-29.** Each candidate pays `sum_k w_k · max(e_k(patch) − e_k(level), 0)`. The level code
+   is computed once, because an all-zero patch is the same at every pose; the trunk layers then run
+   over twice the rows. It costs 54 ms per replan against 44 ms for the raw cost and 29–31 ms with
+   no hook. On a level map the excess is exactly 0, so `U` is bit-identical to vanilla's (self-test).
+
+   * **Flat, 8 m, 2 repeats:** fixed. `nnflat` 10/10, 30/30 and 100/100 arrive in 9.2–9.6 s, the
+     same as vanilla's 9.7 s. The raw cost at 10/10 still takes 12.7–13.3 s.
+   * **Uphill 30°, 3 repeats:** vanilla, raw 3/3, `nnflat` 3/3 and `nnflat` 10/10 all time out
+     at 30 s, 0.8–1.2 m short of the goal. They take the same route, veering ~1.4 m sideways on the
+     face. They all CRAWL the face: ~0.35 rad/s wheels, ~16 s from foot to crest, vanilla included,
+     so it is MPPI's own cost (probably `saturation`; not checked). `nnflat` 30/30 arrived twice
+     (20 s), because it did not slow at the foot and climbed in ~2 s at ~3 rad/s.
+   * **That is not the cost working as meant.** Re-scoring the executed windows shows the net
+     ranks the two climbs correctly: true e_pos 0.18 m climbing fast against 0.02 m crawling,
+     predicted excess 0.19 against 0.08. The cost asks for the crawl, so the fast climbs happened
+     despite it. The excess is ~0 on the flat approach and on the plateau (≤ 0.006), and the
+     arrival order matters less than that.
+   * **Still needed:** a map where the vanilla route itself is the one the twin gets wrong, so
+     that avoiding the error means taking a DIFFERENT route (an edge or curb beside a clear
+     path), rather than a map with one way up.
+
+   **Curb detour (`heightmap/create_curb_detour.py`), 2026-09-29: window 0 cannot pick a route.**
+   The map has a 0.15 m curb across the straight 10 m line and a clear way round its end. At that
+   height the settle accepts every crossing pose (|pitch| ≤ 11.5°; 0.20 m is already blocked),
+   and the cost-to-go routes straight over it: V(start) is the same as for a curb with no gap,
+   against +1.6 (curb end at y = 1.0) or +1.1 (y = 0.4) for a forced detour.
+   * **What happened:** every arm crossed the curb at every weight (paths 9.7 m, 2 repeats each).
+     `nnflat` only slowed down: 10/10 and 30/30 took 10.2–10.8 s, 100/100 took 15–16 s, against
+     vanilla's 9.6–10.2 s. 300/300 drove up to the curb face and stopped there for the rest of the
+     25 s.
+   * **The net is not the problem.** Crossing windows really do diverge more: true e_pos 0.06
+     slow and 0.10 fast, against 0.01 before the curb. The charged excess ranks them the same
+     way: 0.026 slow, 0.045 fast, 0 away from the curb.
+   * **The horizon is the problem.** The charge appears only once the curb is inside the next
+     1 s. By then a sideways shift of 1.2–1.8 m is out of reach, so slowing or stopping is the
+     cheapest way to cut it. The cost-to-go, which does see the whole route, still points over
+     the curb. Once the robot is at the face, `wmin` 0 (no reverse) leaves it no move that avoids
+     the curb.
+   * **So route choice needs the error before the robot reaches the obstacle.** Either charge
+     windows 1–2 (9e), or put the net's error into the cost-to-go, as `planning/`'s gated lattice
+     does with `lattice_learning`'s net, and keep window 0 for the local speed choice it does well.
+
+### 9e. Later windows, only if 9d.6 asks for them
+
+Decided with numbers measured on the Orin (`bench_inference`-style: the full net per patch,
+eager and fused):
+
+* **Full net per rollout window.** Exact. Eager torch is probably too slow even on the Orin,
+  because what dominates here is memory-bound (the LayerNorm, the permutes, the padding). A fused
+  runtime could fit at a reduced batch: TensorRT in fp16, enqueued on Warp's stream inside the
+  capture, or `torch.compile` (Triton runs on the Orin but not on the 1050).
+* **A smaller trunk.** `base_width` 16 has about a quarter of the convolution work. It needs a
+  retrain and costs some accuracy.
+* **A cached terrain code.** The trunk runs over the map rotated to each of n heading bins, and
+  each rollout's code is interpolated from the grid at its pose. It is approximate, so it is the
+  last resort. It also needs the trunk to ignore a uniform height offset, which it does not: the
+  patch is relative to the wheel contacts at its own pose, which a map-wide pass cannot
+  reproduce, and raising a patch by 5 cm moves the current net's prediction by 0.030 m /
+  0.068 rad. A zero-sum first convolution would make it exact, at the cost of a retrain.
+
+**The robot.** The ROS node lives in helhest_stack and cannot import this tree. How it loads the
+hook and calls `update` is decided once step 10 works in simulation.
