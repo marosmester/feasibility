@@ -88,6 +88,7 @@ from feasibility.mppi_learning.command import upsample
 from feasibility.mppi_learning.command import WHEEL_RADIUS
 from feasibility.mppi_learning.command import WINDOW_S
 from feasibility.mppi_learning.command import WINDOW_STEPS
+from feasibility.mppi_learning.dataset_config import check_edge_reach
 from feasibility.mppi_learning.dataset_config import check_mppi_maps
 from feasibility.mppi_learning.dataset_config import DatasetConfig
 from feasibility.mppi_learning.dataset_config import load_config
@@ -389,6 +390,7 @@ def generate(cfg: DatasetConfig) -> None:
     rng = np.random.default_rng(seed)
     pool = check_mppi_maps(cfg)
     allocation = allocate(cfg, pool, rng)
+    check_edge_reach(allocation)
     print(f"[maps]     {n_maps} from {maps_dir}, {trials_per_map} trial(s) each -> {cfg.n} rows")
     print(allocation.table())
 

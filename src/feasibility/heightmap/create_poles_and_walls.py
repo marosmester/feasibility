@@ -53,7 +53,7 @@ from scipy.ndimage import distance_transform_edt
 from feasibility.heightmap import HeightMapReader
 from feasibility.heightmap.create_large_box_obstacles import build_rect_obstacle
 from feasibility.heightmap.lattice_maps_utils import GROUND_EPS
-from feasibility.heightmap.lattice_maps_utils import PLACEMENT_MARGIN
+from feasibility.heightmap.lattice_maps_utils import feature_center_limit
 from feasibility.heightmap.lattice_maps_utils import grid_axes
 from feasibility.heightmap.lattice_maps_utils import place_features
 from feasibility.heightmap.lattice_maps_utils import rect_inside_grid
@@ -82,6 +82,8 @@ class PolesAndWallsConfig:
     incline_deg: float = 80.0  # side slope; sharp, but no single-cell mesh sliver
     overlap_margin: float = 1.0  # m, clear ground between two features' footprints
     max_area_fraction: float = 0.3  # of the whole map, keeps clear ground for spawn sampling
+    center_limit: float | None = None  # m, |cx|, |cy| bound on feature centers; None =
+    # extent/2 - PLACEMENT_MARGIN (lattice_maps_utils.feature_center_limit)
 
     def __post_init__(self) -> None:
         if self.pole_radius[0] < MIN_POLE_RADIUS:
@@ -134,9 +136,7 @@ def build_poles_and_walls_map(
     """One map of poles and thin walls on flat ground, plus a params dict for a .yaml sidecar --
     lattice_maps_utils.place_features runs the placement/overlap/area-budget loop; the first
     feature that cannot land stops the map, so n_features is an upper bound."""
-    center_limit = extent / 2.0 - PLACEMENT_MARGIN
-    if center_limit <= 0.0:
-        raise ValueError(f"extent {extent} m leaves no room inside the {PLACEMENT_MARGIN} m margin")
+    center_limit = feature_center_limit(cfg.center_limit, extent)
     weights = np.asarray(cfg.kind_weights, dtype=np.float64)
     weights = weights / weights.sum()
 
@@ -185,6 +185,7 @@ def build_poles_and_walls_map(
         "n_features_target": n_target,
         "features": features,
         "area_fraction": float(np.count_nonzero(H > GROUND_EPS)) / H.size,
+        **({"center_limit": center_limit} if cfg.center_limit is not None else {}),
     }
     return hmap, params
 
@@ -286,6 +287,17 @@ if __name__ == "__main__":
     print(f"[kinds] 40 maps: {seen}")
     again, _ = build_poles_and_walls_map(np.random.default_rng(args.seed), cfg, args.extent, args.cell)
     assert np.array_equal(hmap.H, again.H), "same seed must reproduce the same map"
+
+    # --- center_limit: every center inside it; features that no longer fit shorten the map --------
+    limit, n_feat = 2.38, []
+    tight = dataclasses.replace(cfg, center_limit=limit)
+    for i in range(40):
+        _, p = build_poles_and_walls_map(np.random.default_rng([args.seed, i]), tight, args.extent, args.cell)
+        assert p["features"] and p["center_limit"] == limit
+        assert all(max(abs(c) for c in f["center"]) <= limit for f in p["features"])
+        n_feat.append(len(p["features"]))
+    print(f"[center_limit] {limit} m: 40 maps, every center inside, features per map "
+          f"{ {int(k): int(v) for k, v in zip(*np.unique(n_feat, return_counts=True))} }")
     kinds = ", ".join(f"{f['kind']}@{f['height']:.2f}m" for f in params["features"])
     print(f"[map] seed {args.seed}: {len(heights)}/{params['n_features_target']} features ({kinds}), "
           f"area {params['area_fraction']:.1%}, max {hmap.H.max():.3f} m")

@@ -14,11 +14,14 @@
 seed: 0                       # RNG seed for map selection and every trial's placement and command
 
 maps:
-  dir: assets/lattice_maps/4  # repo-root-relative or absolute directory written by
+  dir: assets/lattice_maps/0_centered  # repo-root-relative or absolute directory written by
                               # heightmap/create_maps_for_lattice_learning.py; each map's sidecar
-                              # `category` is what the mix's `map:` refers to
-  n_maps: 8                   # maps drawn in total, split across categories by the mix percents
-  trials_per_map: 16          # rows per map, so the dataset has n_maps * trials_per_map rows
+                              # `category` is what the mix's `map:` refers to. Generate it with
+                              # --center-limit 2.38: edge/rotate_in_place origins stay inside
+                              # sampling_bounds' +-2.38 m square on a 12 m map, and a feature
+                              # farther out has no edge in reach (rotate_in_place raises)
+  n_maps: 100                   # maps drawn in total, split across categories by the mix percents
+  trials_per_map: 10          # rows per map, so the dataset has n_maps * trials_per_map rows
 
 trial:                        # what one sample is -- changing these changes the data
   warmup_s: 0.3               # s of commanded ostrich driving at the entry twist before the window;
@@ -51,7 +54,9 @@ command:                      # MPPI's sampling box and priors (command.CommandS
   wmax: 4.0                   # rad/s, v_max = wmax * wheel_radius = 1.4 m/s
   sigma: 0.5                  # rad/s, NARROW family's per-step jitter, independent per wheel
   sigma_knot: 1.0             # rad/s, NARROW family's knot noise
-  spin_min: 2.0               # rad/s, slowest spin (the real robot will not break loose below it)
+  spin_min: 0.0               # rad/s, slowest spin. 0 = spins sampled from standstill, below the
+                              # real robot's ~2 rad/s breakaway that MPPI's own prior floors at, so
+                              # the net sees ostrich failing to break loose too (design.md section 2)
   family_mix:                 # relative weights of MPPI's priors, normalised on use
     wide: 0.3                 # independent uniform knots per wheel over the whole box
     straight: 0.2             # wl == wr, uniform knots
@@ -74,7 +79,7 @@ entry:                        # the twist MPPI commanded during the warm-up (ost
 
 run:                          # how the dataset is computed -- does not change the trials
   chunk: 64                   # ostrich worlds per model build; lower it if the GPU runs out of memory
-  maps_per_build: 1           # maps tiled side by side into one ostrich terrain (tiled_terrain.py)
+  maps_per_build: 10           # maps tiled side by side into one ostrich terrain (tiled_terrain.py)
   device: cuda:0              # warp device for ostrich, the twin and the static settle
   dry_run: false              # true: print the allocation, sample every allocated map's trials
                               # (settle on CPU) and, on a CUDA device, run the flat-ground
@@ -103,7 +108,7 @@ mix:
 
   - map: ramps
     strategy: ramp_down       # head-on down a face from the plateau (drops included); shares the
-    percent: 10.0             # ramps maps with ramp_up. The start is capped by each face's plateau
+    percent: 15.0             # ramps maps with ramp_up. The start is capped by each face's plateau
     params:                   # (robot + warm-up must fit), so fast approaches reach the crest early
       straight_frac: 0.75
       yaw_jitter_deg: 5.0
@@ -111,7 +116,7 @@ mix:
 
   - map: curbs_and_walls
     strategy: edge
-    percent: 25.0
+    percent: 20.0
     params:
       interact_frac: 0.5
       band: 1.5               # m; a window reaches 1.4 m, a 0.3 m arc did not
@@ -129,7 +134,7 @@ mix:
 
   - map: poles_and_walls
     strategy: rotate_in_place
-    percent: 10.0
+    percent: 25.0
     params:
       interact_frac: 0.5      # exact share whose spin sweeps a wheel into the feature
       band: 0.3               # m beyond the rim's reach from the body origin
@@ -137,5 +142,5 @@ mix:
 
   - map: rough
     strategy: uniform         # the negatives: flat and low-amplitude rough ground
-    percent: 25.0
+    percent: 10.0
     params: {}

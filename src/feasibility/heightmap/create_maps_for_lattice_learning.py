@@ -57,13 +57,24 @@ CLI parameters:
     --extent FLOAT     full width/height of every square map in meters, overriding every category's
                        own CONFIG "extent" (default: per category -- ramps 14.0, others 12.0)
     --cell FLOAT       grid resolution in meters (default: 0.1)
-    --out-dir PATH     output directory (default: assets/lattice_maps/<seed>)
+    --center-limit FLOAT
+                       m, draw curbs_and_walls / poles_and_walls feature centers inside
+                       |x|, |y| <= this (default: extent/2 - PLACEMENT_MARGIN, 4.9 m on 12 m maps).
+                       mppi_learning needs 2.38: its origins stay inside the square its
+                       sampling_bounds leaves on a 12 m map (6 - patch reach 3.0 - warm-up lead
+                       0.42 - EDGE_SLACK 0.2), and `rotate_in_place` only reaches ~1.4 m past it --
+                       a feature farther out has no edge cell in reach and that sampler raises.
+                       Ramps and rough maps are unaffected, so the same --seed into a new --out-dir
+                       reproduces them identically
+    --out-dir PATH    output directory (default: assets/lattice_maps/<seed>)
     --dry-run          print counts and build one example per category, write nothing
 
 Usage:
     python src/feasibility/heightmap/create_maps_for_lattice_learning.py --seed 0 --dry-run
     python src/feasibility/heightmap/create_maps_for_lattice_learning.py --seed 0 --n 400
     python src/feasibility/heightmap/create_maps_for_lattice_learning.py --seed 0 --ratios ramps=1
+    python src/feasibility/heightmap/create_maps_for_lattice_learning.py --seed 2 --center-limit 2.38 \\
+        --out-dir assets/lattice_maps/2_centered
 """
 from __future__ import annotations
 
@@ -297,6 +308,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ratios", type=str, default=None)
     parser.add_argument("--extent", type=float, default=None)
     parser.add_argument("--cell", type=float, default=DEFAULT_CELL)
+    parser.add_argument("--center-limit", type=float, default=None)
     parser.add_argument("--out-dir", type=str, default=None)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -307,7 +319,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    ratios = parse_ratios(args.ratios) if args.ratios else dict(DEFAULT_RATIOS)
+    if args.center_limit is not None:
+        # Before any builder runs, so the dry run and the manifest's `config` both see it.
+        for spec in (CURBS_AND_WALLS, POLES_AND_WALLS):
+            spec["config"] = dataclasses.replace(spec["config"], center_limit=args.center_limit)
+    ratios =parse_ratios(args.ratios) if args.ratios else dict(DEFAULT_RATIOS)
     counts = allocate_counts(ratios, args.n)
     out_dir = pathlib.Path(args.out_dir) if args.out_dir else ASSETS_DIR / str(args.seed)
     if not out_dir.is_absolute():
