@@ -367,6 +367,11 @@ def _parse(data: object, name: str, path: pathlib.Path | None, raw: str) -> Data
     )
 
 
+# Public names for the section parsers, for sibling packages with their own schema.
+build_section = _build
+exact_keys = _keys
+
+
 def resolve_config_path(name_or_path: str) -> pathlib.Path:
     """A path (absolute, cwd- or repo-root-relative) if it exists, else `configs/<name>[.yaml]`."""
     p = pathlib.Path(name_or_path)
@@ -400,11 +405,15 @@ def load_config(name_or_path: str) -> DatasetConfig:
 # --- maps ----------------------------------------------------------------------------------------
 
 
-def check_maps(cfg: DatasetConfig, lead: float) -> dict[str, list[pathlib.Path]]:
+def check_maps(
+    cfg: DatasetConfig, lead: float, platform_length: float | None = None
+) -> dict[str, list[pathlib.Path]]:
     """{category: sorted map stems} for every category the mix names, from `maps.dir`'s sidecars.
     Raises if the directory, or a category, is missing, and if `ramp_down` would run on a ramp
     whose plateau is shorter than `required_platform_length(lead)` (maps generated before
-    create_ramps.RampsConfig's standing-platform floor)."""
+    create_ramps.RampsConfig's standing-platform floor). `platform_length` replaces that floor for
+    a caller whose trials are not this package's arcs (`mppi_learning`); `cfg` is only read
+    through `categories`, `maps`, `mix`, `path`, `name` and `trial.warmup_s`."""
     where = cfg.path or cfg.name
     maps_dir = cfg.maps.path
     if not maps_dir.is_dir():
@@ -423,7 +432,7 @@ def check_maps(cfg: DatasetConfig, lead: float) -> dict[str, list[pathlib.Path]]
             raise ConfigError(f"{where}: the mix uses map category {category!r}, but "
                               f"{maps_dir} has no such maps (categories found: {found})")
 
-    need = required_platform_length(lead)
+    need = required_platform_length(lead) if platform_length is None else platform_length
     for entry in cfg.mix:
         if entry.strategy != "ramp_down":
             continue

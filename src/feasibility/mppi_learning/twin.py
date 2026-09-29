@@ -51,7 +51,8 @@ def run_twin(
     k_turn: float = dynamics.K_TURN,
     device: str = "cuda:0",
     solver: SolverParams | None = None,
-) -> np.ndarray:
+    diagnostics: bool = False,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray, np.ndarray]:
     """`start_pose` [N, 3] (x, y, yaw) at the window start; `wheel_omega` [n_windows *
     WINDOW_STEPS, N, 3] setpoints on the 0.1 s grid; `init_wheel_omega` [N, 3] the realized wheel
     speeds there (None = at rest); `init_twist` [N, 3] body (vx, vy, yaw_rate) there (None = derived
@@ -59,7 +60,10 @@ def run_twin(
     `planning_solver(k_turn=k_turn)`.
 
     Returns the twin's pose at the end of each window, [n_windows, N, 7] (x, y, z, qx, qy, qz,
-    qw) -- the layout of ostrich's pose log, so `custom_dataset.pose_to_se3` reads both."""
+    qw) -- the layout of ostrich's pose log, so `custom_dataset.pose_to_se3` reads both.
+    `diagnostics` also returns the settle's min clearance and max residual over each window,
+    [n_windows, N] each -- where the twin itself says its pose is fiction (high-centering, an
+    unconverged settle)."""
     n_steps, n, _ = wheel_omega.shape
     if n_steps % WINDOW_STEPS:
         raise ValueError(f"{n_steps} steps is not a whole number of windows")
@@ -92,7 +96,13 @@ def run_twin(
     end = WINDOW_STEPS * (1 + np.arange(n_steps // WINDOW_STEPS))  # row 0 of the logs is the start
     controlled, derived = sim.controlled.numpy()[end], sim.derived.numpy()[end]
     quat = euler_zyx_to_quat_xyzw(controlled[..., 2], derived[..., 1], derived[..., 2])
-    return np.concatenate([controlled[..., :1], controlled[..., 1:2], derived[..., :1], quat], axis=-1)
+    pose = np.concatenate([controlled[..., :1], controlled[..., 1:2], derived[..., :1], quat], axis=-1)
+    if not diagnostics:
+        return pose
+    per_window = (n_steps // WINDOW_STEPS, WINDOW_STEPS, n)
+    clearance = sim.clearance.numpy().reshape(per_window).min(axis=1)
+    residual = sim.residual.numpy().reshape(per_window).max(axis=1)
+    return pose, clearance, residual
 
 
 if __name__ == "__main__":
@@ -116,6 +126,9 @@ if __name__ == "__main__":
     lag = v - pose[0, 0, 0]
     assert 0.5 * v * dynamics.MOTOR_TAU < lag < 2.0 * v * dynamics.MOTOR_TAU, lag
     assert np.abs(pose[..., 1]).max() < 1e-3 and np.abs(pose[..., 3:5]).max() < 1e-3
+    again, clearance, residual = run_twin(flat, origin, straight, init_wheel_omega=np.stack([np.zeros(3), straight[0, 1]]), device=device, diagnostics=True)
+    assert np.array_equal(again, pose) and clearance.shape == residual.shape == (2, 2)
+    assert (clearance > 0).all() and (residual < dynamics.robot_params().resid_tol).all(), (clearance, residual)
 
     # A spin turns in place, slowed by the turn resistance alpha = 1 + k_turn * mu.
     mu = 0.8

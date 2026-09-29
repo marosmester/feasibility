@@ -9,11 +9,17 @@ candidates per round, so the twin is not involved; the label's twin comes later.
 
 A trial is: a window ORIGIN (the pose the patch is taken at), an ENTRY twist `(v, wz)` held for
 `warmup_s` before it (the spawn is the origin backed out along that constant twist), and one
-window's wheel-speed profile from `command.sample_window_commands`.
+window's wheel-speed profile from `command.sample_window_commands`. The entry is mostly the window's
+OWN first command: a knot is shared by the two windows that meet at it, so every rollout window but
+the first starts with the command continuing. `EntrySpec.jump_frac` of the trials instead enter at
+an independent twist -- window 0, whose WIDE/STRAIGHT knot 0 ignores the measured state.
 
-The origin is NOMINAL -- ideal no-slip kinematics from the spawn, which ostrich's warm-up (motor
-lag, skid-steer turn resistance, terrain) never reproduces exactly. Placement only needs it to be
-close. The label and the patch must use ostrich's REALIZED state at the end of the warm-up: the
+The origin is NOMINAL: the entry twist integrated from the spawn with its yaw rate scaled by
+`EntrySpec.yaw_ratio`, the share of MPPI's commanded yaw rate ostrich realizes under its
+`CommandSpec.ostrich_yaw_gain` compensation (measured on flat ground). Ostrich's warm-up (terrain,
+its stick-slip while turning) never reproduces it exactly, and placement only needs it to be close.
+Every entry is inside the box after that compensation too (`entry_in_box`), as every window is.
+The label and the patch must use ostrich's REALIZED state at the end of the warm-up: the
 patch is sampled there, and `twin.run_twin` starts from it (pose, wheel speeds, body twist), as
 MPPI starts every replan from the measured state.
 
@@ -61,7 +67,6 @@ from helhest.engine import RobotParams
 from feasibility.heightmap import HeightMapReader
 from feasibility.heightmap.create_ramps import Ramp
 from feasibility.lattice_learning.arc import integrate_twist
-from feasibility.lattice_learning.arc import KAPPA_MAX
 from feasibility.lattice_learning.patch import patch_overhangs
 from feasibility.lattice_learning.patch import PatchSpec
 from feasibility.lattice_learning.patch import WHEEL_CONTACTS_LOCAL
@@ -84,11 +89,13 @@ from feasibility.lattice_learning.spawn_sampling import sampling_bounds
 from feasibility.lattice_learning.spawn_sampling import SETTLE_SLACK
 from feasibility.lattice_learning.spawn_sampling import TOUCH_TOL
 from feasibility.mppi_learning.command import CommandSpec
+from feasibility.mppi_learning.command import HALF_TRACK
 from feasibility.mppi_learning.command import MPPI_DT
 from feasibility.mppi_learning.command import sample_window_commands
 from feasibility.mppi_learning.command import SPIN
 from feasibility.mppi_learning.command import WINDOW_S
 from feasibility.mppi_learning.command import WINDOW_STEPS
+from feasibility.mppi_learning.command import WHEEL_RADIUS
 from feasibility.mppi_learning.command import wheels_to_twist
 
 PATCH_SPEC = PatchSpec(x_max=3.0)  # design.md section 4: 24 x 36 cells at 0.125 m
@@ -101,12 +108,15 @@ RAMP_MIN_TRAVEL = 0.3  # m, a face trial's origin is at least this far short of 
 
 @dataclasses.dataclass(frozen=True)
 class EntrySpec:
-    """The twin's/ostrich's speed when the window starts: a forward arc at speed `v` and curvature
-    `kappa`, held for `warmup_s`. Not a command input (design.md section 7): data-only randomisation."""
+    """The twist commanded during the warm-up. `1 - jump_frac` of the trials continue into the
+    window (the ideal twist of its first step's wheel speeds); the rest jump, drawn uniform on
+    [0, v_max] x [-wz_max, wz_max] AND inside the command box (`entry_in_box`), so it is a state
+    MPPI could have commanded and ostrich's compensated warm-up command stays in the box."""
 
-    v_min: float = 0.0  # m/s
+    jump_frac: float = 0.2  # share of window-0-like trials, entry independent of the window
     v_max: float = 1.4  # m/s, = the command box's v_max
-    kappa_max: float = KAPPA_MAX  # 1/m, the router's tightest forward arc
+    wz_max: float = 2.0  # rad/s; the box caps it further, to 1.67 at v = 0.7 m/s with gain 1.15
+    yaw_ratio: float = 0.56  # placement only: realized / MPPI-commanded yaw rate of the warm-up
 
 
 @dataclasses.dataclass(frozen=True)
@@ -117,7 +127,7 @@ class TrialContext:
     mu: float
     device: str
     interact_relief: float  # m, see the module docstring
-    warmup_s: float = 1.0  # a multiple of both MPPI_DT and ostrich's dt
+    warmup_s: float = 0.3  # a multiple of both MPPI_DT and ostrich's dt; ostrich settles in ~0.2 s
     spec: PatchSpec = PATCH_SPEC
     command: CommandSpec = CommandSpec()
     entry: EntrySpec = EntrySpec()
@@ -153,7 +163,7 @@ def make_candidates(
 ) -> Candidates:
     """`omega` is `command.sample_window_commands`' [WINDOW_STEPS, m, 3]; stored row-major."""
     nan = np.full(len(origin), np.nan, dtype=np.float32)
-    spawn = integrate_twist(origin, entry[:, 0], entry[:, 1], -ctx.warmup_s)
+    spawn = integrate_twist(origin, entry[:, 0], ctx.entry.yaw_ratio * entry[:, 1], -ctx.warmup_s)
     return Candidates(
         origin=origin, omega=np.ascontiguousarray(omega.transpose(1, 0, 2)), family=family,
         entry=entry, spawn=spawn, ramp_deg=nan if ramp_deg is None else ramp_deg,
@@ -213,7 +223,8 @@ def window_poses(origin: np.ndarray, omega: np.ndarray) -> list[np.ndarray]:
 def warmup_poses(ctx: TrialContext, cand: Candidates) -> list[np.ndarray]:
     """Poses [m, 3] from the spawn to the origin along the entry twist, ~5 cm apart at v_max."""
     times = np.linspace(0.0, ctx.warmup_s, int(round(ctx.warmup_s / (MPPI_DT / PATH_SUBSTEPS))) + 1)
-    return [integrate_twist(cand.spawn, cand.entry[:, 0], cand.entry[:, 1], t) for t in times]
+    wz = ctx.entry.yaw_ratio * cand.entry[:, 1]
+    return [integrate_twist(cand.spawn, cand.entry[:, 0], wz, t) for t in times]
 
 
 def path_relief_signed(
@@ -243,10 +254,35 @@ def trials_feasible(ctx: TrialContext, cand: Candidates) -> tuple[np.ndarray, np
     return feasible[:k] & ~patch_overhangs(ctx.terrain, cand.origin, ctx.spec), feasible[k:]
 
 
-def sample_entry(ctx: TrialContext, m: int, rng: np.random.Generator) -> np.ndarray:
-    """[m, 2] (v, wz): a forward arc at a uniform speed and curvature."""
-    v = rng.uniform(ctx.entry.v_min, ctx.entry.v_max, m)
-    return np.column_stack([v, v * rng.uniform(-ctx.entry.kappa_max, ctx.entry.kappa_max, m)])
+def entry_in_box(entry: np.ndarray, command: CommandSpec) -> np.ndarray:
+    """[m] bool -- both ideal wheel speeds of the twists `entry` [m, 2], as ostrich is commanded
+    them (yaw rate * `ostrich_yaw_gain`), inside [wmin, wmax]; MPPI's own wheels then are too."""
+    v, wz = entry[:, 0], entry[:, 1] * command.ostrich_yaw_gain
+    wheels = np.stack([v - wz * HALF_TRACK, v + wz * HALF_TRACK], axis=-1) / WHEEL_RADIUS
+    tol = 1e-5  # the continuation entries come from float32 windows clamped to the box edge
+    return ((wheels >= command.wmin - tol) & (wheels <= command.wmax + tol)).all(axis=-1)
+
+
+def sample_entry(ctx: TrialContext, omega: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """[m, 2] (v, wz) for the windows `omega` [WINDOW_STEPS, m, 3]: each window's own first
+    command, except `jump_frac` of them drawn by `sample_jump_entry`."""
+    m = omega.shape[1]
+    entry = np.stack(wheels_to_twist(omega[0].astype(np.float64)), axis=-1)
+    jump = rng.random(m) < ctx.entry.jump_frac
+    entry[jump] = sample_jump_entry(ctx, int(jump.sum()), rng)
+    return entry
+
+
+def sample_jump_entry(ctx: TrialContext, m: int, rng: np.random.Generator) -> np.ndarray:
+    """[m, 2] (v, wz), uniform over the part of [0, v_max] x [-wz_max, wz_max] the command box
+    allows, by rejection."""
+    out = np.empty((0, 2))
+    while len(out) < m:
+        draw = np.column_stack(
+            [rng.uniform(0.0, ctx.entry.v_max, 2 * m), rng.uniform(-ctx.entry.wz_max, ctx.entry.wz_max, 2 * m)]
+        )
+        out = np.concatenate([out, draw[entry_in_box(draw, ctx.command)]])
+    return out[:m]
 
 
 # --- the shared stratified fill ---------------------------------------------------------------
@@ -377,7 +413,7 @@ def sample_trials(
     def propose(m: int) -> Candidates:
         omega, family = sample_window_commands(m, rng, ctx.command)
         origin = np.column_stack([rng.uniform(x_lo, x_hi, m), rng.uniform(y_lo, y_hi, m), rng.uniform(0.0, 2.0 * np.pi, m)])
-        return make_candidates(ctx, origin, omega, family, sample_entry(ctx, m, rng))
+        return make_candidates(ctx, origin, omega, family, sample_entry(ctx, omega, rng))
 
     if interact_frac is None:
         need, fallback = {0: n}, []
@@ -426,7 +462,7 @@ def _sample_near_edges(
         facing = (rng.uniform(size=m) < facing_frac) & (dist[cell] > 0.0)
         yaw = np.where(facing, to_edge + rng.uniform(-cone, cone, m), rng.uniform(0.0, 2.0 * np.pi, m))
         omega, family = sample_window_commands(m, rng, command)
-        entry = np.zeros((m, 2)) if at_rest else sample_entry(ctx, m, rng)
+        entry = np.zeros((m, 2)) if at_rest else sample_entry(ctx, omega, rng)
         return make_candidates(ctx, np.column_stack([x, y, yaw]), omega, family, entry)
 
     def admit(cand: Candidates) -> np.ndarray:
@@ -491,14 +527,22 @@ def sample_rotate_in_place_trials(
     )
 
 
+PLATFORM_MARGIN = 0.1  # m, heading jitter and curvature swing the rear wheel off the face axis
+
+
+def platform_behind(ctx: TrialContext) -> float:
+    """m of plateau a `ramp_down` trial occupies BEHIND its origin's front axle: the warm-up at the
+    fastest entry, the wheelbase back to the rear axle, the rear wheel's back edge and a margin."""
+    return ctx.max_warmup_distance + float(ctx.robot.rear_offset) + float(ctx.robot.wheel_radius) + PLATFORM_MARGIN
+
+
 def required_platform_length(ctx: TrialContext) -> float:
-    """m -- the plateau a `ramp_down` trial needs for the whole robot to stand on it at the earliest
-    spawn: the origin's front axle is `reach + wheel_radius` before the crest (the front wheel just
-    reaches it at window end), `ctx.max_warmup_distance` further back for the warm-up, plus the rear
-    wheel's back edge. `lattice_learning`'s maps are sized for its 0.3 m arc, not this."""
-    r = float(ctx.robot.wheel_radius)
-    reach = ctx.command.v_max * WINDOW_S
-    return reach + r + ctx.max_warmup_distance + float(ctx.robot.rear_offset) + r + 0.1
+    """m -- the shortest plateau a `ramp_down` face can be sampled on: the whole robot on it, any
+    entry speed, with the origin's front wheel at the crest (front axle `wheel_radius` short of it).
+    A longer plateau lets the origin start further back (`_sample_face_trials`), up to
+    `reach + wheel_radius` before the crest -- where the front wheel just reaches it at window end,
+    which takes `reach + wheel_radius + platform_behind` (3.37 m at the defaults)."""
+    return float(ctx.robot.wheel_radius) + platform_behind(ctx)
 
 
 def _sample_face_trials(
@@ -511,7 +555,13 @@ def _sample_face_trials(
     front axle sits at `s` in [-(reach + wheel_radius), run - RAMP_MIN_TRAVEL] (never before the
     event `-direction * wheel_radius`), anywhere across the top width, the heading at MID-WINDOW within
     +- `yaw_jitter_deg` of the face axis. The lattice's `s_event` argument carries over: going down a
-    short face it is what puts the drop inside the window."""
+    short face it is what puts the drop inside the window.
+
+    Going DOWN, the lower bound is also capped per face by its plateau: the robot and its warm-up
+    must fit on it (`platform_behind`), so on a plateau P the origin starts at most
+    `P - platform_behind` before the crest. On the lattice maps (P 2.1-3.0 m) that is 0.5-1.4 m
+    instead of the full 1.75 m, so a fast approach reaches the crest early in the window; every
+    entry speed stays equally likely at every start."""
     _check_frac("straight_frac", straight_frac)
     r = float(ctx.robot.wheel_radius)
     jitter = np.radians(yaw_jitter_deg)
@@ -522,6 +572,10 @@ def _sample_face_trials(
     foot_x, foot_y, face_yaw, face_run, face_half_w, face_slope = (
         np.array([getattr(f, k) for f in faces]) for k in ("foot_x", "foot_y", "yaw", "run", "half_width", "slope_deg")
     )
+    face_s_min = np.full(len(faces), s_min)
+    if direction < 0:  # the robot and its warm-up stand on the plateau behind the crest
+        plateau = np.array([f.ramp.plateau for f in faces])
+        face_s_min = np.maximum(s_min, np.minimum(platform_behind(ctx) - plateau, s_event))
     entry_frac = 0.0 if direction > 0 else 1.0  # entry point: the foot going up, the crest going down
     turn = 0.0 if direction > 0 else np.pi
 
@@ -538,7 +592,7 @@ def _sample_face_trials(
         ex, ey = fx + entry_frac * run * c, fy + entry_frac * run * s
         travel = fyaw + turn
 
-        s0 = rng.uniform(s_min, np.maximum(run - RAMP_MIN_TRAVEL, s_event))
+        s0 = rng.uniform(face_s_min[face_idx], np.maximum(run - RAMP_MIN_TRAVEL, s_event))
         t0 = rng.uniform(-half_w, half_w)
         omega, family = sample_window_commands(m, rng, command)
         # heading at mid-window: the path's own turning in the body frame, read off a yaw-0 origin
@@ -546,7 +600,7 @@ def _sample_face_trials(
         yaw0 = travel + rng.uniform(-jitter, jitter, m) - mid_yaw
         tc, ts = np.cos(travel), np.sin(travel)
         origin = np.column_stack([ex + s0 * tc - t0 * ts, ey + s0 * ts + t0 * tc, yaw0])
-        cand = make_candidates(ctx, origin, omega, family, sample_entry(ctx, m, rng), face_slope[face_idx], s0.astype(np.float32))
+        cand = make_candidates(ctx, origin, omega, family, sample_entry(ctx, omega, rng), face_slope[face_idx], s0.astype(np.float32))
 
         # every wheel contact from spawn to window end inside the top width and on this ramp's surface
         on_face = np.ones(m, dtype=bool)
@@ -638,6 +692,26 @@ if __name__ == "__main__":
     print(f"patch extent: window rims span x [{lo[0]:.2f}, {hi[0]:.2f}] y [{lo[1]:.2f}, {hi[1]:.2f}] "
           f"inside x [{PATCH_SPEC.x_min}, {PATCH_SPEC.x_max}] y [{PATCH_SPEC.y_min}, {PATCH_SPEC.y_max}]")
 
+    # Entries are twists the command box can produce, spread over it.
+    ent = sample_jump_entry(probe, 20_000, np.random.default_rng(2))
+    assert entry_in_box(ent, probe.command).all() and ent[:, 0].min() >= 0.0
+    assert ent[:, 0].max() > 0.9 * probe.entry.v_max and np.abs(ent[:, 1]).max() > 0.9 * 1.4 / HALF_TRACK / 2
+    # ... and the rest continue into their window: its first step's twist, exactly.
+    ent = sample_entry(probe, om, np.random.default_rng(2))
+    first = np.stack(wheels_to_twist(om[0].astype(np.float64)), axis=-1)
+    same = np.isclose(ent, first).all(axis=1)
+    assert abs(same.mean() - (1 - probe.entry.jump_frac)) < 0.02, same.mean()
+    # With ostrich's yaw compensation, every entry -- continued or jumped -- still fits once compensated.
+    gained = dataclasses.replace(probe, command=CommandSpec(ostrich_yaw_gain=1.15))
+    om_g, fam_g = sample_window_commands(20_000, np.random.default_rng(1), gained.command)
+    ent = sample_entry(gained, om_g, np.random.default_rng(2))
+    spin = fam_g == FAMILIES.index("spin")  # a spin's continuation entry spins, one wheel reversed
+    assert entry_in_box(ent[~spin], gained.command).all()
+    spin_wheels = (np.abs(ent[spin, 1]) * gained.command.ostrich_yaw_gain * HALF_TRACK
+                   + np.abs(ent[spin, 0])) / WHEEL_RADIUS
+    assert spin_wheels.max() <= gained.command.wmax + 1e-5
+    assert not entry_in_box(np.array([[0.7, 1.9]]), gained.command).any()  # in the plain box, not after x1.15
+
     # Uniform slope scores ~0 relief along any path.
     slope = HeightMapReader(np.tan(np.radians(10.0)) * (X + 8.0), origin=(-8.0, -8.0), cell=0.05)
     org = np.column_stack([rng.uniform(-4, 4, 256), rng.uniform(-4, 4, 256), rng.uniform(0, 6.28, 256)])
@@ -649,7 +723,8 @@ if __name__ == "__main__":
     fb = sample_trials(context(flat), 32, rng, interact_frac=0.5)
     assert fb.pose.shape == (32, 3) and fb.omega.shape == (32, WINDOW_STEPS, 3)
     assert fb.shortfall == 16 and (fb.relief == 0).all() and (fb.interact_dir == 0).all()
-    assert np.allclose(integrate_twist(fb.pose, fb.entry[:, 0], fb.entry[:, 1], probe.warmup_s), fb.origin, atol=1e-6)
+    warm_wz = probe.entry.yaw_ratio * fb.entry[:, 1]
+    assert np.allclose(integrate_twist(fb.pose, fb.entry[:, 0], warm_wz, probe.warmup_s), fb.origin, atol=1e-6)
 
     # 0.2 m box: exact stratification, patch on the map, spawns AND window ends settle-feasible.
     box = HeightMapReader(np.where((np.abs(X) < 1.5) & (np.abs(Y) < 1.5), 0.2, 0.0), origin=(-8.0, -8.0), cell=0.05)
@@ -708,7 +783,9 @@ if __name__ == "__main__":
     ramp_map = HeightMapReader(np.maximum(*(ramp_layer(r_, 16.0, 0.05) for r_ in ramps)), origin=(-8.0, -8.0), cell=0.05)
     ctx = context(ramp_map)
     faces = ramp_faces({"ramps": [dataclasses.asdict(r_) for r_ in ramps]})
-    print(f"required plateau for ramp_down: {required_platform_length(ctx):.2f} m (these maps have 2.1)")
+    assert required_platform_length(ctx) <= 2.1, "the lattice maps' plateau floor must admit ramp_down"
+    print(f"ramp_down: plateau floor {required_platform_length(ctx):.2f} m (these maps have 2.1), "
+          f"origins from {2.1 - platform_behind(ctx):.2f} m before the crest")
     ramp_kw = dict(straight_frac=0.75, yaw_jitter_deg=5.0, fallback_interact_frac=0.5)
     for sampler, name, turn in ((sample_ramp_up_trials, "ramp_up", 0.0), (sample_ramp_down_trials, "ramp_down", np.pi)):
         t0 = time.perf_counter()
@@ -719,6 +796,8 @@ if __name__ == "__main__":
         off = np.degrees(np.abs(np.angle(np.exp(1j * (mid[:, 2] - axis - turn)))))
         assert off.max() <= ramp_kw["yaw_jitter_deg"] + 1e-6, (name, off.max())
         assert set(np.unique(rmb.family[np.isfinite(rmb.ramp_s)])) <= {1, 2}, "ramp commands are STRAIGHT/NARROW"
+        if name == "ramp_down":  # robot + warm-up on the 2.1 m plateau
+            assert np.nanmin(rmb.ramp_s) >= platform_behind(ctx) - 2.1 - 1e-5, np.nanmin(rmb.ramp_s)
         print(f"{name}: 200 trials, shortfall {rmb.shortfall}, mid-window heading off-axis <= {off.max():.1f} deg, "
               f"interact {int((rmb.interact_dir > 0).sum())} up / {int((rmb.interact_dir < 0).sum())} down, {time.perf_counter() - t0:.1f}s")
 
