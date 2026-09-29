@@ -92,14 +92,71 @@ Very close to `lattice_learning`: the same config-driven `generate_dataset.py`, 
 `spawn_sampling` strategies, `tiled_terrain` batching and `train.py`. The differences:
 
 * Each trial records **twin vs ostrich** under the same time-varying command profile.
-* Each trial starts with a warm-up that brings the robot to a sampled entry speed rather than the
-  window's own command. That speed is not one of the four command inputs; whether it becomes a
-  fifth input or stays a data-only randomisation is open (§7). Only ostrich runs the warm-up. The
+* Each trial starts with a short warm-up (0.3 s) that gets ostrich moving; ostrich cannot be
+  spawned at speed. Measured on flat ground from rest, straight driving settles in ≤ 0.2 s. Turning
+  reaches its mean yaw rate in ~0.2 s and then never settles, because ostrich stick-slips, so a
+  longer warm-up buys nothing. The warm-up is mostly commanded at the window's **own first
+  command**: MPPI's knots are shared by adjacent windows, so every rollout window after the first
+  starts with its command continuing. A share (`entry.jump_frac`, 0.2) enters at an independent
+  twist in the wheel box instead, like window 0, whose WIDE/STRAIGHT knot 0 ignores the measured
+  state. Only ostrich runs the warm-up. The
   twin starts at ostrich's **realized** state at the window start (pose, wheel speeds, body
   twist), with MPPI's `planning_solver`, the way every MPPI replan starts from the measured
   state. The patch is taken at that same pose.
+* **`ramp_down` on the lattice maps.** A trial could start up to one window's reach (1.4 m + a wheel
+  radius) before the crest. Add the warm-up and the robot's length, and full coverage would need
+  3.37 m plateaus, while the maps have 2.1–3.0 m. So each face caps the start by its own plateau:
+  the robot and its warm-up must fit on it (`platform_behind`, 1.62 m), and origins start at most
+  `plateau − 1.62` m (0.5–1.4 m) before the crest. `check_maps` requires plateaus ≥ 1.97 m. Every
+  entry speed and the whole descent are covered, but a fast approach reaches the crest early in
+  the window, so late drops are under-represented. Longer-plateau maps would fix that.
+* **The net is for outdoors**, and ostrich is commanded a slightly faster turn than the twin is.
+  See "Turning" below.
 * Everything else carries over: the label heads (`pos_rot` / `pos_rpy`), `TargetTransform`, the
   mirror augmentation and the self-checks.
+
+### Turning: the yaw ratio and the 1.15 yaw gain
+
+**Yaw ratio.** Take a pair of left/right wheel speeds. If the wheels rolled without slipping, they
+would turn the body at the *ideal* yaw rate `wz = r (wr − wl) / (2 · half_track)`. A skid-steer
+robot cannot turn without slipping: its wheels are dragged sideways, so the body turns slower.
+The **yaw ratio** is realized ÷ ideal yaw rate, and each "robot" has its own:
+
+| robot | yaw ratio | source |
+|---|---|---|
+| ideal kinematics | 1.00 | definition |
+| real Helhest, outdoors | **0.55** | helhest's ICP-truth fit of real drives: α ≈ 1.82, ratio 1/α |
+| twin (`k_turn` 1.0, mu 0.8) | 0.56 | α = 1 + k_turn · mu = 1.80 |
+| ostrich, same command | **0.48** | measured, flat ground |
+| ostrich, yaw rate × 1.15 | **0.56** | measured: arcs 0.51–0.55, spins 0.57–0.63 |
+
+**Why a gain.** The label is twin vs ostrich, and ostrich stands in for the real robot. With the
+same command, ostrich turns less than the real robot (0.48 against 0.55). Part of every label
+would then be *ostrich's* error, not the twin's, and the net would learn to distrust turns that
+are fine on the robot. So ostrich alone is commanded MPPI's yaw rate × `trial.ostrich_yaw_gain`.
+Ostrich turns at 0.48 / 0.55 ≈ 0.87 of the robot, so the gain is 1/0.87 ≈ **1.15**: ostrich asks
+for 1.15× the yaw rate and realizes
+about what the robot would. It applies in both the warm-up and the window. The forward speed is
+untouched, and the twin gets MPPI's command unchanged.
+
+**Why not something else.**
+* *Retune ostrich's friction instead.* This doesn't work: a lateral/longitudinal ratio
+  (`MU_LAT_RATIO`) of 0.2–0.5 only reaches 0.48–0.52. Only a longitudinal mu of 1.6 reaches the
+  target, and that would let ostrich climb slopes the robot can't.
+* *lattice_learning's 0.49.* That value is ostrich vs *ideal* kinematics. Dividing by it would
+  make ostrich turn at ~1.0, well past the real robot.
+
+**The sampling box.** Compensation widens the wheel spread: `m ± d` becomes `m ± 1.15·d`. Every
+command family is therefore drawn in ostrich's compensated wheel space, inside `[wmin, wmax]`,
+and mapped back to MPPI's command (`command.contract`). MPPI's spins top out at wmax / 1.15, and
+the widest arcs shrink the same way.
+
+**`entry.yaw_ratio`** (0.56) is the realized ÷ MPPI-commanded yaw rate under this gain. It is
+used only to place the spawn so that the warm-up ends near the window origin. Re-measure it
+whenever the gain or friction changes.
+
+**Effect.** On flat ground the spin label's median offset fell from 0.17 m / 0.28 rad to
+0.10 m / 0.15 rad. The turning noise stayed the same (cv 0.39 vs 0.37).
 
 ## 6. Integration into MPPI
 
@@ -119,8 +176,9 @@ Very close to `lattice_learning`: the same config-driven `generate_dataset.py`, 
 * **Real-time inference.** Once the net is trained: cache the command-free trunk as a code field
   at routing cadence, run only the head per rollout window, and move inference into the CUDA
   graph (e.g. by exporting to TensorRT). Nothing above depends on how this is done.
-* **Entry speed as an input.** Decide from data whether the twin's realized twist at the window
-  start must be a net input or whether warm-up randomisation is enough.
+* **Entry speed as an input.** With the entry mostly continuing into the window, the start speed
+  is readable from the command (`v_mean − v_slope/2`). Decide from data whether the jump share
+  still needs the realized start twist as a fifth input.
 * **Complete maps only.** Like `lattice_learning` (§3c there), there is no measured-cell channel,
   so a partially observed map is outside the training distribution.
 

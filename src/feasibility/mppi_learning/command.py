@@ -20,6 +20,13 @@ streams, which cannot be called for a batch of independent one-window trials.
       every call, so the two wheels' jitters are independent draws -- it wobbles `wz` as well as `v`.
     * NARROW's nominal is MPPI's current `U`, which this cannot know; a uniform constant over the
       box stands in for it.
+    * ostrich is commanded `compensate(omega, ostrich_yaw_gain)` (design.md section 5), so every
+      family is drawn in OSTRICH's wheel space -- the box, the clamp, the spin band -- and mapped
+      back to MPPI's command by `contract`, the inverse. That linear map keeps knots linear,
+      spins constant and straight windows straight, and it is what keeps the command ostrich
+      actually gets inside `[wmin, wmax]`: the MPPI commands sampled are exactly those whose
+      compensated wheels fit the box (a diamond narrowed in `wz` by the gain), spins top out
+      at `wmax / ostrich_yaw_gain`.
     * the PIVOT prior is left out: the proposal runs it with `pivot_frac` 0, and with `wmin` = 0 it
       would only clamp to forward arcs WIDE already covers.
 
@@ -57,6 +64,8 @@ class CommandSpec:
     spin_min: float = 2.0  # rad/s, the real robot will not break loose below ~2 rad/s
     # sampling weight per family, in `FAMILIES` order; normalised on use
     mix: tuple[float, float, float, float] = (0.3, 0.2, 0.3, 0.2)
+    # ostrich's yaw feedforward: it is commanded wz * ostrich_yaw_gain (`compensate`); 1.0 = none
+    ostrich_yaw_gain: float = 1.0
 
     @property
     def v_max(self) -> float:
@@ -68,6 +77,20 @@ def wheels_to_twist(wheel_omega: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     differential drive -- the inverse of `comparator.common.cmd_to_wheels`."""
     wl, wr = wheel_omega[..., 0], wheel_omega[..., 1]
     return WHEEL_RADIUS * (wl + wr) / 2.0, WHEEL_RADIUS * (wr - wl) / (2.0 * HALF_TRACK)
+
+
+def compensate(wheel_omega: np.ndarray, gain: float) -> np.ndarray:
+    """[..., 3] MPPI wheel speeds (left, right, rear) -> the ones ostrich is commanded: the same
+    forward speed with the yaw rate multiplied by `gain`, i.e. the left/right half-difference scaled
+    by `gain` about their mean. The rear wheel (on the centreline) keeps the mean."""
+    w = np.asarray(wheel_omega, dtype=np.float64)
+    mean, half = (w[..., 0] + w[..., 1]) / 2.0, (w[..., 1] - w[..., 0]) / 2.0 * gain
+    return np.stack([mean - half, mean + half, mean], axis=-1).astype(np.float32)
+
+
+def contract(wheel_omega: np.ndarray, gain: float) -> np.ndarray:
+    """The inverse of `compensate`: ostrich's wheel speeds -> the MPPI command that produces them."""
+    return compensate(wheel_omega, 1.0 / gain)
 
 
 def sample_window_commands(
@@ -96,8 +119,10 @@ def sample_window_commands(
     v = (1 - frac) * v_knots[0] + frac * v_knots[1]  # [S, N]
     straight = np.stack([v, v], axis=-1)
 
-    # SPIN: wl = -wr, magnitude floored at spin_min, held constant across the window
-    mag = spec.spin_min + (spec.wmax - spec.spin_min) * rng.random(n)
+    # SPIN: wl = -wr, held constant across the window. spin_min floors MPPI's command (the real
+    # robot's breakaway), i.e. spin_min * gain in ostrich's wheel space where this is drawn.
+    spin_lo = spec.spin_min * spec.ostrich_yaw_gain
+    mag = spin_lo + (spec.wmax - spin_lo) * rng.random(n)
     mag = np.where(rng.random(n) < 0.5, -mag, mag)
     spin = np.broadcast_to(np.stack([-mag, mag], axis=-1), (WINDOW_STEPS, n, 2))
 
@@ -114,11 +139,12 @@ def sample_window_commands(
 
 
 def _finish(profile: np.ndarray, family: np.ndarray, spec: CommandSpec) -> tuple[np.ndarray, np.ndarray]:
-    """Clamp to the box (the spin band keeps its reversed wheel) and append the rear wheel."""
+    """Clamp ostrich's profile to the box (the spin band keeps its reversed wheel), append the rear
+    wheel and `contract` it to MPPI's command."""
     lo = np.where(family == SPIN, -spec.wmax, spec.wmin)[None, :, None]
     profile = np.clip(profile, lo, spec.wmax)
     rear = profile.mean(axis=-1, keepdims=True)  # cmd_to_wheels: v_rear = v / r = mean(wl, wr)
-    return np.concatenate([profile, rear], axis=-1).astype(np.float32), family
+    return contract(np.concatenate([profile, rear], axis=-1), spec.ostrich_yaw_gain), family
 
 
 def upsample(wheel_omega: np.ndarray, dt_to: float, dt_from: float = MPPI_DT) -> np.ndarray:
@@ -160,18 +186,22 @@ def linear_residual(wheel_omega: np.ndarray) -> np.ndarray:
     return np.sqrt(((x - fit) ** 2).mean(axis=(0, 2)))
 
 
-if __name__ == "__main__":
-    spec = CommandSpec()
+def _self_test(spec: CommandSpec) -> None:
     rng = np.random.default_rng(0)
     n = 20_000
     w, fam = sample_window_commands(n, rng, spec)
+    g = spec.ostrich_yaw_gain
     assert w.shape == (WINDOW_STEPS, n, 3) and fam.shape == (n,)
     assert set(np.unique(fam)) == set(range(len(FAMILIES)))
     assert np.isfinite(w).all()
 
-    # Forward-only except the spin band, whose wheels are exactly opposite.
+    # What ostrich is commanded stays in the box; MPPI's own command therefore does too.
+    ost = compensate(w, g)
+    assert np.allclose(contract(ost, g), w, atol=1e-5)
     forward = fam != SPIN
-    assert w[:, forward, :].min() >= spec.wmin - 1e-6 and w.max() <= spec.wmax + 1e-6
+    for x in (w, ost):
+        assert x[:, forward, :].min() >= spec.wmin - 1e-5 and np.abs(x).max() <= spec.wmax + 1e-5
+    assert np.abs(w[:, fam == SPIN, 1]).max() <= spec.wmax / g + 1e-5
     spin = w[:, fam == SPIN]
     assert np.allclose(spin[..., 0], -spin[..., 1]) and np.abs(spin[..., 1]).min() >= spec.spin_min - 1e-5
     assert np.allclose(spin[..., 1], spin[:1, :, 1]), "a spin is held, not ramped"
@@ -201,5 +231,12 @@ if __name__ == "__main__":
     o = upsample(w[:, :5], dt_to=2.5e-2)
     assert o.shape == (4 * WINDOW_STEPS, 5, 3) and np.array_equal(o[::4], w[:, :5])
 
-    print(f"OK  window {WINDOW_S:.1f} s, families {dict(zip(FAMILIES, np.bincount(fam) / n))}")
-    print(f"    NARROW residual {narrow_rms:.3f} rad/s vs jitter sigma {spec.sigma}")
+    _, wz_mppi = wheels_to_twist(w)
+    print(f"OK  gain {g}: window {WINDOW_S:.1f} s, families {dict(zip(FAMILIES, np.bincount(fam) / n))}")
+    print(f"    NARROW residual {narrow_rms:.3f} rad/s vs jitter sigma {spec.sigma}; "
+          f"max |wz| {np.abs(wz_mppi).max():.2f} rad/s, ostrich's max |wheel| {np.abs(ost).max():.2f}")
+
+
+if __name__ == "__main__":
+    _self_test(CommandSpec())
+    _self_test(CommandSpec(ostrich_yaw_gain=1.15))

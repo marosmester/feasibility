@@ -1,0 +1,141 @@
+# mppi_learning dataset config -- the ONLY input of generate_dataset.py:
+#     python src/feasibility/mppi_learning/generate_dataset.py default
+# (a bare name resolves to this directory; a path works too). Every key is required; see
+# dataset_config.py for the validation and generate_dataset.py's docstring for what a sample is.
+# This file documents every key -- copy it to start a new config.
+#
+# One sample: the robot is settled at a spawn, driven for `warmup_s` at an entry twist, then given ONE
+# 1 s MPPI window (command.WINDOW_STEPS = 10 steps of 0.1 s). Ostrich runs all of it; the twin starts
+# at ostrich's realized state at the window start and runs the window only (design.md section 5).
+#
+# ramp_down needs every ramp plateau >= dataset_config.platform_length (1.97 m at this warm-up: the
+# robot and its warm-up on the plateau); check_maps refuses a dir with shorter ones.
+
+seed: 0                       # RNG seed for map selection and every trial's placement and command
+
+maps:
+  dir: assets/lattice_maps/4  # repo-root-relative or absolute directory written by
+                              # heightmap/create_maps_for_lattice_learning.py; each map's sidecar
+                              # `category` is what the mix's `map:` refers to
+  n_maps: 8                   # maps drawn in total, split across categories by the mix percents
+  trials_per_map: 16          # rows per map, so the dataset has n_maps * trials_per_map rows
+
+trial:                        # what one sample is -- changing these changes the data
+  warmup_s: 0.3               # s of commanded ostrich driving at the entry twist before the window;
+                              # a multiple of MPPI_DT = 0.1 s, >= 0.2. Measured on flat ground from
+                              # rest: straight driving reaches its speed in <= 0.2 s (1.4 m/s
+                              # overshoots to 1.53 at 0.2 s), turning reaches its mean yaw rate in
+                              # ~0.2 s and then never settles -- ostrich's stick-slip swings it
+                              # +-20-100 % per 0.1 s for as long as it turns -- so longer buys nothing.
+                              # With entry.v_max it also sets how far back trials spawn.
+  settle_steps: 15            # ostrich steps dropping onto the terrain at zero command, before the
+                              # warm-up (0.375 s at OSTRICH_DT = 0.025 s)
+  mu: 0.8                     # ground friction for ostrich, the twin and the static settle
+  interact_relief: 0.05       # m, plane-relative terrain relief along the window path that counts
+                              # as meeting terrain (interact_dir != 0)
+  k_turn: 1.0                 # the TWIN's turn resistance, alpha = 1 + k_turn * mu: helhest's
+                              # ICP-truth fit of real drive bags, outdoor alpha ~1.82 -> 1.0 (indoor
+                              # 1.48 -> 0.6, helhest dynamics.K_TURN). This net is for OUTDOORS
+  ostrich_yaw_gain: 1.15      # ostrich is commanded yaw rate x this, warm-up AND window, so it turns
+                              # like the real robot outdoors: on flat ground (mu 0.8, MU_LAT_RATIO
+                              # 0.5) it realizes 0.48 of an ideal yaw rate, the robot 1/1.82 = 0.55,
+                              # so ostrich turns at 0.48 / 0.55 = 0.87 of the robot and is asked for
+                              # 1 / 0.87 = 1.15x the yaw rate (measured: realizes 0.56).
+                              # Ostrich's friction cannot close that gap: MU_LAT_RATIO 0.2-0.5 all
+                              # give 0.48-0.52, only longitudinal mu 1.6 reaches 0.54. The twin
+                              # always gets MPPI's own command; the command box and the entries are
+                              # sampled so the COMPENSATED wheels stay in [wmin, wmax]
+
+command:                      # MPPI's sampling box and priors (command.CommandSpec, design.md)
+  wmin: 0.0                   # rad/s, lowest wheel speed outside the spin family: 0 = no reverse
+  wmax: 4.0                   # rad/s, v_max = wmax * wheel_radius = 1.4 m/s
+  sigma: 0.5                  # rad/s, NARROW family's per-step jitter, independent per wheel
+  sigma_knot: 1.0             # rad/s, NARROW family's knot noise
+  spin_min: 2.0               # rad/s, slowest spin (the real robot will not break loose below it)
+  family_mix:                 # relative weights of MPPI's priors, normalised on use
+    wide: 0.3                 # independent uniform knots per wheel over the whole box
+    straight: 0.2             # wl == wr, uniform knots
+    narrow: 0.3               # a constant nominal plus knot noise and jitter
+    spin: 0.2                 # wl = -wr held for the window, |w| in [spin_min, wmax / ostrich_yaw_gain]
+
+entry:                        # the twist MPPI commanded during the warm-up (ostrich gets it
+                              # compensated by trial.ostrich_yaw_gain, like the window)
+  jump_frac: 0.2              # share of trials entering at an independent twist, like MPPI's window 0
+                              # (WIDE/STRAIGHT knot 0 ignores the measured state). The rest enter at
+                              # their window's own first command, as every later rollout window does
+                              # (a knot is shared by the two windows meeting at it).
+  v_max: 1.4                  # m/s, jump entries: v ~ U(0, v_max), at most the command box's v_max
+  wz_max: 2.0                 # rad/s, jump entries: wz ~ U(-wz_max, wz_max); draws whose ideal wheel
+                              # speeds, compensated, leave [wmin, wmax] are redrawn
+  yaw_ratio: 0.56             # PLACEMENT only: ostrich realizes ~0.56 of MPPI's yaw rate under
+                              # trial.ostrich_yaw_gain 1.15 (flat ground, mu 0.8: arcs 0.51-0.55,
+                              # spins 0.57-0.63), so the nominal origin integrates the warm-up at this
+                              # share of its yaw rate. Re-measure if the gain changes
+
+run:                          # how the dataset is computed -- does not change the trials
+  chunk: 64                   # ostrich worlds per model build; lower it if the GPU runs out of memory
+  maps_per_build: 1           # maps tiled side by side into one ostrich terrain (tiled_terrain.py)
+  device: cuda:0              # warp device for ostrich, the twin and the static settle
+  dry_run: false              # true: print the allocation, sample every allocated map's trials
+                              # (settle on CPU) and, on a CUDA device, run the flat-ground
+                              # twin-vs-ostrich check; nothing written
+
+ostrich_overrides: []         # Hydra overrides applied to ostrich's "helhest" base config
+                              # (ostrich/examples/conf); rendering is forced headless and the
+                              # timestep pinned to OSTRICH_DT regardless
+
+# percent of SAMPLES drawn by `strategy` on maps whose sidecar category is `map`; percents sum to 100.
+# Same strategies and params as lattice_learning (its configs/default.yaml), measured along the
+# window's own path instead of a 0.3 m arc:
+# uniform / targeted   any                                    (none) / interact_frac
+# ramp_up / ramp_down  ramps                                  straight_frac, yaw_jitter_deg, fallback_interact_frac
+# edge                 curbs_and_walls, poles_and_walls       interact_frac, band, facing_frac, down_frac
+# rotate_in_place      curbs_and_walls, poles_and_walls       interact_frac, band, min_clearance -- SPIN
+#                      family only, entered at rest
+mix:
+  - map: ramps
+    strategy: ramp_up         # head-on up a face, heading at mid-window within yaw_jitter_deg
+    percent: 15.0
+    params:
+      straight_frac: 0.75     # share of STRAIGHT windows, the rest NARROW
+      yaw_jitter_deg: 5.0
+      fallback_interact_frac: 0.5
+
+  - map: ramps
+    strategy: ramp_down       # head-on down a face from the plateau (drops included); shares the
+    percent: 10.0             # ramps maps with ramp_up. The start is capped by each face's plateau
+    params:                   # (robot + warm-up must fit), so fast approaches reach the crest early
+      straight_frac: 0.75
+      yaw_jitter_deg: 5.0
+      fallback_interact_frac: 0.5
+
+  - map: curbs_and_walls
+    strategy: edge
+    percent: 25.0
+    params:
+      interact_frac: 0.5
+      band: 1.5               # m; a window reaches 1.4 m, a 0.3 m arc did not
+      facing_frac: 0.7
+      down_frac: 0.5
+
+  - map: poles_and_walls
+    strategy: edge
+    percent: 15.0
+    params:
+      interact_frac: 0.5
+      band: 1.5
+      facing_frac: 0.7
+      down_frac: 0.5
+
+  - map: poles_and_walls
+    strategy: rotate_in_place
+    percent: 10.0
+    params:
+      interact_frac: 0.5      # exact share whose spin sweeps a wheel into the feature
+      band: 0.3               # m beyond the rim's reach from the body origin
+      min_clearance: 0.05     # m, no wheel this close to the feature at the spawn
+
+  - map: rough
+    strategy: uniform         # the negatives: flat and low-amplitude rough ground
+    percent: 25.0
+    params: {}
