@@ -119,8 +119,9 @@ def sample_window_commands(
     v = (1 - frac) * v_knots[0] + frac * v_knots[1]  # [S, N]
     straight = np.stack([v, v], axis=-1)
 
-    # SPIN: wl = -wr, held constant across the window. spin_min floors MPPI's command (the real
-    # robot's breakaway), i.e. spin_min * gain in ostrich's wheel space where this is drawn.
+    # SPIN: wl = -wr, held constant across the window. spin_min floors MPPI's command (MPPI's own
+    # prior uses the real robot's ~2 rad/s breakaway; 0 draws from standstill), i.e. spin_min * gain
+    # in ostrich's wheel space where this is drawn.
     spin_lo = spec.spin_min * spec.ostrich_yaw_gain
     mag = spin_lo + (spec.wmax - spin_lo) * rng.random(n)
     mag = np.where(rng.random(n) < 0.5, -mag, mag)

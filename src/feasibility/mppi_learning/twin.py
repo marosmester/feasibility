@@ -52,6 +52,7 @@ def run_twin(
     device: str = "cuda:0",
     solver: SolverParams | None = None,
     diagnostics: bool = False,
+    every_step: bool = False,
 ) -> np.ndarray | tuple[np.ndarray, np.ndarray, np.ndarray]:
     """`start_pose` [N, 3] (x, y, yaw) at the window start; `wheel_omega` [n_windows *
     WINDOW_STEPS, N, 3] setpoints on the 0.1 s grid; `init_wheel_omega` [N, 3] the realized wheel
@@ -63,7 +64,8 @@ def run_twin(
     qw) -- the layout of ostrich's pose log, so `custom_dataset.pose_to_se3` reads both.
     `diagnostics` also returns the settle's min clearance and max residual over each window,
     [n_windows, N] each -- where the twin itself says its pose is fiction (high-centering, an
-    unconverged settle)."""
+    unconverged settle). `every_step` returns the pose at every step instead, [n_steps + 1, N, 7]
+    with row 0 the start -- the viewer's path; the label needs only the window ends."""
     n_steps, n, _ = wheel_omega.shape
     if n_steps % WINDOW_STEPS:
         raise ValueError(f"{n_steps} steps is not a whole number of windows")
@@ -94,6 +96,8 @@ def run_twin(
     sim.rollout_launch()
 
     end = WINDOW_STEPS * (1 + np.arange(n_steps // WINDOW_STEPS))  # row 0 of the logs is the start
+    if every_step:
+        end = np.arange(n_steps + 1)
     controlled, derived = sim.controlled.numpy()[end], sim.derived.numpy()[end]
     quat = euler_zyx_to_quat_xyzw(controlled[..., 2], derived[..., 1], derived[..., 2])
     pose = np.concatenate([controlled[..., :1], controlled[..., 1:2], derived[..., :1], quat], axis=-1)
@@ -129,6 +133,8 @@ if __name__ == "__main__":
     again, clearance, residual = run_twin(flat, origin, straight, init_wheel_omega=np.stack([np.zeros(3), straight[0, 1]]), device=device, diagnostics=True)
     assert np.array_equal(again, pose) and clearance.shape == residual.shape == (2, 2)
     assert (clearance > 0).all() and (residual < dynamics.robot_params().resid_tol).all(), (clearance, residual)
+    path = run_twin(flat, origin, straight, init_wheel_omega=np.stack([np.zeros(3), straight[0, 1]]), device=device, every_step=True)
+    assert path.shape == (2 * WINDOW_STEPS + 1, 2, 7) and np.array_equal(path[WINDOW_STEPS :: WINDOW_STEPS], pose)
 
     # A spin turns in place, slowed by the turn resistance alpha = 1 + k_turn * mu.
     mu = 0.8

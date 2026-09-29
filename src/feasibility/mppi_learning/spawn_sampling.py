@@ -77,6 +77,7 @@ from feasibility.lattice_learning.spawn_sampling import cell_centers
 from feasibility.lattice_learning.spawn_sampling import contact_plane
 from feasibility.lattice_learning.spawn_sampling import edge_field
 from feasibility.lattice_learning.spawn_sampling import EDGE_FACING_CONE_DEG
+from feasibility.lattice_learning.spawn_sampling import EdgeField
 from feasibility.lattice_learning.spawn_sampling import interaction_dir
 from feasibility.lattice_learning.spawn_sampling import MAX_PROPOSAL_ROUNDS
 from feasibility.lattice_learning.spawn_sampling import ramp_alone
@@ -103,6 +104,7 @@ PATCH_SPEC = PatchSpec(x_max=3.0)  # design.md section 4: 24 x 36 cells at 0.125
 PATH_SUBSTEPS = 2  # path poses per MPPI step (0.05 s): ~7 cm of travel at v_max, ~0.2 m of rim at the fastest spin
 PROPOSAL_BATCH = 2048  # candidates per round; each costs a 21-pose rim sweep, ~8x a lattice arc's
 MID_WINDOW = WINDOW_STEPS * PATH_SUBSTEPS // 2  # index into `window_poses`: t = 0.5 s
+SPIN_SPEED_BINS = 5  # rotate_in_place stratifies spin speed x interaction, see spin_speed_bin
 RAMP_MIN_TRAVEL = 0.3  # m, a face trial's origin is at least this far short of the crest going up
 
 
@@ -306,12 +308,15 @@ def _fill(
     label: Callable[[np.ndarray, np.ndarray], np.ndarray],
     *,
     admit: Callable[[Candidates], np.ndarray] | None = None,
+    substratum: tuple[Callable[[Candidates], np.ndarray], int] | None = None,
     require_endpoint: bool,
 ) -> _Filled:
     """The loop every stratified strategy shares (`lattice_learning`'s `stratified_fill`, over
     window paths). `propose(m)` -> candidates; `admit(cand)` -> [m] bool geometry pre-filter;
     `label(relief, sign)` -> [m] stratum; `need` maps stratum -> trials wanted, and each (short,
-    into) pair of `fallback` moves an unfilled stratum's deficit after MAX_PROPOSAL_ROUNDS."""
+    into) pair of `fallback` moves an unfilled stratum's deficit after MAX_PROPOSAL_ROUNDS.
+    `substratum` (fn, k) crosses the label with fn(cand) in [0, k): the stratum becomes
+    `label * k + fn(cand)`, and `need`/`fallback` are keyed on that."""
     need = dict(need)
     n = sum(need.values())
     got: dict[int, list[tuple]] = {k: [] for k in need}
@@ -331,6 +336,8 @@ def _fill(
                 continue
             relief, sign = path_relief_signed(ctx.terrain, cand.origin, window_poses(cand.origin, cand.omega))
             labels = label(relief, sign)
+            if substratum is not None:
+                labels = labels * substratum[1] + substratum[0](cand)
             n_proposed += len(cand)
             n_interacting += int((relief > ctx.interact_relief).sum())
 
@@ -429,25 +436,69 @@ def sample_trials(
     )
 
 
+def edge_cells_in_reach(ctx: TrialContext, cell_reach: float, field: EdgeField | None = None) -> np.ndarray:
+    """Flat indices of the cells inside `sampling_bounds` within `cell_reach` of a height edge --
+    where `edge`/`rotate_in_place` origins are drawn. Empty when every feature lies outside."""
+    field = edge_field(ctx.terrain) if field is None else field
+    x_lo, x_hi, y_lo, y_hi = sampling_bounds(ctx.terrain, ctx.spec, ctx.max_warmup_distance)
+    CX, CY = cell_centers(ctx.terrain)
+    return np.flatnonzero((field.dist <= cell_reach) & (CX >= x_lo) & (CX <= x_hi) & (CY >= y_lo) & (CY <= y_hi))
+
+
+def rotate_cell_reach(ctx: TrialContext, band: float) -> float:
+    """m, `rotate_in_place`'s `cell_reach`: the farthest a wheel rim reaches from the body origin,
+    plus `band`."""
+    return float(np.hypot(WHEEL_CONTACTS_LOCAL[:, 0], WHEEL_CONTACTS_LOCAL[:, 1]).max() + ctx.robot.wheel_radius) + band
+
+
+def spin_speed_bin(command: CommandSpec, omega: np.ndarray, k: int) -> np.ndarray:
+    """[m] which of `k` equal-width bins of the SPIN prior's |wheel speed| (MPPI's command, over
+    [spin_min, wmax / ostrich_yaw_gain]) each window `omega` [m, WINDOW_STEPS, 3] falls in."""
+    lo, hi = command.spin_min, command.wmax / command.ostrich_yaw_gain
+    frac = (np.abs(omega[:, 0, 1].astype(np.float64)) - lo) / (hi - lo)
+    return np.clip((frac * k).astype(int), 0, k - 1)
+
+
+def _balanced_need(n: int, n_int: int | None, k: int, rng: np.random.Generator) -> tuple[dict[int, int], list]:
+    """`need`/`fallback` for `_fill` over (interacting, speed bin) strata keyed `label * k + bin`:
+    the `n` rows spread evenly over the `k` bins, exactly `n_int` of them interacting, dealt at
+    random so neither the remainders nor the interacting rows favour a bin. A bin that cannot fill
+    its interacting rows moves them into ITS OWN non-interacting ones, so the speed marginal stays
+    uniform (a spin too slow to reach anything in one window does not interact, and is recorded
+    in `shortfall`). `n_int` None: bins only, every label 0."""
+    bins = rng.permutation(rng.permutation(k)[np.arange(n) % k])  # the n % k leftovers go to random bins
+    inter = rng.permutation(np.arange(n) < (n_int or 0)).astype(int)
+    keys, counts = np.unique(inter * k + bins, return_counts=True)
+    need = {int(key): int(c) for key, c in zip(keys, counts)}
+    fallback = [(k + b, b) for b in range(k) if k + b in need] if n_int is not None else []
+    for _, into in fallback:
+        need.setdefault(into, 0)
+    return need, fallback
+
+
 def _sample_near_edges(
     ctx: TrialContext, n: int, rng: np.random.Generator, *, strategy: str, interact_frac: float | None,
     cell_reach: float, facing_frac: float, down_frac: float | None, command: CommandSpec,
-    at_rest: bool, min_clearance: float | None, require_endpoint: bool,
+    at_rest: bool, min_clearance: float | None, require_endpoint: bool, speed_bins: int = 1,
 ) -> WindowBatch:
     """`edge` and `rotate_in_place`: origins on cells within `cell_reach` of a height edge (found
     from the heightmap alone), heading at the nearest edge +- EDGE_FACING_CONE_DEG with
     probability `facing_frac`. `down_frac` None stratifies binary (interacting or not); a float
     splits the interacting share into driving-down and climbing-up, as `lattice_learning`'s `edge`.
     `min_clearance` rejects candidates whose wheels come within it of the terrain above the contact
-    plane anywhere in the warm-up, so the feature is met, if at all, in the window."""
+    plane anywhere in the warm-up, so the feature is met, if at all, in the window. `speed_bins` > 1
+    (SPIN-only commands, `down_frac` None) also stratifies the spin speed, `_balanced_need`."""
     _check_frac("interact_frac", interact_frac, optional=True)
+    if speed_bins > 1 and (down_frac is not None or command.mix[:3] != (0.0, 0.0, 0.0)):
+        raise ValueError("speed_bins > 1 needs SPIN-only commands and down_frac None")
     field = edge_field(ctx.terrain)
-    x_lo, x_hi, y_lo, y_hi = sampling_bounds(ctx.terrain, ctx.spec, ctx.max_warmup_distance)
     CX, CY = cell_centers(ctx.terrain)
-    cells = np.flatnonzero((field.dist <= cell_reach) & (CX >= x_lo) & (CX <= x_hi) & (CY >= y_lo) & (CY <= y_hi))
+    cells = edge_cells_in_reach(ctx, cell_reach, field)
     if len(cells) == 0:
         if strategy == "rotate_in_place":
-            raise ValueError("no map cell lies within reach of a height edge for sample_rotate_in_place_trials")
+            raise ValueError("no map cell lies within reach of a height edge for sample_rotate_in_place_trials "
+                             "(features outside sampling_bounds' square -- regenerate the maps with "
+                             "create_maps_for_lattice_learning.py --center-limit 2.38)")
         rest = sample_trials(ctx, n, rng, interact_frac=interact_frac, require_endpoint=require_endpoint)
         return dataclasses.replace(rest, shortfall=n, strategy=np.full(n, strategy))
 
@@ -469,7 +520,12 @@ def _sample_near_edges(
         clear = rim_penetration(ctx.terrain, cand.origin, warmup_poses(ctx, cand), margin=min_clearance)
         return clear <= TOUCH_TOL
 
-    if interact_frac is None:
+    substratum = None
+    if speed_bins > 1:
+        n_int = None if interact_frac is None else round(n * interact_frac)
+        need, fallback = _balanced_need(n, n_int, speed_bins, rng)
+        substratum = (lambda cand: spin_speed_bin(command, cand.omega, speed_bins), speed_bins)
+    elif interact_frac is None:
         need, fallback = {0: n}, []
     elif down_frac is None:
         n_int = round(n * interact_frac)
@@ -488,7 +544,7 @@ def _sample_near_edges(
 
     filled = _fill(
         ctx, need, fallback, propose, label, require_endpoint=require_endpoint,
-        admit=admit if min_clearance is not None else None,
+        admit=admit if min_clearance is not None else None, substratum=substratum,
     )
     return _to_batch(ctx, filled, rng, strategy=strategy, targeted=interact_frac is not None)
 
@@ -516,14 +572,19 @@ def sample_rotate_in_place_trials(
     """`n` spin windows (`command.SPIN` family only, entered at rest) placed so a wheel can sweep into
     a pole or wall: origins within `band` of the farthest a wheel rim reaches from the body origin
     of a height edge. No wheel comes within `min_clearance` of the terrain above the contact plane
-    at the spawn, and exactly `round(n * interact_frac)` sweep a wheel into it during the window."""
+    at the spawn, and exactly `round(n * interact_frac)` sweep a wheel into it during the window.
+    The spin speed is stratified too (SPIN_SPEED_BINS equal bins, interacting rows dealt across them
+    at random), or
+    the interacting half would fill with fast spins -- a slow one rarely reaches anything -- and
+    speed would stand in for contact in the data; bins a slow spin cannot interact in give up their
+    interacting rows to their own non-interacting ones (`shortfall`)."""
     if min_clearance < 0.0 or band <= 0.0:
         raise ValueError(f"need min_clearance >= 0 and band > 0, got {min_clearance}, {band}")
-    rim_reach = float(np.hypot(WHEEL_CONTACTS_LOCAL[:, 0], WHEEL_CONTACTS_LOCAL[:, 1]).max() + ctx.robot.wheel_radius)
     return _sample_near_edges(
-        ctx, n, rng, strategy="rotate_in_place", interact_frac=interact_frac, cell_reach=rim_reach + band,
+        ctx, n, rng, strategy="rotate_in_place", interact_frac=interact_frac, cell_reach=rotate_cell_reach(ctx, band),
         facing_frac=0.0, down_frac=None, command=dataclasses.replace(ctx.command, mix=(0.0, 0.0, 0.0, 1.0)),
         at_rest=True, min_clearance=min_clearance, require_endpoint=require_endpoint,
+        speed_bins=SPIN_SPEED_BINS,
     )
 
 
@@ -774,6 +835,20 @@ if __name__ == "__main__":
     turned = np.abs(np.degrees(wheels_to_twist(rb.omega)[1].mean(axis=1) * WINDOW_S))
     print(f"rotate_in_place: 100 spins ({turned.min():.0f}-{turned.max():.0f} deg), 50 sweep a wheel in "
           f"(natural {rb.proposal_interact_rate:.1%}), {time.perf_counter() - t0:.1f}s")
+
+    # Spins from standstill: the speed marginal stays exactly even over the bins even where a slow
+    # spin cannot reach the feature, and speed does not stand in for contact.
+    slow = dataclasses.replace(ctx, command=dataclasses.replace(ctx.command, spin_min=0.0))
+    t0 = time.perf_counter()
+    sb = sample_rotate_in_place_trials(slow, 200, rng, interact_frac=0.5, band=0.3, min_clearance=0.05)
+    k = spin_speed_bin(slow.command, sb.omega, SPIN_SPEED_BINS)
+    per_bin = np.bincount(k, minlength=SPIN_SPEED_BINS)
+    assert (per_bin == 200 // SPIN_SPEED_BINS).all(), per_bin
+    inter_bin = np.bincount(k, weights=sb.interact_dir != 0, minlength=SPIN_SPEED_BINS) / per_bin
+    assert (sb.interact_dir != 0).sum() == 100 - sb.shortfall
+    assert inter_bin[1:].min() > 0.25 and inter_bin.max() < 0.75, inter_bin
+    print(f"rotate_in_place from 0: {per_bin.tolist()} per speed bin, interacting "
+          f"{np.round(inter_bin, 2).tolist()}, shortfall {sb.shortfall}, {time.perf_counter() - t0:.1f}s")
 
     # Ramps: head-on along a face at mid-window, contacts on that face's own surface, no shortfall.
     ramps = [

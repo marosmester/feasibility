@@ -278,7 +278,14 @@ class ArcDivergenceNet(nn.Module):
     `target_transform` is a plain attribute, not a buffer: it is fitted data, not a learned
     parameter, so it stays out of `state_dict()` and must be saved alongside a checkpoint (and
     re-attached on load) for `predict()` to work -- same contract as `learning/model.py`'s
-    `PoseErrorMLP` and `grid_learning_2/model.py`'s `GridDivergenceNet`."""
+    `PoseErrorMLP` and `grid_learning_2/model.py`'s `GridDivergenceNet`.
+
+    The command is looked up through `COMMAND_COLUMNS` / `N_CMD_FEATURES` / `encode_command` on the
+    CLASS, so a subclass with another command encoding (`mppi_learning.model.WindowDivergenceNet`)
+    overrides those three and inherits everything else; here they are the module's own."""
+
+    COMMAND_COLUMNS: dict[str, tuple[str, ...]] = COMMAND_COLUMNS
+    N_CMD_FEATURES: dict[str, int] = N_CMD_FEATURES
 
     def __init__(
         self,
@@ -297,8 +304,8 @@ class ArcDivergenceNet(nn.Module):
         super().__init__()
         if head_fusion not in HEAD_FUSIONS:
             raise ValueError(f"head_fusion must be one of {HEAD_FUSIONS}, got {head_fusion!r}")
-        if command_mode not in COMMAND_MODES:
-            raise ValueError(f"command_mode must be one of {COMMAND_MODES}, got {command_mode!r}")
+        if command_mode not in self.COMMAND_COLUMNS:
+            raise ValueError(f"command_mode must be one of {tuple(self.COMMAND_COLUMNS)}, got {command_mode!r}")
         if label_mode not in LABEL_MODES:
             raise ValueError(f"label_mode must be one of {LABEL_MODES}, got {label_mode!r}")
         spec = patch_spec or PatchSpec()
@@ -334,7 +341,7 @@ class ArcDivergenceNet(nn.Module):
         self.geometry = nn.Conv2d(squeeze_channels, geometry_channels, kernel_size=(geom_h, geom_w))
 
         self.command_encoder = nn.Sequential(
-            nn.Linear(N_CMD_FEATURES[command_mode], embed_dim), nn.SiLU(),
+            nn.Linear(self.N_CMD_FEATURES[command_mode], embed_dim), nn.SiLU(),
             nn.Linear(embed_dim, embed_dim),
         )
 
@@ -385,9 +392,13 @@ class ArcDivergenceNet(nn.Module):
             relief = relief.unsqueeze(1)
         return self.terrain_code(relief)
 
+    def encode_command(self, command: torch.Tensor) -> torch.Tensor:
+        """[B, C] command -> [B, N_CMD_FEATURES[command_mode]] encoder input."""
+        return command_features(command, self.command_mode)
+
     def _head(self, c: torch.Tensor, command: torch.Tensor) -> torch.Tensor:
         """[B, geometry_channels] terrain code + [B, C] command -> [B, K] in model space."""
-        e = self.command_encoder(command_features(command, self.command_mode))  # [B, embed_dim]
+        e = self.command_encoder(self.encode_command(command))  # [B, embed_dim]
         if self.head_fusion == "film":
             gamma, beta = self.film(e).chunk(2, dim=-1)
             h = c * (1.0 + gamma) + beta  # `1 + gamma`: identity modulation at init
@@ -404,7 +415,7 @@ class ArcDivergenceNet(nn.Module):
         collapses to a single 1x1 code per row."""
         if patch.ndim != 4 or patch.shape[1] != N_CHANNELS:
             raise ValueError(f"patch must be [B, {N_CHANNELS}, H, W], got {tuple(patch.shape)}")
-        expected = (patch.shape[0], len(COMMAND_COLUMNS[self.command_mode]))
+        expected = (patch.shape[0], len(self.COMMAND_COLUMNS[self.command_mode]))
         if tuple(command.shape) != expected:
             raise ValueError(
                 f"command_mode={self.command_mode!r} expects command {expected}, got "

@@ -46,6 +46,22 @@ def grid_axes(extent: float, cell: float) -> np.ndarray:
     return -extent / 2.0 + (np.arange(n) + 0.5) * cell
 
 
+def feature_center_limit(limit: float | None, extent: float) -> float:
+    """m, the |cx|, |cy| bound curbs/walls and poles/walls draw feature centers inside: `limit`, or
+    extent/2 - PLACEMENT_MARGIN when None. A tighter `limit` pulls features towards the middle,
+    for a consumer whose spawn square is smaller than lattice_learning's -- a feature whose center
+    lies inside that square has an edge cell inside it too (every kind's edge passes within half
+    its shortest side, <= 2 m, of its center, and every square used here is wider than 4 m)."""
+    default = extent / 2.0 - PLACEMENT_MARGIN
+    if default <= 0.0:
+        raise ValueError(f"extent {extent} m leaves no room inside the {PLACEMENT_MARGIN} m margin")
+    if limit is None:
+        return default
+    if not 0.0 < limit <= default:
+        raise ValueError(f"center_limit {limit} m must be in (0, {default:.2f}] for a {extent} m map")
+    return float(limit)
+
+
 def rect_inside_grid(rect: Rect, height: float, incline_deg: float, extent: float) -> bool:
     """True when the rectangle's footprint, including its sloped skirt, lies inside the grid."""
     w, d, cx, cy, yaw = rect

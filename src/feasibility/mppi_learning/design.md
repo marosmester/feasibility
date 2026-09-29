@@ -52,6 +52,16 @@ Training commands are drawn **from MPPI's own sampler**: spline knots + jitter, 
 forward motion (`v ≥ 0`) and pivots (`wl = −wr`, magnitudes up to the spin prior's). The data
 then covers exactly what the net will be asked about at control time.
 
+One deliberate exception: the dataset's spins start at `command.spin_min` 0, below the 2 rad/s
+MPPI floors its spin prior at (the real robot does not break loose under it). The data is a
+superset of what MPPI samples, so the net does not have to extrapolate below the floor if MPPI's
+`spin_min` is ever lowered. Ostrich has no breakaway either: on flat, non-interacting spins of the
+first spin_min-0 dataset it realized a median 0.52-0.58 of MPPI's commanded yaw in every speed band
+down to |wz| < 0.25 rad/s, which is the same ratio as above 2 rad/s and close to the twin's `1/α`. So
+a slow spin here is NOT the real robot's stall, and the net learns ostrich's version of it. `entry.yaw_ratio` was measured
+on spins ≥ 2 rad/s; it only places the spawn, and `rotate_in_place` enters at rest, so a slow spin
+changes where an `edge` trial's origin lands by at most its warm-up's yaw error.
+
 ## 3. The window length
 
 T = 1.0 s, chosen mainly so that **window boundaries fall on MPPI's knots**. The command is then
@@ -239,19 +249,29 @@ A 1 s window at up to 1.4 m/s travels ~5× further, along a curve that is not a 
 5. **`generate_dataset.py`**: same skeleton as `lattice_learning`'s (config → allocate → tiled
    ostrich builds → h5 with provenance). Per row it stores the patch, the 4-number command, entry
    twist, twin and ostrich end poses. `dry_run` first on one map.
-6. **`custom_dataset.py`**: a `Dataset` over that h5 (4 command columns, labels from twin vs
-   ostrich via the imported `se3_errors` / `rpy_errors`), map-level split.
-7. **`model.py`**: a thin subclass of `ArcDivergenceNet` that swaps the command features for the
-   4-number encoding (`(v_mean, v_slope)` scaled by `v_max`, `wz` split into value/|value|/sign
-   as today). Mirror: `wz_mean`, `wz_slope` → negated. If a subclass is awkward because
-   `command_features` / `COMMAND_COLUMNS` are module-level, add a `"mean_slope"` mode to
-   `lattice_learning/model.py` instead (additive).
-8. **`train.py`**: `lattice_learning`'s loop, importing its checkpoint/metric helpers where they
-   are command-agnostic. It drops the kappa baselines, logs to W&B, and writes to
+6. **`custom_dataset.py`** (done): `WindowDivergenceDataset` over one or more h5 files, with the
+   4 command columns and labels from twin vs ostrich via the imported `se3_errors` /
+   `rpy_errors`. Files whose label-defining attrs differ are refused. The split is by map, with
+   maps identified by path across files. `drop_endpoint_infeasible` and `drop_twin_flagged` are
+   opt-in filters.
+7. **`model.py`** (done): `WindowDivergenceNet`, a subclass of `ArcDivergenceNet` through class
+   hooks added to lattice without changing its numbers. It turns the 4-number command into 7 features:
+   `(v_mean, v_slope)` / `v_max`; `wz_mean` as value / |value| / sign; `wz_slope`; and
+   `wz_slope · sign(wz_mean)`, which says whether the turn tightens or eases and is
+   mirror-invariant. The scales are fixed by the wheel box, not fitted. Mirror: `wz_mean` and
+   `wz_slope` are negated.
+8. **`train.py`** (done): `lattice_learning`'s loop, importing its command-agnostic helpers
+   (losses, metrics, blur, scheduler, `evaluate`, the verdict line). The kappa baselines are
+   replaced by a per-family mean and `family + relief` (least squares on the stored path relief
+   with a per-family intercept). The report scores every baseline on the same val subsets:
+   interaction, family, continued / jump / at-rest entry (for §7's fifth-input question), flat
+   patches, and the rows the two filters would drop. The checkpoint stores the dataset's
+   `LABEL_ATTRS` and the command scales, which load asserts. Logs to W&B and writes to
    `outputs/checkpoints/`.
-9. **`test_nn.py` / a replay viewer**: held-out evaluation, then a GL replay of twin vs ostrich
-   over one window (adapted from `gl_replay_arc.py`, which imports `replay/`: allowed, since
-   `replay` is not in the forbidden list).
+9. **`test_nn.py` / a replay viewer** (done): `test_nn.py` re-scores a checkpoint with
+   `lattice_learning/test_nn.py`'s scoring and figure. It rebuilds the checkpoint's own files,
+   row filters and held-out-MAP split, and warns when the data's `LABEL_ATTRS` differ from the
+   checkpoint's. The viewer is `gl_dataset_browser.py`.
 10. **MPPI hook** (§6): first the torch-free buffer + cost term in helhest_stack's `MppiGpu`,
     then `mppi_learning/mppi_cost.py`, which fills it from the net (eager torch first, TensorRT
     later, §7).

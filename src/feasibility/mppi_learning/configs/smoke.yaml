@@ -43,7 +43,9 @@ command:                      # MPPI's sampling box and priors (command.CommandS
   wmax: 4.0                   # rad/s, v_max = wmax * wheel_radius = 1.4 m/s
   sigma: 0.5                  # rad/s, NARROW family's per-step jitter, independent per wheel
   sigma_knot: 1.0             # rad/s, NARROW family's knot noise
-  spin_min: 2.0               # rad/s, slowest spin (the real robot will not break loose below it)
+  spin_min: 0.0               # rad/s, slowest spin. 0 = spins sampled from standstill, below the
+                              # real robot's ~2 rad/s breakaway that MPPI's own prior floors at, so
+                              # the net sees ostrich failing to break loose too (design.md section 2)
   family_mix:                 # relative weights of MPPI's priors, normalised on use
     wide: 0.3                 # independent uniform knots per wheel over the whole box
     straight: 0.2             # wl == wr, uniform knots

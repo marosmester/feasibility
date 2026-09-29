@@ -29,6 +29,7 @@ from helhest.engine import RobotParams
 
 from feasibility.heightmap import HeightMapReader
 from feasibility.lattice_learning.dataset_config import allocate
+from feasibility.lattice_learning.dataset_config import Allocation
 from feasibility.lattice_learning.dataset_config import build_section
 from feasibility.lattice_learning.dataset_config import check_maps
 from feasibility.lattice_learning.dataset_config import ConfigError
@@ -49,8 +50,10 @@ from feasibility.mppi_learning.command import CommandSpec
 from feasibility.mppi_learning.command import FAMILIES
 from feasibility.mppi_learning.command import MPPI_DT
 from feasibility.mppi_learning.spawn_sampling import concat_batches
+from feasibility.mppi_learning.spawn_sampling import edge_cells_in_reach
 from feasibility.mppi_learning.spawn_sampling import EntrySpec
 from feasibility.mppi_learning.spawn_sampling import required_platform_length
+from feasibility.mppi_learning.spawn_sampling import rotate_cell_reach
 from feasibility.mppi_learning.spawn_sampling import sample_edge_trials
 from feasibility.mppi_learning.spawn_sampling import sample_ramp_down_trials
 from feasibility.mppi_learning.spawn_sampling import sample_ramp_up_trials
@@ -114,7 +117,8 @@ class CommandBox:
         _check(self.wmax > self.wmin, f"wmax must be > wmin, got {self.wmax} <= {self.wmin}")
         _check(self.sigma >= 0.0, f"sigma must be >= 0, got {self.sigma}")
         _check(self.sigma_knot >= 0.0, f"sigma_knot must be >= 0, got {self.sigma_knot}")
-        _check(0.0 < self.spin_min <= self.wmax, f"spin_min must be in (0, wmax], got {self.spin_min}")
+        # 0 draws spins from standstill, below the real robot's ~2 rad/s breakaway (design.md section 2)
+        _check(0.0 <= self.spin_min <= self.wmax, f"spin_min must be in [0, wmax], got {self.spin_min}")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -331,6 +335,28 @@ def check_mppi_maps(cfg: DatasetConfig) -> dict[str, list[pathlib.Path]]:
     return check_maps(cfg, lead=float("nan"), platform_length=platform_length(cfg))
 
 
+def check_edge_reach(allocation: Allocation) -> None:
+    """Refuse, before anything is simulated, an allocation holding a `rotate_in_place` map whose
+    features all lie outside `sampling_bounds`' square (that sampler raises on it; `edge` falls back
+    to uniform instead). Such a dir was generated without `--center-limit`; costs one distance
+    transform per affected map."""
+    cfg = allocation.cfg
+    bad = []
+    for m in allocation.maps:
+        entries = [cfg.mix[e] for e in m.counts if cfg.mix[e].strategy == "rotate_in_place"]
+        if not entries:
+            continue
+        ctx = trial_context(cfg, HeightMapReader.load(m.path), "cpu")
+        if any(len(edge_cells_in_reach(ctx, rotate_cell_reach(ctx, e.params.band))) == 0 for e in entries):
+            bad.append(m.path.name)
+    if bad:
+        raise ConfigError(
+            f"{cfg.path or cfg.name}: {len(bad)} rotate_in_place map(s) in {cfg.maps.path} have no height edge "
+            f"within reach of the origin square ({', '.join(bad[:5])}{', ...' if len(bad) > 5 else ''}) -- "
+            f"regenerate the dir with create_maps_for_lattice_learning.py --center-limit 2.38"
+        )
+
+
 def sample_map_mix(
     terrain: HeightMapReader,
     meta: dict,
@@ -376,8 +402,9 @@ if __name__ == "__main__":
 
     base = yaml.safe_load((CONFIGS_DIR / "default.yaml").read_text())
     default = parse_config(base, "default")
-    assert default.command == CommandSpec(ostrich_yaw_gain=default.trial.ostrich_yaw_gain), \
-        "default.yaml's command block is MPPI's box (design.md)"
+    # MPPI's box, except spins drawn from standstill (design.md section 2)
+    assert default.command == CommandSpec(ostrich_yaw_gain=default.trial.ostrich_yaw_gain, spin_min=0.0), \
+        "default.yaml's command block is MPPI's box, spin_min 0 aside (design.md)"
     edge = next(i for i, e in enumerate(base["mix"]) if e["strategy"] == "edge")
 
     def mutate(fn: Callable[[dict], None]) -> dict:
@@ -409,7 +436,7 @@ if __name__ == "__main__":
     raises(mutate(lambda d: d["mix"].append(copy.deepcopy(d["mix"][0]))), "duplicate entry")
     print("[validate] 22 broken variants all rejected with the offending key named")
 
-    pool = {c: [pathlib.Path(f"/nonexistent/{c}_i{i:04d}") for i in range(20)] for c in default.categories}
+    pool = {c: [pathlib.Path(f"/nonexistent/{c}_i{i:04d}") for i in range(default.maps.n_maps)] for c in default.categories}
     alloc = allocate(default, pool, np.random.default_rng(0))
     assert len(alloc.maps) == default.maps.n_maps
     assert all(sum(m.counts.values()) == default.maps.trials_per_map for m in alloc.maps)
