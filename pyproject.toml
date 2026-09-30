@@ -33,6 +33,14 @@ dependencies = [
   "h5py>=3.14",
   # src/feasibility/learning/train.py logs runs to Weights & Biases.
   "wandb>=0.18",
+  # src/feasibility/nn_mppi exports the mppi_learning net to ONNX (the TensorRT route).
+  # onnxscript is what torch.onnx.export's default dynamo exporter needs; onnxruntime
+  # (CPU) is only the parity check of the exported graph against torch. TensorRT itself
+  # is NOT here: TRT 10 needs sm_75+, so it cannot run on the GTX 1050 dev laptop, and
+  # the robot's Jetson Orin gets it from JetPack, not from these x86 wheels.
+  "onnx>=1.18",
+  "onnxscript>=0.3",
+  "onnxruntime>=1.22",
 ]
 
 [tool.uv]
