@@ -36,6 +36,7 @@ import argparse
 import copy
 import pathlib
 import time
+from collections.abc import Callable
 
 import torch
 from torch import nn
@@ -136,23 +137,29 @@ def self_test(net: WindowDivergenceNet, device: torch.device) -> WindowDivergenc
     return fast
 
 
-def _time_ms(net: WindowDivergenceNet, patch: torch.Tensor, reps: int = 10) -> float:
-    with torch.no_grad():
-        for _ in range(3):
-            net.terrain_code(patch)
+def _time_ms(fn: Callable[[], object], trials: int = 5, reps: int = 5) -> float:
+    """The fastest of `trials` means over `reps` calls, after 3 warm-up calls: this laptop GPU drops
+    its clock in bursts (software power cap), and one burst inflates every number it overlaps ~10x."""
+    for _ in range(3):
+        fn()
+    best = float("inf")
+    for _ in range(trials):
         torch.cuda.synchronize()
         start = time.perf_counter()
         for _ in range(reps):
-            net.terrain_code(patch)
+            fn()
         torch.cuda.synchronize()
-    return (time.perf_counter() - start) / reps * 1e3
+        best = min(best, (time.perf_counter() - start) / reps * 1e3)
+    return best
 
 
+@torch.no_grad()
 def bench(net: WindowDivergenceNet, fast: WindowDivergenceNet, batches: list[int], profile: bool) -> None:
     spec = net.patch_spec
     for n in batches:
         patch = torch.randn(n, 1, spec.ny, spec.nx, device="cuda") * 0.3
-        before, after = _time_ms(net, patch), _time_ms(fast, patch)
+        before = _time_ms(lambda: net.terrain_code(patch), trials=1, reps=10)
+        after = _time_ms(lambda: fast.terrain_code(patch), trials=1, reps=10)
         print(f"[bench] terrain_code, {n} patches: ChannelLayerNorm {before:.1f} ms, "
               f"NCHWChannelLayerNorm {after:.1f} ms ({before / after:.2f}x)")
     if not profile:
@@ -162,7 +169,7 @@ def bench(net: WindowDivergenceNet, fast: WindowDivergenceNet, batches: list[int
 
     patch = torch.randn(batches[0], 1, spec.ny, spec.nx, device="cuda") * 0.3
     reps = 5
-    with torch.no_grad(), torch_profile(activities=[ProfilerActivity.CUDA]) as prof:
+    with torch_profile(activities=[ProfilerActivity.CUDA]) as prof:
         for _ in range(reps):
             fast.terrain_code(patch)
         torch.cuda.synchronize()

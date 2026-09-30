@@ -44,16 +44,13 @@ from feasibility.heightmap import HeightMapReader
 from feasibility.mppi_learning.gl_dataset_browser import ground_polyline
 from feasibility.mppi_learning.gl_dataset_browser import NEXT_KEYS
 from feasibility.mppi_learning.gl_dataset_browser import PREV_KEYS
+from feasibility.nn_mppi.closed_loop import arm_colors
 from feasibility.replay.gl_replay import integrate_wheel_angle
 from feasibility.replay.gl_replay import interp_pose
 from feasibility.replay.gl_replay import interp_series
 from feasibility.replay.gl_replay import JOINTS_PER_ROBOT
 
 RESTART_KEY = pyglet.window.key.R
-# matplotlib's tab10, which closed_loop.plot colours the arms with, in its arm order
-TAB10 = ((0.122, 0.467, 0.706), (1.0, 0.498, 0.055), (0.173, 0.627, 0.173), (0.839, 0.153, 0.157),
-         (0.580, 0.404, 0.741), (0.549, 0.337, 0.294), (0.890, 0.467, 0.761), (0.498, 0.498, 0.498),
-         (0.737, 0.741, 0.133), (0.090, 0.745, 0.812))
 GOAL_COLOR = (1.0, 0.1, 0.1)
 # camera behind the start, looking along start -> goal from above
 CAMERA_BACK = 4.0  # [m]
@@ -128,7 +125,6 @@ class Scene:
     joint_q: np.ndarray
     joint_q_wp: wp.array
     joint_qd_wp: wp.array
-    lines: dict[str, tuple[wp.array, wp.array, tuple[float, float, float]]]
 
 
 def polyline_segments(points: np.ndarray, device: wp.context.Device) -> tuple[wp.array, wp.array]:
@@ -150,22 +146,22 @@ def build_scene(viewer: newton.viewer.ViewerGL, run: Run, mesh: newton.Mesh, wor
     for (first, last), w in zip(shapes, worlds):
         shape_color[first:last] = colors[run.arm[w]]
     model.shape_color.assign(shape_color)
-    viewer.set_model(model)
+    viewer.set_model(model)  # also drops the previous view's lines
 
-    lines = {}
+    # the paths and the goal are static: ViewerGL keeps logged lines and redraws them every frame
     for w in worlds:
         xy = run.pose[run.first_row : run.end_row[w] + 1, w, :2]
         if len(xy) >= 2:
-            lines[f"/path_{w}"] = (*polyline_segments(ground_polyline(run.terrain, xy[:, 0], xy[:, 1]), model.device),
-                                   colors[run.arm[w]])
+            viewer.log_lines(f"/path_{w}", *polyline_segments(ground_polyline(run.terrain, xy[:, 0], xy[:, 1]), model.device),
+                             colors=colors[run.arm[w]])
     angle = np.linspace(0.0, 2.0 * np.pi, 33)
     circle = ground_polyline(run.terrain, run.goal[0] + run.reach_radius * np.cos(angle),
                              run.goal[1] + run.reach_radius * np.sin(angle))
-    lines["/goal"] = (*polyline_segments(circle, model.device), GOAL_COLOR)
+    viewer.log_lines("/goal", *polyline_segments(circle, model.device), colors=GOAL_COLOR)
     joint_q = model.joint_q.numpy().copy()
     return Scene(worlds=worlds, model=model, state=model.state(), q_start=model.joint_q_start.numpy(), joint_q=joint_q,
                  joint_q_wp=wp.array(joint_q, dtype=wp.float32, device=model.device),
-                 joint_qd_wp=wp.zeros_like(model.joint_qd), lines=lines)
+                 joint_qd_wp=wp.zeros_like(model.joint_qd))
 
 
 def main() -> None:
@@ -180,7 +176,7 @@ def main() -> None:
 
     run = load_run(args.file)
     arms = list(dict.fromkeys(run.arm))
-    colors = {name: TAB10[i % len(TAB10)] for i, name in enumerate(arms)}
+    colors = dict(zip(arms, arm_colors(arms)))
     if args.arms is not None:
         unknown = sorted(set(args.arms) - set(arms))
         if unknown:
@@ -250,8 +246,6 @@ def main() -> None:
         newton.eval_fk(scene.model, scene.joint_q_wp, scene.joint_qd_wp, scene.state)
         viewer.begin_frame(sim_t)
         viewer.log_state(scene.state)
-        for name, (starts, ends, color) in scene.lines.items():
-            viewer.log_lines(name, starts, ends, colors=color)
         viewer.end_frame()
         wp.synchronize()
 

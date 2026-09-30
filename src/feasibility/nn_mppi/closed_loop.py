@@ -28,7 +28,9 @@ arm differ too.
 
 Timing: every replan is timed on the wall clock (`WindowCost.update` + `replan` + reading the plan
 back, which waits for the GPU), and every planner profiles its refine stages with CUDA events (the
-hook runs inside "cost"). After the run, a table per arm gives the median and 90th percentile
+hook runs inside "cost"). Reading those events syncs after every refine, which serializes the
+host's launches with the GPU and adds a few percent to a vanilla replan's ~3 ms, and nothing
+measurable to the ~100 ms of a 3-window one. After the run, a table per arm gives the median and 90th percentile
 replan time and the mean ms per stage. Worlds replan one after another, so each replan has the GPU
 to itself, as on the robot, but ostrich steps between frames and warms the GPU.
 
@@ -226,7 +228,7 @@ class Arm:
     weights: dict[str, float] | None  # None = vanilla
     baseline: str = "none"  # WindowCost's baseline
     windows: int = 1  # WindowCost's n_windows
-    nn_refines: int | None = None  # charge the cost in the first nn_refines refines only; None = every refine
+    nn_refines: int = 0  # charge the cost in the first nn_refines refines only (nn arms)
 
 
 def pitch_roll(q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -260,6 +262,9 @@ def run(args: argparse.Namespace) -> None:
     attrs = ckpt["label_attrs"]
     k_turn, mu, yaw_gain = float(attrs["k_turn"]), float(attrs["mu"]), float(attrs["ostrich_yaw_gain"])
 
+    nn_refines_list = args.nn_refines or [args.n_refine]
+    if not all(1 <= k <= args.n_refine for k in nn_refines_list):
+        raise SystemExit(f"--nn-refines {nn_refines_list}: each must be in [1, --n-refine {args.n_refine}]")
     arms = [] if args.no_vanilla else [Arm("vanilla", None)]
     for flag, prefix, baseline, entries in (("--nn-weights", "nn", "none", args.nn_weights),
                                             ("--nn-flat-weights", "nnflat", "flat", args.nn_flat_weights)):
@@ -268,13 +273,11 @@ def run(args: argparse.Namespace) -> None:
             if len(values) != len(net.target_names):
                 raise SystemExit(f"{flag} {text}: need {len(net.target_names)} values for {net.target_names}")
             for n_windows in args.windows:
-                for nn_refines in args.nn_refines or [args.n_refine]:
-                    if not 1 <= nn_refines <= args.n_refine:
-                        raise SystemExit(f"--nn-refines {nn_refines}: must be in [1, --n-refine {args.n_refine}]")
+                for nn_refines in nn_refines_list:
                     # window 0 alone, charged in every refine, keeps the old arm names
                     suffix = (f"w{n_windows}" if n_windows > 1 else "") + (f"r{nn_refines}" if nn_refines < args.n_refine else "")
                     arms.append(Arm(f"{prefix}[{text}]{suffix}", dict(zip(net.target_names, values)), baseline, n_windows,
-                                    nn_refines if nn_refines < args.n_refine else None))
+                                    nn_refines))
     worlds = [(arm, r) for arm in arms for r in range(args.repeats)]
     n_worlds, n_frames = len(worlds), int(round(args.max_time / MPPI_DT))
     print(f"[map]      {map_name}: {terrain.nx}x{terrain.ny} @ {terrain.cell} m, start {start.tolist()}, goal {goal}")
@@ -296,7 +299,7 @@ def run(args: argparse.Namespace) -> None:
         cost = None
         if arm.weights is not None:
             cost = WindowCost(net, attrs, planner, arm.weights, blur_terrain=bool(ckpt["blur_terrain"]), baseline=arm.baseline,
-                              n_windows=arm.windows, trunk=trunk, switchable=arm.nn_refines is not None)
+                              n_windows=arm.windows, trunk=trunk, switchable=arm.nn_refines < args.n_refine)
             planner.set_cost_hook(cost)
         planners.append(planner)
         costs.append(cost)
@@ -324,7 +327,6 @@ def run(args: argparse.Namespace) -> None:
     driving = np.zeros((n_frames, n_worlds), bool)  # the frame's command came from MPPI
     previous_plan = [None] * n_worlds
     plan_ms = np.full((n_frames, n_worlds), np.nan, np.float32)  # update + replan + the plan's readback
-    t_plan = 0.0
     for f in range(n_frames):
         xy_yaw, wheels, twist, pose = ostrich.state()
         pitch, roll = pitch_roll(pose[:, 3:7])
@@ -342,18 +344,16 @@ def run(args: argparse.Namespace) -> None:
                 reason = "arrived"
             if reason is not None:
                 status[w], done[w], end_frame[w] = reason, True, f
-        t = time.perf_counter()
         for w in np.flatnonzero(~done):
             t_world = time.perf_counter()
             planner, cost = planners[w], costs[w]
             planner.sim.set_initial_wheel_omega(wheels[w])
             planner.sim.set_initial_twist(twist[w])
-            if cost is not None:
-                cost.update(xy_yaw[w])
-            if cost is not None and cost.switchable:
-                cost.replan_split(xy_yaw[w], goal, args.n_refine, worlds[w][0].nn_refines)
-            else:
+            if cost is None:
                 planner.replan(xy_yaw[w], goal, args.n_refine)
+            else:
+                cost.update(xy_yaw[w])
+                cost.replan_split(xy_yaw[w], goal, args.n_refine, worlds[w][0].nn_refines)
             plan = planner.nominal()  # a device-to-host copy: waits for the replan's GPU work
             plan_ms[f, w] = (time.perf_counter() - t_world) * 1e3
             if previous_plan[w] is not None:
@@ -364,7 +364,6 @@ def run(args: argparse.Namespace) -> None:
             previous_plan[w] = plan.copy()
             commands[f, w] = (plan[0, 0], plan[0, 1], 0.5 * (plan[0, 0] + plan[0, 1]))
             driving[f, w] = True
-        t_plan += time.perf_counter() - t
         if done.all():
             n_frames = f
             break
@@ -372,7 +371,7 @@ def run(args: argparse.Namespace) -> None:
         if f % 50 == 0:
             print(f"  t={f * MPPI_DT:5.1f} s: " + ", ".join(f"{status[w] if done[w] else 'driving'}" for w in range(n_worlds)))
     n_run = min(n_frames, commands.shape[0])
-    print(f"[run]      {n_run} frames, planning {t_plan / max(n_run, 1) * 1e3:.0f} ms per frame for {n_worlds} worlds")
+    print(f"[run]      {n_run} frames, planning {np.nansum(plan_ms[:n_run]) / max(n_run, 1):.0f} ms per frame for {n_worlds} worlds")
 
     pose_log, wheel_log = ostrich.logs()
     windows = window_errors(terrain, pose_log, wheel_log, commands[:n_run], driving[:n_run], net, mu, k_turn, device)
@@ -492,7 +491,7 @@ def save(path: pathlib.Path, args: argparse.Namespace, map_name: str, terrain: H
         f["arm"] = np.array([a.name for a, _ in worlds], dtype=h5py.string_dtype())
         f["arm_baseline"] = np.array([a.baseline for a, _ in worlds], dtype=h5py.string_dtype())
         f["arm_windows"] = np.array([a.windows for a, _ in worlds])
-        f["arm_nn_refines"] = np.array([a.nn_refines or args.n_refine for a, _ in worlds])  # refines charged
+        f["arm_nn_refines"] = np.array([a.nn_refines for a, _ in worlds])  # refines charged, 0 = vanilla
         f["plan_ms"] = plan_ms  # [frames, W] wall time of update + replan + readback, NaN when not planning
         f["stage_ms"] = stage_ms  # [W, stages] mean GPU ms per refine stage
         f["stage_ms"].attrs["stages"] = list(STAGES)
@@ -512,6 +511,13 @@ def save(path: pathlib.Path, args: argparse.Namespace, map_name: str, terrain: H
     print(f"saved {path}")
 
 
+def arm_colors(names: list[str]) -> list[tuple[float, float, float]]:
+    """One RGB per arm, in arm order: matplotlib's tab10, as the PNG and gl_replay_closed_loop.py draw them."""
+    import matplotlib
+
+    return [tuple(float(c) for c in matplotlib.colormaps["tab10"](i)[:3]) for i in range(len(names))]
+
+
 def plot(path: pathlib.Path, terrain: HeightMapReader, start: np.ndarray, goal: tuple[float, float],
          worlds: list[tuple[Arm, int]], status: np.ndarray, pose_log: np.ndarray) -> None:
     import matplotlib
@@ -524,7 +530,7 @@ def plot(path: pathlib.Path, terrain: HeightMapReader, start: np.ndarray, goal: 
     im = ax.imshow(terrain.H, origin="lower", extent=extent, cmap="gray")
     fig.colorbar(im, ax=ax, shrink=0.7, label="height [m]")
     names = list(dict.fromkeys(a.name for a, _ in worlds))
-    colors = plt.cm.tab10(np.arange(len(names)))
+    colors = arm_colors(names)
     for w, (arm, r) in enumerate(worlds):
         xy = pose_log[SETTLE_STEPS:, w, :2]
         ax.plot(xy[:, 0], xy[:, 1], color=colors[names.index(arm.name)], lw=1.5,
