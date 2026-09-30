@@ -68,6 +68,8 @@ Per block at 512 patches, in ms:
 ## Where this leaves the goal
 Windows 1 and 2 at 512 rollouts mean 1024 patches per refine, which is about 94 ms per refine, or about 280 ms with 3 refines. Faster kernels won't close that gap on this GPU. It needs fewer or cheaper patches: a smaller trunk, fewer refines, pose-sharing, or the dense code map (`encode_map`).
 
+## Wired in
+`WindowCost(..., n_windows=3)` runs `WarpTrunk` inside the refine graph. It samples each rollout's patch at steps 10 and 20. At 512 rollouts × 1 refine, a replan takes 3.0 ms without the hook, 4.9 ms with window 0 only (baseline "flat"), and 99.7 ms with windows 0–2 (`mppi_cost.py --bench`). `closed_loop.py` measures the same on a short run: 99 ms per replan, 96 ms of it in the cost stage. Over 25 s runs with 14 worlds the GPU heats up: median 101–126 ms, p90 109–139 ms. The closed-loop results are in `mppi_learning/design.md` §9e.
+
 ## Open
-- Neither trunk is wired into `WindowCost` yet. There is no per-rollout patch sampling at steps 10 and 20.
 - `mppi_cost._dense_kernel`, which runs the head, has the same scalar-`vec4`-load problem, so the same fix should speed it up.

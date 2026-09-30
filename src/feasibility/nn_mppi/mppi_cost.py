@@ -1,5 +1,6 @@
-"""`WindowCost`: the `mppi_learning` net's predicted twin-vs-ostrich error of MPPI's FIRST window,
-charged to every rollout inside helhest_stack's captured refine (mppi_learning/design.md section 9).
+"""`WindowCost`: the `mppi_learning` net's predicted twin-vs-ostrich error of MPPI's windows, charged
+to every rollout inside helhest_stack's captured refine (mppi_learning/design.md section 9). Window
+0 by default; `n_windows` 3 also charges windows 1 and 2 (below).
 
 `MppiGpu.replan` starts every rollout at the same pose, so window 0 (steps [0, 10), knot 0 to
 knot 1) has ONE terrain patch, shared by all rollouts; only the command differs. The work is
@@ -27,14 +28,28 @@ The weights are a device array (`set_weights`), so tuning them needs no recaptur
 must be the one the net was trained for (`check_planner`): H 31 / 4 knots (window 0 = one knot
 interval), `wmin` 0, and the twin's `k_turn` and step from the checkpoint's `label_attrs`.
 
-Rollouts beyond window 0 start at their own poses and are not charged (design.md section 9e).
+Windows 1 and 2 (`n_windows` > 1, design.md section 9e) start where each rollout is at steps 10 and
+20, so they need a patch and a terrain code PER ROLLOUT, and those poses exist only after the
+rollout, inside the graph. The hook therefore samples every rollout's patch there with the same
+sampler, runs `warp_trunk.WarpTrunk` (the graph-capturable trunk) over all of them plus one level
+patch, and runs the head per (window, rollout) with that window's command from
+`target_wheel_omega[10 k : 10 k + 10]`. Each rollout pays for its own later windows, with the same
+weights and baseline as window 0; the robust cost then averages that term over the mu replicas.
+The trunk is the cost: ~47 ms per 512 patches on the GTX 1050 (`trunk_speed.md`).
+
+`switchable=True` wraps the hook in a conditional graph node (`wp.capture_if`) on a device flag, so
+`replan_split(state, goal, n_refine, k)` can charge the cost in the first k refines only and let the
+rest rank the rollouts by the planner's own cost. Both replay the same captured graph, with no
+recapture, and the skipped refines cost what a vanilla refine does.
 
 CLI parameters:
     --checkpoint PATH   a mppi_learning train.py checkpoint (default: a random-weight net, which
                         checks the plumbing but not a trained net's numbers)
     --batch INT         MPPI rollouts for the checks (default 1024)
-    --bench             also time a 3-refine replan at 4096 rollouts without the hook, with it, and
-                        with it at baseline "flat"
+    --bench             also time a replan at 4096 rollouts x 3 refines without the hook, with it,
+                        and with it at baseline "flat"; at 512 rollouts x 1 refine without the hook
+                        and at baseline "flat" charging 1 and 3 windows; and at 512 x 3 refines
+                        without the hook and charging 3 windows in every refine or in the first only
 
 Usage:
     python src/feasibility/nn_mppi/mppi_cost.py
@@ -44,9 +59,11 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import gc
 import math
 import pathlib
 import time
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -66,25 +83,27 @@ from feasibility.mppi_learning.model import WindowDivergenceNet
 from feasibility.mppi_learning.model import WZ_SCALE
 from feasibility.mppi_learning.train import load_checkpoint
 
+if TYPE_CHECKING:
+    from feasibility.nn_mppi.warp_trunk import WarpTrunk
+
 HORIZON = 31  # design.md section 3: H = WINDOW_STEPS * (N_KNOTS - 1) + 1
 N_KNOTS = 4
 ROWS_PER_THREAD = wp.constant(8)  # batch rows per `_dense_kernel` thread; the head's rows are padded to it
 
 
-@wp.kernel
-def _patch_kernel(
+@wp.func
+def _relief(
     elevation: wp.array2d(dtype=wp.float32),
     grid: Grid,
-    pose: wp.array(dtype=wp.vec3),  # [1] (x, y, yaw) the rollouts start from
+    p: wp.vec3,  # (x, y, yaw) of the patch's body frame
+    i: int,
+    j: int,
     x_min: float,
     y_min: float,
     cell: float,
     contacts: wp.array(dtype=wp.vec2),  # [3] body-frame wheel contacts, the height reference
     height_scale: float,
-    patch: wp.array2d(dtype=wp.float32),  # [ny, nx] rows along body +y, columns along body +x
 ):
-    i, j = wp.tid()
-    p = pose[0]
     c = wp.cos(p[2])
     s = wp.sin(p[2])
     reference = float(0.0)
@@ -95,7 +114,45 @@ def _patch_kernel(
     bx = x_min + (float(j) + 0.5) * cell
     by = y_min + (float(i) + 0.5) * cell
     height = sample_field(elevation, grid, p[0] + c * bx - s * by, p[1] + s * bx + c * by)
-    patch[i, j] = (height - reference) / height_scale
+    return (height - reference) / height_scale
+
+
+@wp.kernel
+def _patch_kernel(
+    elevation: wp.array2d(dtype=wp.float32),
+    grid: Grid,
+    pose: wp.array(dtype=wp.vec3),  # [1] (x, y, yaw) the rollouts start from
+    x_min: float,
+    y_min: float,
+    cell: float,
+    contacts: wp.array(dtype=wp.vec2),
+    height_scale: float,
+    patch: wp.array2d(dtype=wp.float32),  # [ny, nx] rows along body +y, columns along body +x
+):
+    i, j = wp.tid()
+    patch[i, j] = _relief(elevation, grid, pose[0], i, j, x_min, y_min, cell, contacts, height_scale)
+
+
+@wp.kernel
+def _rollout_patch_kernel(
+    elevation: wp.array2d(dtype=wp.float32),
+    grid: Grid,
+    controlled: wp.array2d(dtype=wp.vec3),  # [T + 1, B] every rollout's (x, y, yaw) per step
+    window_steps: int,
+    rows: int,  # patch rows per window (B padded to whole ROWS_PER_THREAD groups)
+    x_min: float,
+    y_min: float,
+    cell: float,
+    contacts: wp.array(dtype=wp.vec2),
+    height_scale: float,
+    patches: wp.array3d(dtype=wp.float32),  # [n_later * rows + 1, ny, nx]: window w + 1, rollout r at w * rows + r
+):
+    w, r, cell_index = wp.tid()
+    nx = patches.shape[2]
+    i = cell_index // nx
+    j = cell_index - i * nx
+    p = controlled[(w + 1) * window_steps, r]  # the rollout's pose where window w + 1 starts
+    patches[w * rows + r, i, j] = _relief(elevation, grid, p, i, j, x_min, y_min, cell, contacts, height_scale)
 
 
 @wp.func
@@ -117,17 +174,19 @@ def _silu4(v: wp.vec4):
     return wp.vec4(_silu(v[0]), _silu(v[1]), _silu(v[2]), _silu(v[3]))
 
 
-@wp.kernel
-def _features_kernel(
+@wp.func
+def _command_features(
     target_wheel_omega: wp.array2d(dtype=wp.vec3),  # [T, B] MPPI's commanded wheel speeds
+    first_step: int,
+    column: int,
     window_steps: int,
     wheel_radius: float,
     half_track: float,
     v_scale: float,
     wz_scale: float,
-    features: wp.array2d(dtype=wp.vec4),  # [rows, 2]: window_command_features of window 0 + a 0 pad
 ):
-    c = wp.tid()
+    """window_command_features of steps [first_step, first_step + window_steps) of one rollout, as
+    two vec4 (the 7 features + a 0 pad)."""
     # command.encode: least-squares mean + slope over the window, the slope times window_steps
     centre = 0.5 * float(window_steps - 1)
     v_sum = float(0.0)
@@ -136,7 +195,7 @@ def _features_kernel(
     wz_moment = float(0.0)
     ic_sq = float(0.0)
     for t in range(window_steps):
-        w = target_wheel_omega[t, c]
+        w = target_wheel_omega[first_step + t, column]
         v = wheel_radius * (w[0] + w[1]) / 2.0
         wz = wheel_radius * (w[1] - w[0]) / (2.0 * half_track)
         ic = float(t) - centre
@@ -149,8 +208,42 @@ def _features_kernel(
     wz_mean = wz_sum / n / wz_scale
     wz_slope = wz_moment / ic_sq * n / wz_scale
     sign = _sign(wz_mean)
-    features[c, 0] = wp.vec4(v_sum / n / v_scale, v_moment / ic_sq * n / v_scale, wz_mean, wp.abs(wz_mean))
-    features[c, 1] = wp.vec4(sign, wz_slope, wz_slope * sign, 0.0)
+    return (wp.vec4(v_sum / n / v_scale, v_moment / ic_sq * n / v_scale, wz_mean, wp.abs(wz_mean)),
+            wp.vec4(sign, wz_slope, wz_slope * sign, 0.0))
+
+
+@wp.kernel
+def _features_kernel(
+    target_wheel_omega: wp.array2d(dtype=wp.vec3),
+    window_steps: int,
+    wheel_radius: float,
+    half_track: float,
+    v_scale: float,
+    wz_scale: float,
+    features: wp.array2d(dtype=wp.vec4),  # [rows, 2]: window 0 of candidate c at row c
+):
+    c = wp.tid()
+    f0, f1 = _command_features(target_wheel_omega, 0, c, window_steps, wheel_radius, half_track, v_scale, wz_scale)
+    features[c, 0] = f0
+    features[c, 1] = f1
+
+
+@wp.kernel
+def _rollout_features_kernel(
+    target_wheel_omega: wp.array2d(dtype=wp.vec3),
+    window_steps: int,
+    rows: int,
+    wheel_radius: float,
+    half_track: float,
+    v_scale: float,
+    wz_scale: float,
+    features: wp.array2d(dtype=wp.vec4),  # [n_later * rows, 2]: window w + 1 of rollout r at row w * rows + r
+):
+    w, r = wp.tid()
+    f0, f1 = _command_features(target_wheel_omega, (w + 1) * window_steps, r, window_steps, wheel_radius,
+                               half_track, v_scale, wz_scale)
+    features[w * rows + r, 0] = f0
+    features[w * rows + r, 1] = f1
 
 
 @wp.kernel
@@ -201,18 +294,24 @@ def _film_layer_norm_silu_kernel(width: int) -> wp.Kernel:
 
     def film_layer_norm_silu(
         film: wp.array2d(dtype=float),  # [rows, 2 * width]: gamma, then beta
-        code: wp.array2d(dtype=float),  # [n_codes, width] the shared terrain code(s)
+        code: wp.array2d(dtype=float),  # the terrain code(s), [n_codes, width] or, per_row, [rows + 1, width]
         rows: int,
+        per_row: int,
         weight: wp.array(dtype=float),  # LayerNorm affine
         bias: wp.array(dtype=float),
         eps: float,
-        y: wp.array2d(dtype=float),  # [n_codes * rows, width]: row r is film row r % rows under code r // rows
+        y: wp.array2d(dtype=float),  # [n_codes * rows, width]: row r is film row r % rows under the code below
     ):
         r = wp.tid()
+        # shared codes (window 0): code r // rows. per_row (the later windows, a patch per rollout):
+        # film row r's own code r, then, for a level half r >= rows, the level code at row `rows`
+        c = r // rows
+        if per_row != 0:
+            c = wp.min(r, rows)
         gamma = wp.tile_load(film[r % rows], shape=n, offset=0)
         beta = wp.tile_load(film[r % rows], shape=n, offset=n)
         one_plus_gamma = wp.tile_map(wp.add, gamma, wp.tile_ones(shape=n, dtype=float))
-        h = wp.tile_map(wp.add, wp.tile_map(wp.mul, wp.tile_load(code[r // rows], shape=n), one_plus_gamma), beta)
+        h = wp.tile_map(wp.add, wp.tile_map(wp.mul, wp.tile_load(code[c], shape=n), one_plus_gamma), beta)
         mean = wp.tile_sum(h)[0] / float(n)
         centred = wp.tile_map(wp.sub, h, wp.tile_full(shape=n, value=mean, dtype=float))
         var = wp.tile_sum(wp.tile_map(wp.mul, centred, centred))[0] / float(n)  # biased, as nn.LayerNorm
@@ -275,6 +374,47 @@ def _output_kernel(
         J[replica * n_cand + c] += cost
 
 
+@wp.kernel
+def _rollout_output_kernel(
+    h: wp.array2d(dtype=wp.vec4),  # [n_codes * n_later * rows, head_width / 4]
+    weight: wp.array2d(dtype=wp.vec4),
+    bias: wp.array(dtype=float),
+    target_mean: wp.array(dtype=float),
+    target_std: wp.array(dtype=float),
+    cost_weight: wp.array(dtype=float),
+    n_later: int,  # windows after window 0
+    rows: int,  # h rows per window
+    level_row: int,  # 0 = no baseline, else the first row of h under the level code
+    prediction: wp.array3d(dtype=float),  # [n_later, B, K] physical (m, rad)
+    level_prediction: wp.array3d(dtype=float),
+    J: wp.array(dtype=float),  # [B] MppiGpu.J: each rollout pays for its own later windows
+):
+    r = wp.tid()
+    cost = float(0.0)
+    for w in range(n_later):
+        row = w * rows + r
+        for k in range(weight.shape[0]):
+            error = _head_error(h, weight, bias, target_mean, target_std, k, row)
+            prediction[w, r, k] = error
+            if level_row > 0:
+                level = _head_error(h, weight, bias, target_mean, target_std, k, level_row + row)
+                level_prediction[w, r, k] = level
+                error = wp.max(error - level, 0.0)
+            cost += cost_weight[k] * error
+    J[r] += cost
+
+
+def _padded_rows(n: int) -> int:
+    return -(-n // ROWS_PER_THREAD) * ROWS_PER_THREAD
+
+
+def trunk_rows(n_rollouts: int, n_windows: int) -> int:
+    """Patches per refine for windows 1 .. n_windows - 1: each window's rollouts padded to whole
+    ROWS_PER_THREAD groups, plus the level patch. A `WarpTrunk` shared by several `WindowCost`s
+    needs at least this `max_batch`."""
+    return (n_windows - 1) * _padded_rows(n_rollouts) + 1
+
+
 def check_planner(planner: MppiGpu, label_attrs: dict[str, object]) -> None:
     """Raises unless `planner` rolls out what the net was trained on: window 0 must be exactly one
     knot interval, the twin's k_turn and step must be the label's, and wmin must be 0 (the data
@@ -292,9 +432,13 @@ def check_planner(planner: MppiGpu, label_attrs: dict[str, object]) -> None:
 
 
 class WindowCost:
-    """The window-0 cost hook for one `MppiGpu`. Construct, `set_weights` if needed, then
-    `planner.set_cost_hook(cost)`, and call `cost.update(state)` before every
-    `planner.replan(state, ...)`."""
+    """The window cost hook for one `MppiGpu`: window 0, and windows 1 .. n_windows - 1 if
+    `n_windows` > 1. Construct, `set_weights` if needed, then `planner.set_cost_hook(cost)`, and call
+    `cost.update(state)` before every `planner.replan(state, ...)`. `trunk` may be a `WarpTrunk` of
+    the same net shared with other `WindowCost`s whose planners replan one after another on the same
+    stream (its buffers are reused per call); its `max_batch` must be at least `trunk_rows`.
+    `switchable` puts the hook's work behind a conditional graph node on a device flag
+    (`set_enabled`), so some refines can skip it without a recapture (`replan_split`)."""
 
     def __init__(
         self,
@@ -304,9 +448,16 @@ class WindowCost:
         weights: dict[str, float],
         blur_terrain: bool = False,
         baseline: str = "none",
+        n_windows: int = 1,
+        trunk: WarpTrunk | None = None,
+        switchable: bool = False,
     ) -> None:
         if baseline not in ("none", "flat"):
             raise ValueError(f"baseline {baseline!r}: 'none' or 'flat'")
+        if not 1 <= n_windows <= N_KNOTS - 1:
+            raise ValueError(f"n_windows {n_windows}: the horizon holds 1 to {N_KNOTS - 1} windows")
+        if n_windows > 1 and blur_terrain:
+            raise ValueError("the blur-terrain baseline is implemented for window 0 only")
         if net.head_fusion != "film":
             raise ValueError(f"only the FiLM head is implemented in Warp, the net has {net.head_fusion!r}")
         if net.target_transform is None:
@@ -317,6 +468,10 @@ class WindowCost:
         self.net = net.to(self.torch_device).eval()
         self.blur_terrain = blur_terrain
         self.baseline = baseline
+        self.switchable = switchable
+        if switchable and not wp.is_conditional_graph_supported():
+            raise ValueError("switchable needs conditional CUDA graph nodes, which this Warp/driver lacks")
+        self.enabled = wp.ones(1, dtype=wp.int32, device=self.device)  # read by the conditional node
         n_codes = 2 if baseline == "flat" else 1
         self.target_names = net.target_names
         self.n_cand, self.n_mu = planner.n_cand, planner.n_mu
@@ -380,18 +535,68 @@ class WindowCost:
                 level = torch.zeros_like(self._patch_torch)
                 self._code_torch[1].copy_(self.net.terrain_code(prepare_patch(level, blur_terrain)).reshape(-1))
 
+        # windows 1 .. n_windows - 1: a patch per rollout, so the trunk runs inside the graph (Warp)
+        self.n_windows, self.n_rollouts = n_windows, planner.n_rollouts
+        if n_windows == 1:
+            return
+        from feasibility.nn_mppi.warp_trunk import WarpTrunk  # warp_trunk imports this module's kernels
+
+        self.window_rows = _padded_rows(self.n_rollouts)
+        later_rows = (n_windows - 1) * self.window_rows
+        needed = trunk_rows(self.n_rollouts, n_windows)
+        self.terrain_trunk = trunk if trunk is not None else WarpTrunk(net, needed, self.device)
+        if self.terrain_trunk.max_batch < needed:
+            raise ValueError(f"the shared trunk takes {self.terrain_trunk.max_batch} patches, this cost needs {needed}")
+        with wp.ScopedDevice(self.device):
+            # the last patch row is never written: the all-zero level patch, whose code the level
+            # half of the head reads (baseline "flat")
+            self.patches = wp.zeros((needed, spec.ny, spec.nx), dtype=wp.float32)
+            self.rollout_features = wp.zeros((later_rows, 2), dtype=wp.vec4)
+            self.rollout_embedding_hidden = wp.zeros((later_rows, embed_dim // 4), dtype=wp.vec4)
+            self.rollout_embedding = wp.zeros((later_rows, embed_dim // 4), dtype=wp.vec4)
+            self.rollout_film_out = wp.zeros((later_rows, 2 * width // 4), dtype=wp.vec4)
+            self.rollout_normed = wp.zeros((n_codes * later_rows, width // 4), dtype=wp.vec4)
+            self.rollout_hidden = [wp.zeros((n_codes * later_rows, head_width // 4), dtype=wp.vec4) for _ in range(2)]
+            shape = (n_windows - 1, self.n_rollouts, len(self.target_names))
+            self.rollout_prediction = wp.zeros(shape, dtype=float)
+            self.rollout_level_prediction = wp.zeros(shape, dtype=float)
+        self._rollout_film_out_floats, self._trunk_code_floats, self._rollout_normed_floats = (
+            _as_floats(a) for a in (self.rollout_film_out, self.terrain_trunk.code, self.rollout_normed))
+
     @classmethod
     def from_checkpoint(
-        cls, path: pathlib.Path, planner: MppiGpu, weights: dict[str, float], baseline: str = "none"
+        cls, path: pathlib.Path, planner: MppiGpu, weights: dict[str, float], baseline: str = "none",
+        n_windows: int = 1,
     ) -> "WindowCost":
         net, ckpt = load_checkpoint(path, wp.device_to_torch(planner.device))
-        return cls(net, ckpt["label_attrs"], planner, weights, blur_terrain=bool(ckpt["blur_terrain"]), baseline=baseline)
+        return cls(net, ckpt["label_attrs"], planner, weights, blur_terrain=bool(ckpt["blur_terrain"]), baseline=baseline,
+                   n_windows=n_windows)
 
     def set_weights(self, weights: dict[str, float]) -> None:
         """Cost weight per target name (1/m for e_pos, 1/rad for the angles). Graph-safe."""
         if set(weights) != set(self.target_names):
             raise ValueError(f"weights {sorted(weights)} must name exactly the targets {self.target_names}")
         self.cost_weight.assign(np.array([weights[k] for k in self.target_names], np.float32))
+
+    def set_enabled(self, enabled: bool) -> None:
+        """Run (True) or skip (False) the hook's work in the refines launched after this call. A
+        stream-ordered device write, so it takes effect between two graph launches. Switchable only."""
+        if not self.switchable:
+            raise ValueError("set_enabled needs a WindowCost built with switchable=True")
+        self.enabled.fill_(int(enabled))
+
+    def replan_split(self, state: np.ndarray, goal: tuple[float, float], n_refine: int, cost_refines: int) -> wp.array:
+        """`planner.replan(state, goal, n_refine)` with this cost charged in the FIRST `cost_refines`
+        refines only; the rest rank the rollouts by the planner's own cost. Two replans of the same
+        captured graph, which together are exactly one replan of n_refine."""
+        if not 1 <= cost_refines <= n_refine:
+            raise ValueError(f"cost_refines {cost_refines} must be in [1, {n_refine}]")
+        self.set_enabled(True)
+        U = self._planner.replan(state, goal, cost_refines)
+        if n_refine > cost_refines:
+            self.set_enabled(False)
+            U = self._planner.replan(state, goal, n_refine - cost_refines)
+        return U
 
     def _stream_context(self) -> contextlib.AbstractContextManager:
         if not self.device.is_cuda:
@@ -413,7 +618,14 @@ class WindowCost:
             self._code_torch[0].copy_(code.reshape(-1))
 
     def __call__(self, planner: MppiGpu) -> None:
-        """The hook: launches only, on the planner's buffers, so it is captured into the refine."""
+        """The hook: launches only, on the planner's buffers, so it is captured into the refine;
+        switchable, inside a conditional node that runs only while `enabled` is 1."""
+        if self.switchable:
+            wp.capture_if(self.enabled, on_true=self._charge, planner=planner)
+        else:
+            self._charge(planner)
+
+    def _charge(self, planner: MppiGpu) -> None:
         dev, rows = self.device, self.features.shape[0]
 
         def dense(x: wp.array, weight: wp.array, bias: wp.array, silu: int, y: wp.array) -> None:
@@ -430,7 +642,7 @@ class WindowCost:
         dense(self.embedding, *self.film, 0, self.film_out)
         wp.launch_tiled(
             self._film_layer_norm, dim=self.normed.shape[0], block_dim=32,
-            inputs=[self._film_out_floats, self._code_floats, rows, *self.layer_norm],
+            inputs=[self._film_out_floats, self._code_floats, rows, 0, *self.layer_norm],
             outputs=[self._normed_floats], device=dev,
         )
         dense(self.normed, *self.trunk[0], self.hidden[0])
@@ -440,6 +652,40 @@ class WindowCost:
             inputs=[self.hidden[1], *self.head, *self.target, self.cost_weight, self.n_cand, self.n_mu,
                     rows if self.baseline == "flat" else 0],
             outputs=[self.prediction, self.level_prediction, planner.J], device=dev,
+        )
+        if self.n_windows == 1:
+            return
+
+        # windows 1 .. n_windows - 1: every ROLLOUT (not candidate: the mu replicas of a candidate
+        # end window 0 at different poses) from its own pose at the window's first step
+        spec, sim, n_later, later_rows = self.patch_spec, planner.sim, self.n_windows - 1, self.rollout_features.shape[0]
+        wp.launch(
+            _rollout_patch_kernel, (n_later, self.n_rollouts, spec.ny * spec.nx),
+            inputs=[sim.elevation, sim.grid, sim.controlled, WINDOW_STEPS, self.window_rows, spec.x_min, spec.y_min,
+                    spec.cell, self.contacts, HEIGHT_SCALE],
+            outputs=[self.patches], device=dev,
+        )
+        self.terrain_trunk(self.patches)
+        wp.launch(
+            _rollout_features_kernel, (n_later, self.n_rollouts),
+            inputs=[sim.target_wheel_omega, WINDOW_STEPS, self.window_rows, WHEEL_RADIUS, HALF_TRACK, V_SCALE, WZ_SCALE],
+            outputs=[self.rollout_features], device=dev,
+        )
+        dense(self.rollout_features, *self.encoder[0], self.rollout_embedding_hidden)
+        dense(self.rollout_embedding_hidden, *self.encoder[1], self.rollout_embedding)
+        dense(self.rollout_embedding, *self.film, 0, self.rollout_film_out)
+        wp.launch_tiled(
+            self._film_layer_norm, dim=self.rollout_normed.shape[0], block_dim=32,
+            inputs=[self._rollout_film_out_floats, self._trunk_code_floats, later_rows, 1, *self.layer_norm],
+            outputs=[self._rollout_normed_floats], device=dev,
+        )
+        dense(self.rollout_normed, *self.trunk[0], self.rollout_hidden[0])
+        dense(self.rollout_hidden[0], *self.trunk[1], self.rollout_hidden[1])
+        wp.launch(
+            _rollout_output_kernel, self.n_rollouts,
+            inputs=[self.rollout_hidden[1], *self.head, *self.target, self.cost_weight, n_later, self.window_rows,
+                    later_rows if self.baseline == "flat" else 0],
+            outputs=[self.rollout_prediction, self.rollout_level_prediction, planner.J], device=dev,
         )
 
 
@@ -589,46 +835,160 @@ def self_test(checkpoint: pathlib.Path | None, batch: int) -> None:
         level_cost.update(state)
         assert np.array_equal(hooked.replan(state, goal, 3).numpy(), plain.replan(state, goal, 3).numpy())
     print("[flat] level map: excess exactly 0, U bit-identical to the unhooked planner over 3 replans x 3 refines")
+    if blur:
+        print("all self-checks ok (windows 1-2 skipped: the blur-terrain baseline is window 0 only)")
+        return
+
+    # 7. windows 1 and 2 (n_windows 3, baseline "flat"): every rollout's patch at its OWN pose at
+    # steps 10 and 20, its command over the window, both heads per window, and the term in Jc:
+    # window 0's excess plus the mean over a candidate's mu replicas of theirs (the robust cost
+    # averages J over the replicas)
+    later = _test_planner(terrain, batch, k_turn, n_mu=2)
+    later_cost = WindowCost(net, label_attrs, later, weights, baseline="flat", n_windows=3)
+    later_cost.update(state)
+    later.set_cost_hook(later_cost)
+    later.replan(state, goal, 1)
+    poses, omega_all = later.sim.controlled.numpy(), later.sim.target_wheel_omega.numpy()
+    n, rows = later.n_rollouts, later_cost.window_rows
+    got_later, level_later = later_cost.rollout_prediction.numpy(), later_cost.rollout_level_prediction.numpy()
+    patches, features_later = later_cost.patches.numpy(), later_cost.rollout_features.numpy().reshape(-1, 8)
+    assert not patches[-1].any()  # the level patch
+    for w in range(2):
+        first = (w + 1) * WINDOW_STEPS
+        ref = sample_patches(terrain, poses[first].astype(np.float64), spec)
+        err_patch = np.abs(patches[w * rows : w * rows + n] - ref).max()
+        command_w = torch.from_numpy(encode(omega_all[first : first + WINDOW_STEPS])).cuda()
+        err_features = np.abs(features_later[w * rows : w * rows + n, :7]
+                              - window_command_features(command_w).cpu().numpy()).max()
+        with torch.no_grad():
+            ref_torch = torch.from_numpy(ref).cuda()[:, None]
+            expected_w = net.predict(ref_torch, command_w).cpu().numpy()
+            expected_level = net.predict(torch.zeros_like(ref_torch), command_w).cpu().numpy()
+        err_head = np.abs(got_later[w] - expected_w).max() / max(1e-3, np.abs(expected_w).max())
+        err_level = np.abs(level_later[w] - expected_level).max() / max(1e-3, np.abs(expected_level).max())
+        assert err_patch < 1e-5 and err_features < 1e-5 and err_head < 1e-4 and err_level < 1e-4, (
+            w + 1, err_patch, err_features, err_head, err_level)
+        spread = np.ptp(poses[first, :, :2], axis=0)
+        print(f"[window {w + 1}] {n} rollouts from their own step-{first} poses (spread {spread[0]:.2f} x {spread[1]:.2f} m): "
+              f"patch max |diff| {err_patch:.1e}, features {err_features:.1e}, head / level head vs net.predict "
+              f"max rel diff {err_head:.1e} / {err_level:.1e}")
+    ones = np.ones(len(weights), np.float32)
+    window0 = np.maximum(later_cost.prediction.numpy() - later_cost.level_prediction.numpy(), 0.0) @ ones
+    per_rollout = np.maximum(got_later - level_later, 0.0).sum(axis=0) @ ones
+    added = window0 + per_rollout.reshape(later.n_mu, later.n_cand).mean(axis=0)
+    err_j = np.abs(later.Jc.numpy() - plain_jc - added).max() / max(1.0, np.abs(plain_jc).max())
+    assert err_j < 1e-5, err_j
+    print(f"[windows] window 0 + windows 1-2 excess in Jc: max rel diff {err_j:.1e}; windows 1-2 charge "
+          f"{100 * (per_rollout > 0).mean():.0f}% of rollouts, mean {per_rollout.mean():.4f}")
+
+    # 8. the no-op guarantees with windows 1-2, on a trunk shared with the cost above
+    for name, where, value, baseline in (("zero weights", terrain, 0.0, "none"),
+                                         ("baseline 'flat' on a level map", level_map, 1.0, "flat")):
+        hooked, plain = _test_planner(where, batch, k_turn, n_mu=2), _test_planner(where, batch, k_turn, n_mu=2)
+        hooked_cost = WindowCost(net, label_attrs, hooked, {k: value for k in net.target_names}, baseline=baseline,
+                                 n_windows=3, trunk=later_cost.terrain_trunk)
+        hooked.set_cost_hook(hooked_cost)
+        for _ in range(3):
+            hooked_cost.update(state)
+            assert np.array_equal(hooked.replan(state, goal, 3).numpy(), plain.replan(state, goal, 3).numpy()), name
+        print(f"[no-op] windows 1-2, {name}: U bit-identical to the unhooked planner over 3 replans x 3 refines")
+
+    # 9. switchable (the hook behind a conditional graph node): enabled it is the plain hook, and
+    # disabled it is no hook, U bit-identical either way; replan_split(3, 1) is the same as one
+    # hooked refine, then a recapture WITHOUT the hook and two more (what it saves is the recapture).
+    # The split MAY end bit-identical to vanilla: only candidate 0 and the NARROW band are drawn
+    # around U, so when a vanilla refine's elites all come from the U-independent priors (WIDE,
+    # STRAIGHT, SPIN), the hooked refine leaves no trace. Printed, not asserted.
+    names = ("hooked", "on", "off", "plain", "split", "reference")
+    planners = {name: _test_planner(terrain, batch, k_turn, n_mu=2) for name in names}
+    # at weight 1 a trained net's excess is too small to move U at all; 300 is closed_loop's weight
+    strong = {k: 300.0 for k in net.target_names}
+    costs = {name: WindowCost(net, label_attrs, planners[name], strong, baseline="flat", n_windows=3,
+                              trunk=later_cost.terrain_trunk, switchable=name in ("on", "off", "split"))
+             for name in names if name != "plain"}
+    for name in ("hooked", "on", "off", "split"):
+        planners[name].set_cost_hook(costs[name])
+    costs["off"].set_enabled(False)
+    split_is_vanilla = []
+    for _ in range(2):
+        U = {}
+        for name, planner in planners.items():
+            if name in costs:
+                costs[name].update(state)
+            if name == "split":
+                costs[name].replan_split(state, goal, 3, 1)
+            elif name == "reference":
+                planner.set_cost_hook(costs[name])
+                planner.replan(state, goal, 1)
+                planner.set_cost_hook(None)
+                planner.replan(state, goal, 2)
+            else:
+                planner.replan(state, goal, 3)
+            U[name] = planner.nominal()
+        assert np.array_equal(U["on"], U["hooked"]) and np.array_equal(U["off"], U["plain"])
+        assert np.array_equal(U["split"], U["reference"])
+        assert not np.array_equal(U["hooked"], U["plain"])  # else the checks above prove nothing
+        split_is_vanilla.append(bool(np.array_equal(U["split"], U["plain"])))
+    print("[switch] conditional hook: enabled = the plain hook, disabled = no hook, replan_split(3, 1) = a hooked "
+          f"refine + 2 unhooked after a recapture, U bit-identical over 2 replans (split == vanilla: {split_is_vanilla})")
     print("all self-checks ok")
 
 
 def bench(checkpoint: pathlib.Path | None) -> None:
-    """9d.5: a 3-refine replan at the deployed 4096 rollouts: no hook, the hook, the hook at baseline "flat"."""
+    """9d.5: a replan at the deployed 4096 rollouts x 3 refines (no hook, the hook, the hook at
+    baseline "flat"), and at the window study's 512 rollouts x 1 refine (no hook, baseline "flat"
+    on window 0, on windows 0-2). Each is the fastest of 3 trials of 10 replans: this laptop GPU
+    drops its clock in bursts."""
     from feasibility.heightmap.create_box_obstacles import build_centered_box
 
     net, label_attrs, blur = _load(checkpoint)
     terrain = build_centered_box(0.3, 0.08, 70.0, 12.0)
     state, goal = np.array([-1.6, 0.4, 0.3]), (4.0, 0.0)
     weights = {name: 1.0 for name in net.target_names}
-    for baseline in (None, "none", "flat"):
-        planner = _test_planner(terrain, 4096, float(label_attrs["k_turn"]), n_mu=1)
-        cost = None if baseline is None else WindowCost(net, label_attrs, planner, weights, blur_terrain=blur, baseline=baseline)
-        if cost is not None:
-            planner.set_cost_hook(cost)
-
-        def step() -> None:
+    # (batch, n_refine, [(baseline or None = no hook, n_windows, refines charged or None = all)])
+    for batch, n_refine, arms in ((4096, 3, ((None, 1, None), ("none", 1, None), ("flat", 1, None))),
+                                  (512, 1, ((None, 1, None), ("flat", 1, None), ("flat", 3, None))),
+                                  (512, 3, ((None, 1, None), ("flat", 3, None), ("flat", 3, 1)))):
+        for baseline, n_windows, cost_refines in arms:
+            # a hooked planner and its cost point at each other, so only the cycle collector frees
+            # the previous arm's GPU buffers (a 3-window cost's trunk is ~0.2 GB)
+            gc.collect()
+            planner = _test_planner(terrain, batch, float(label_attrs["k_turn"]), n_mu=1)
+            cost = None if baseline is None else WindowCost(
+                net, label_attrs, planner, weights, blur_terrain=blur, baseline=baseline, n_windows=n_windows,
+                switchable=cost_refines is not None)
             if cost is not None:
-                cost.update(state)
-            planner.replan(state, goal, 3)
+                planner.set_cost_hook(cost)
 
-        for _ in range(3):
-            step()
-        wp.synchronize()
-        reps = 20
-        start = time.perf_counter()
-        for _ in range(reps):
-            step()
-        wp.synchronize()
-        ms = (time.perf_counter() - start) / reps * 1e3
-        label = "without the hook" if baseline is None else f"with the hook, baseline {baseline!r}"
-        print(f"[bench] 4096 rollouts, 3 refines, {label}: {ms:.2f} ms per replan")
+            def step() -> None:
+                if cost is not None:
+                    cost.update(state)
+                if cost_refines is not None:
+                    cost.replan_split(state, goal, n_refine, cost_refines)
+                else:
+                    planner.replan(state, goal, n_refine)
+
+            for _ in range(3):
+                step()
+            best = float("inf")
+            for _ in range(3):
+                wp.synchronize()
+                start = time.perf_counter()
+                for _ in range(10):
+                    step()
+                wp.synchronize()
+                best = min(best, (time.perf_counter() - start) / 10 * 1e3)
+            label = "without the hook" if baseline is None else f"with the hook, baseline {baseline!r}, {n_windows} window(s)"
+            if cost_refines is not None:
+                label += f", in the first {cost_refines} refine(s) only"
+            print(f"[bench] {batch} rollouts, {n_refine} refine(s), {label}: {best:.2f} ms per replan")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--checkpoint", type=pathlib.Path, default=None, help="mppi_learning checkpoint (default: random weights)")
     parser.add_argument("--batch", type=int, default=1024, help="MPPI rollouts for the checks (default 1024)")
-    parser.add_argument("--bench", action="store_true", help="also time a replan at 4096 rollouts without/with the hook (both baselines)")
+    parser.add_argument("--bench", action="store_true", help="also time replans without/with the hook (4096 x 3 refines, 512 x 1)")
     args = parser.parse_args()
     self_test(args.checkpoint, args.batch)
     if args.bench:
