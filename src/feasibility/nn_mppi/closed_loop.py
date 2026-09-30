@@ -1,5 +1,5 @@
-"""Closed-loop MPPI in ostrich, with and without the net's window-0 cost -- mppi_learning/design.md
-section 9d.6.
+"""Closed-loop MPPI in ostrich, with and without the net's window cost -- mppi_learning/design.md
+section 9d.6 and 9e.
 
 MPPI plans with helhest_stack's twin, as on the robot; OSTRICH executes. Every `dynamics.DT` (0.1 s,
 one replan per perception frame on the robot) each world:
@@ -9,7 +9,7 @@ one replan per perception frame on the robot) each world:
      with);
   2. seeds its planner's rollouts with them (`set_initial_wheel_omega` / `set_initial_twist`, as the
      ROS node does from /joint_states and odometry), calls `WindowCost.update` on the `nn` arms, and
-     replans (3 refines);
+     replans (`--n-refine`, the node's 3 by default);
   3. blends the new plan with the previous one, shifted a step (the node's `plan_consistency` 0.3),
      and sends its first step to ostrich -- yaw-compensated by the checkpoint's `ostrich_yaw_gain`,
      exactly as the dataset commanded ostrich, since that gain is part of what the net's labels mean.
@@ -18,7 +18,19 @@ Every (arm, repeat) is one replicated world of ONE ostrich build (replicated wor
 with each other), each with its own `MppiGpu`. Arms: `vanilla` (no hook), one `nn` arm per
 `--nn-weights` entry (the raw predicted error), and one `nnflat` arm per `--nn-flat-weights` entry
 (`WindowCost`'s baseline "flat": only the error predicted above the same command on level ground).
-Ostrich is nondeterministic, so repeats of one arm differ too.
+Those charge window 0 only; `--windows 1 3` gives every weight entry a second arm, suffixed `w3`,
+that charges windows 1 and 2 as well, at the same per-window weights, so the pair differs only in
+the later windows. Their terrain codes come from one `WarpTrunk` shared by all arms. `--nn-refines
+1` charges the cost in the first refine of every replan only, suffix `r1`: the net ranks the
+rollouts once and the remaining refines use MPPI's own cost (`WindowCost.replan_split`, the hook
+behind a conditional graph node, so no recapture). Ostrich is nondeterministic, so repeats of one
+arm differ too.
+
+Timing: every replan is timed on the wall clock (`WindowCost.update` + `replan` + reading the plan
+back, which waits for the GPU), and every planner profiles its refine stages with CUDA events (the
+hook runs inside "cost"). After the run, a table per arm gives the median and 90th percentile
+replan time and the mean ms per stage. Worlds replan one after another, so each replan has the GPU
+to itself, as on the robot, but ostrich steps between frames and warms the GPU.
 
 The planner is the node's (`elevation_node.py` defaults: 4096 rollouts, 3 refines, n_theta 24,
 elite 0.01, straight prior 0.2, its cost weights, a cost-to-go field with a 0.3 m robust margin
@@ -35,7 +47,8 @@ twin-vs-ostrich end-pose error ALONG THE DRIVEN PATH, which is the dataset's lab
 cost tries to keep small. The net's prediction for the same windows is printed beside it.
 
 Outputs `outputs/nn_mppi/<map>_<tag>.{h5,png}`: ostrich pose/wheel logs and commands per world, the
-per-window errors and predictions, and a bird's-eye plot of every world's path.
+per-window errors and predictions, the replan and stage times, and a bird's-eye plot of every
+world's path.
 
 CLI parameters:
     --checkpoint PATH       mppi_learning train.py checkpoint (required)
@@ -52,6 +65,11 @@ CLI parameters:
     --spin-frac F           MPPI SPIN prior fraction (default 0, the node's)
     --reach-radius M        arrival radius (default 0.3, the node's plan_reach_radius)
     --batch INT             MPPI rollouts (default 4096)
+    --n-refine INT          MPPI refines per replan (default 3)
+    --windows N [N ...]     windows each nn/nnflat arm charges, 1 (window 0) to 3; one arm per entry
+                            and weight entry (default 1)
+    --nn-refines K [K ...]  charge the nn cost in the first K refines of each replan only, 1 to
+                            --n-refine; one arm per entry, crossed with --windows (default: every refine)
     --routing-cell M        cost-to-go cell size, the map max-pooled to it (default 0.32)
     --pivot-cost C          cost-to-go point-turn primitives (default 0, the node's; a map whose only
                             way out is a turn in place, like the garage, needs > 0 and --spin-frac)
@@ -61,6 +79,12 @@ Usage:
     python src/feasibility/nn_mppi/closed_loop.py --checkpoint outputs/checkpoints/<ckpt>.pt --map flat
     python src/feasibility/nn_mppi/closed_loop.py --checkpoint outputs/checkpoints/<ckpt>.pt \\
         --map assets/garage/garage_b --pivot-cost 0.15 --spin-frac 0.1 --nn-weights 3,3 10,10 --repeats 2
+    python src/feasibility/nn_mppi/closed_loop.py --checkpoint outputs/checkpoints/<ckpt>.pt \\
+        --map assets/curb_detour/curb_detour_h015_g04 --batch 512 --n-refine 1 --nn-weights \\
+        --nn-flat-weights 30,30 100,100 300,300 --windows 1 3 --repeats 2
+    python src/feasibility/nn_mppi/closed_loop.py --checkpoint outputs/checkpoints/<ckpt>.pt \\
+        --map assets/curb_detour/curb_detour_h015_g04 --batch 512 --n-refine 3 --nn-weights \\
+        --nn-flat-weights 100,100 300,300 --windows 3 --nn-refines 1 3 --repeats 2
 """
 from __future__ import annotations
 
@@ -108,12 +132,15 @@ from feasibility.mppi_learning.train import load_checkpoint
 from feasibility.mppi_learning.twin import run_twin
 from feasibility.nn_mppi.mppi_cost import HORIZON
 from feasibility.nn_mppi.mppi_cost import N_KNOTS
+from feasibility.nn_mppi.mppi_cost import trunk_rows
 from feasibility.nn_mppi.mppi_cost import WindowCost
+from feasibility.nn_mppi.warp_trunk import WarpTrunk
 
 OUT = OUT_DIR / "nn_mppi"
 SETTLE_STEPS = 15  # ostrich steps dropping onto the terrain at zero command (mppi configs' settle_steps)
 STEPS_PER_FRAME = _exact_steps(MPPI_DT, OSTRICH_DT)  # 4 ostrich steps per replan
-N_REFINE = 3
+N_REFINE = 3  # the node's plan_n_refine, --n-refine's default
+STAGES = ("sample", "rollout", "cost", "reweight")  # MppiGpu's profiled refine stages; the hook is in "cost"
 PLAN_CONSISTENCY = 0.3  # the node's EMA of the new plan toward the previous one, shifted a step
 EDGE_MARGIN = 0.5  # [m] a world this close to the map edge is stopped as off_map
 FLIP_DEG = 60.0  # |pitch| or |roll| past this: flipped
@@ -129,7 +156,8 @@ def node_planner(
     sim.set_uniform_friction(mu)
     cost = CostParams(goal_running=0.3, effort=1e-3, turn=0.03, smoothness=0.04, saturation=300.0)
     sampling = SamplingConfig(wmax=4.0, wmin=0.0, n_knots=N_KNOTS, straight_frac=0.2, spin_frac=spin_frac, elite_frac=0.01)
-    planner = MppiGpu(sim, cost, sampling, n_theta=24, seed=seed)
+    # profile: CUDA events around each refine stage, read after every refine (the replan syncs anyway)
+    planner = MppiGpu(sim, cost, sampling, n_theta=24, seed=seed, profile=True)
     planner.reset_nominal(1.5)  # plan_nominal_reset
     return planner
 
@@ -197,6 +225,8 @@ class Arm:
     name: str
     weights: dict[str, float] | None  # None = vanilla
     baseline: str = "none"  # WindowCost's baseline
+    windows: int = 1  # WindowCost's n_windows
+    nn_refines: int | None = None  # charge the cost in the first nn_refines refines only; None = every refine
 
 
 def pitch_roll(q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -237,15 +267,27 @@ def run(args: argparse.Namespace) -> None:
             values = [float(v) for v in text.split(",")]
             if len(values) != len(net.target_names):
                 raise SystemExit(f"{flag} {text}: need {len(net.target_names)} values for {net.target_names}")
-            arms.append(Arm(f"{prefix}[{text}]", dict(zip(net.target_names, values)), baseline))
+            for n_windows in args.windows:
+                for nn_refines in args.nn_refines or [args.n_refine]:
+                    if not 1 <= nn_refines <= args.n_refine:
+                        raise SystemExit(f"--nn-refines {nn_refines}: must be in [1, --n-refine {args.n_refine}]")
+                    # window 0 alone, charged in every refine, keeps the old arm names
+                    suffix = (f"w{n_windows}" if n_windows > 1 else "") + (f"r{nn_refines}" if nn_refines < args.n_refine else "")
+                    arms.append(Arm(f"{prefix}[{text}]{suffix}", dict(zip(net.target_names, values)), baseline, n_windows,
+                                    nn_refines if nn_refines < args.n_refine else None))
     worlds = [(arm, r) for arm in arms for r in range(args.repeats)]
     n_worlds, n_frames = len(worlds), int(round(args.max_time / MPPI_DT))
     print(f"[map]      {map_name}: {terrain.nx}x{terrain.ny} @ {terrain.cell} m, start {start.tolist()}, goal {goal}")
     print(f"[labels]   k_turn {k_turn}, mu {mu}, ostrich yaw gain {yaw_gain} ({args.checkpoint.name})")
+    print(f"[planner]  {args.batch} rollouts, {args.n_refine} refine(s) per replan")
     print(f"[worlds]   {n_worlds}: " + ", ".join(f"{a.name} x{args.repeats}" for a in arms))
 
     t0 = time.perf_counter()
     V, lattice_grid, vcap = routing_field(terrain, goal, k_turn, args.routing_cell, args.pivot_cost, device)
+    # one WarpTrunk for every arm charging later windows: the replans run one after another on one
+    # stream, so they can share its activation buffers (~0.2 GB per 1000 patches)
+    most_windows = max([a.windows for a in arms if a.weights is not None], default=1)
+    trunk = WarpTrunk(net, trunk_rows(args.batch, most_windows), device) if most_windows > 1 else None
     planners, costs = [], []
     for i, (arm, _) in enumerate(worlds):
         planner = node_planner(terrain, k_turn, mu, args.batch, args.spin_frac, seed=i, device=device)
@@ -253,7 +295,8 @@ def run(args: argparse.Namespace) -> None:
         planner.cw.lattice_cap = vcap
         cost = None
         if arm.weights is not None:
-            cost = WindowCost(net, attrs, planner, arm.weights, blur_terrain=bool(ckpt["blur_terrain"]), baseline=arm.baseline)
+            cost = WindowCost(net, attrs, planner, arm.weights, blur_terrain=bool(ckpt["blur_terrain"]), baseline=arm.baseline,
+                              n_windows=arm.windows, trunk=trunk, switchable=arm.nn_refines is not None)
             planner.set_cost_hook(cost)
         planners.append(planner)
         costs.append(cost)
@@ -280,6 +323,7 @@ def run(args: argparse.Namespace) -> None:
     commands = np.zeros((n_frames, n_worlds, 3), np.float32)  # MPPI convention, what the twin would get
     driving = np.zeros((n_frames, n_worlds), bool)  # the frame's command came from MPPI
     previous_plan = [None] * n_worlds
+    plan_ms = np.full((n_frames, n_worlds), np.nan, np.float32)  # update + replan + the plan's readback
     t_plan = 0.0
     for f in range(n_frames):
         xy_yaw, wheels, twist, pose = ostrich.state()
@@ -300,13 +344,18 @@ def run(args: argparse.Namespace) -> None:
                 status[w], done[w], end_frame[w] = reason, True, f
         t = time.perf_counter()
         for w in np.flatnonzero(~done):
+            t_world = time.perf_counter()
             planner, cost = planners[w], costs[w]
             planner.sim.set_initial_wheel_omega(wheels[w])
             planner.sim.set_initial_twist(twist[w])
             if cost is not None:
                 cost.update(xy_yaw[w])
-            planner.replan(xy_yaw[w], goal, N_REFINE)
-            plan = planner.nominal()
+            if cost is not None and cost.switchable:
+                cost.replan_split(xy_yaw[w], goal, args.n_refine, worlds[w][0].nn_refines)
+            else:
+                planner.replan(xy_yaw[w], goal, args.n_refine)
+            plan = planner.nominal()  # a device-to-host copy: waits for the replan's GPU work
+            plan_ms[f, w] = (time.perf_counter() - t_world) * 1e3
             if previous_plan[w] is not None:
                 shifted = np.roll(previous_plan[w], -1, axis=0)
                 shifted[-1] = previous_plan[w][-1]
@@ -328,11 +377,14 @@ def run(args: argparse.Namespace) -> None:
     pose_log, wheel_log = ostrich.logs()
     windows = window_errors(terrain, pose_log, wheel_log, commands[:n_run], driving[:n_run], net, mu, k_turn, device)
     report(worlds, status, end_frame, pose_log, windows, goal)
+    # per world, the mean ms of each refine stage over its replans, the first (cold) refine excluded
+    stage_ms = np.array([[p.timing_stats()[s]["mean_ms"] for s in STAGES] for p in planners], np.float32)
+    report_timing(arms, worlds, plan_ms[:n_run], stage_ms)
     OUT.mkdir(parents=True, exist_ok=True)
     tag = args.tag or "_".join(a.name.replace("[", "").replace("]", "").replace(",", "-") for a in arms)
     stem = OUT / f"{map_name}_{tag}"
     save(stem.with_suffix(".h5"), args, map_name, terrain, start, goal, worlds, status, end_frame, pose_log, wheel_log,
-         commands[:n_run], driving[:n_run], windows, attrs)
+         commands[:n_run], driving[:n_run], windows, attrs, plan_ms[:n_run], stage_ms)
     plot(stem.with_suffix(".png"), terrain, start, goal, worlds, status, pose_log)
 
 
@@ -384,7 +436,7 @@ def window_errors(
 
 def report(worlds: list[tuple[Arm, int]], status: np.ndarray, end_frame: np.ndarray, pose_log: np.ndarray,
            windows: dict[str, np.ndarray], goal: tuple[float, float]) -> None:
-    print(f"\n{'world':>18} {'status':>9} {'time s':>7} {'path m':>7} {'|pitch|':>8} {'|roll|':>7} "
+    print(f"\n{'world':>22} {'status':>9} {'time s':>7} {'path m':>7} {'|pitch|':>8} {'|roll|':>7} "
           f"{'e_pos true/pred':>16} {'e_rot true/pred':>16}")
     for w, (arm, r) in enumerate(worlds):
         rows = pose_log[SETTLE_STEPS : frame_rows(end_frame[w]), w]
@@ -394,7 +446,7 @@ def report(worlds: list[tuple[Arm, int]], status: np.ndarray, end_frame: np.ndar
         true, pred = windows["true"][k], windows["pred"][k]
         errors = (f"{true[:, 0].mean():6.3f} / {pred[:, 0].mean():6.3f}   {true[:, 1].mean():6.3f} / {pred[:, 1].mean():6.3f}"
                   if k.any() else "      (no full window)")
-        print(f"{arm.name + f' #{r}':>18} {status[w]:>9} {end_frame[w] * MPPI_DT:7.1f} {path:7.2f} "
+        print(f"{arm.name + f' #{r}':>22} {status[w]:>9} {end_frame[w] * MPPI_DT:7.1f} {path:7.2f} "
               f"{np.degrees(np.abs(pitch).max()):7.1f}° {np.degrees(np.abs(roll).max()):6.1f}°   {errors}")
     if len(windows["frame"]) > 2:
         true, pred = windows["true"], windows["pred"]
@@ -403,10 +455,27 @@ def report(worlds: list[tuple[Arm, int]], status: np.ndarray, end_frame: np.ndar
               f"ostrich, pred = the net); correlation true vs pred e_pos {corr[0]:.2f}, e_rot {corr[1]:.2f}")
 
 
+def report_timing(arms: list[Arm], worlds: list[tuple[Arm, int]], plan_ms: np.ndarray, stage_ms: np.ndarray) -> None:
+    """Per arm, pooled over its worlds: wall time per replan (median and 90th percentile, the first
+    replan -- graph capture -- excluded) and the mean GPU time per refine stage. Worlds replan one
+    after another, so a replan has the GPU to itself, as on the robot."""
+    print(f"\n{'arm':>22} {'replan ms':>10} {'p90':>6}   per refine, ms: " + "  ".join(f"{s:>8}" for s in STAGES))
+    for arm in arms:
+        k = [w for w, (a, _) in enumerate(worlds) if a is arm]
+        times = plan_ms[1:, k]
+        times = times[np.isfinite(times)]
+        if times.size == 0:
+            continue
+        stages = stage_ms[k].mean(axis=0)
+        print(f"{arm.name:>22} {np.median(times):10.1f} {np.percentile(times, 90):6.1f}                   "
+              + "  ".join(f"{t:8.2f}" for t in stages))
+
+
 def save(path: pathlib.Path, args: argparse.Namespace, map_name: str, terrain: HeightMapReader, start: np.ndarray,
          goal: tuple[float, float], worlds: list[tuple[Arm, int]], status: np.ndarray, end_frame: np.ndarray,
          pose_log: np.ndarray, wheel_log: np.ndarray, commands: np.ndarray, driving: np.ndarray,
-         windows: dict[str, np.ndarray], label_attrs: dict[str, object]) -> None:
+         windows: dict[str, np.ndarray], label_attrs: dict[str, object], plan_ms: np.ndarray,
+         stage_ms: np.ndarray) -> None:
     with h5py.File(path, "w") as f:
         f.attrs["map"] = str(args.map)
         f.attrs["map_name"] = map_name
@@ -416,12 +485,17 @@ def save(path: pathlib.Path, args: argparse.Namespace, map_name: str, terrain: H
         f.attrs["settle_steps"] = SETTLE_STEPS
         f.attrs["ostrich_dt"] = OSTRICH_DT
         f.attrs["mppi_dt"] = MPPI_DT
-        for key in ("batch", "spin_frac", "reach_radius", "routing_cell", "pivot_cost", "max_time"):
+        for key in ("batch", "n_refine", "spin_frac", "reach_radius", "routing_cell", "pivot_cost", "max_time"):
             f.attrs[key] = getattr(args, key)
         for key, value in label_attrs.items():
             f.attrs[f"label_{key}"] = value
         f["arm"] = np.array([a.name for a, _ in worlds], dtype=h5py.string_dtype())
         f["arm_baseline"] = np.array([a.baseline for a, _ in worlds], dtype=h5py.string_dtype())
+        f["arm_windows"] = np.array([a.windows for a, _ in worlds])
+        f["arm_nn_refines"] = np.array([a.nn_refines or args.n_refine for a, _ in worlds])  # refines charged
+        f["plan_ms"] = plan_ms  # [frames, W] wall time of update + replan + readback, NaN when not planning
+        f["stage_ms"] = stage_ms  # [W, stages] mean GPU ms per refine stage
+        f["stage_ms"].attrs["stages"] = list(STAGES)
         f["repeat"] = np.array([r for _, r in worlds])
         f["status"] = np.array(list(status), dtype=h5py.string_dtype())
         f["end_frame"] = end_frame
@@ -479,6 +553,10 @@ if __name__ == "__main__":
     parser.add_argument("--spin-frac", type=float, default=0.0, help="MPPI SPIN prior fraction (the node's 0)")
     parser.add_argument("--reach-radius", type=float, default=0.3, help="arrival radius [m]")
     parser.add_argument("--batch", type=int, default=4096, help="MPPI rollouts")
+    parser.add_argument("--n-refine", type=int, default=N_REFINE, help="MPPI refines per replan (the node's 3)")
+    parser.add_argument("--windows", type=int, nargs="+", default=[1], help="windows charged: one nn/nnflat arm per entry and weights")
+    parser.add_argument("--nn-refines", type=int, nargs="+", default=None,
+                        help="charge the nn cost in the first K refines only: one arm per entry (default: every refine)")
     parser.add_argument("--routing-cell", type=float, default=0.32, help="cost-to-go cell size [m]")
     parser.add_argument("--pivot-cost", type=float, default=0.0, help="cost-to-go point-turn cost (the node's 0 = off)")
     parser.add_argument("--tag", type=str, default=None, help="output file suffix")

@@ -445,5 +445,31 @@ eager and fused):
   reproduce, and raising a patch by 5 cm moves the current net's prediction by 0.030 m /
   0.068 rad. A zero-sum first convolution would make it exact, at the cost of a retrain.
 
+**First try: the full net per rollout window, in Warp (2026-09-30).** `WindowCost(...,
+n_windows=3)` samples each rollout's patch at steps 10 and 20 inside the refine graph and runs
+`nn_mppi/warp_trunk.WarpTrunk` over them (`nn_mppi/trunk_speed.md`). The planner runs at 512
+rollouts × 1 refine; one refine per 0.1 s frame is still classic MPPI, since the plan is
+warm-started. `closed_loop.py --windows 1 3` runs vanilla and `nnflat` at 30, 100 and 300, each
+charging window 0 only or windows 0–2 at the same per-window weights, with 2 repeats, 25 s, GTX 1050:
+
+| map | window 0 only | windows 0–2 |
+|---|---|---|
+| curb end at y = 0.4 | 300: stops at the curb face, 2/2 time out. ≤ 100: crosses | **300: goes round the end, 2/2 arrive in 14.2 s, max pitch ≤ 1.5°**. 100: crosses, later and at an angle, with 2× the true e_rot |
+| curb end at y = 1.0 | 300: crawls over, 24.5–24.9 s. ≤ 100: crosses | 300: turns toward −y (the closed side) and stalls at the face, 2/2 time out. ≤ 100: crosses |
+| flat, 8 m | all arrive in 10.3–11.2 s (vanilla 10.6–10.8) | all arrive in 8.6–10.7 s |
+
+* **Later windows do choose a route**, when the way round fits in the 3 s horizon. A curb end at
+  0.4 m needs about 1 m of sideways shift, which fits. At 1.0 m the detour doesn't finish inside
+  the horizon, and the cost-to-go (which routes over the curb) gives no reason to prefer either
+  side. The planner then turns away from the charge without reaching a way round. Why it picks −y
+  in both repeats was not investigated. A wider detour needs the error in the cost-to-go (the
+  gated-lattice route of 9d.6), not a longer MPPI horizon.
+* **Flat ground is unaffected**, so the level baseline holds over windows 1–2 too.
+* **Cost:** 99.7 ms per replan in isolation (`mppi_cost.py --bench`), against 4.9 ms for window 0
+  only. In the closed loop, median 101–126 ms and p90 109–139 ms, rising as the laptop GPU heats
+  over back-to-back runs (vanilla's rollout stage slows from 2.5 to 3.2 ms alongside). A late
+  stretch of the y = 1.0 run reached a 396 ms p90. It is over budget on this GPU; the Orin
+  estimate is in `trunk_speed.md`.
+
 **The robot.** The ROS node lives in helhest_stack and cannot import this tree. How it loads the
 hook and calls `update` is decided once step 10 works in simulation.
