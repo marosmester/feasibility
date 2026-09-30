@@ -471,5 +471,24 @@ charging window 0 only or windows 0–2 at the same per-window weights, with 2 r
   stretch of the y = 1.0 run reached a 396 ms p90. It is over budget on this GPU; the Orin
   estimate is in `trunk_speed.md`.
 
+**The net in the first refine only, then 2 vanilla refines (2026-09-30).** The idea: the net
+ranks the rollouts coarsely, and the usual refines polish the result locally
+(`WindowCost.replan_split`, `closed_loop.py --nn-refines 1 3`). The setup was 512 rollouts × 3
+refines, windows 0–2, `nnflat` at 100 and 300, 2 repeats. **It does not work.** On both curb maps
+the `r1` arms drive straight over the curb like vanilla (11.2–11.8 s against vanilla's
+11.0–11.4 s). The net in all 3 refines goes round at 300 on the y = 0.4 map (18.6–20 s) and
+stalls on the y = 1.0 map, as with 1 refine. The vanilla refines do not polish the net's choice;
+they replace it:
+* Only candidate 0 and the NARROW band are sampled around U. WIDE, STRAIGHT and SPIN ignore it.
+* Each refine sets U to the mean of its top 1 %, and the vanilla cost's elites come from wherever
+  crossing is cheapest.
+* The self-test catches this directly: after 1 hooked refine and 2 vanilla ones, U can be
+  bit-identical to the unhooked planner's.
+
+Keeping the net's choice would take refines 2–3 that sample only around U. The alternative is a
+cost that still carries the curb there, e.g. window 0 alone at ~2 ms per refine. The split costs
+106 ms per replan against 100 ms for the net's single refine (`mppi_cost.py --bench`, cool GPU):
+the two vanilla refines add ~3 ms each.
+
 **The robot.** The ROS node lives in helhest_stack and cannot import this tree. How it loads the
 hook and calls `update` is decided once step 10 works in simulation.

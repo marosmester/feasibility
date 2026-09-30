@@ -54,7 +54,6 @@ from __future__ import annotations
 import argparse
 import copy
 import pathlib
-import time
 from collections.abc import Callable
 
 import numpy as np
@@ -62,10 +61,15 @@ import torch
 import torch.nn.functional as F
 import warp as wp
 
+from feasibility.lattice_learning.model import _conv3_out
 from feasibility.lattice_learning.model import ArcDivergenceNet
 from feasibility.nn_mppi.channel_layer_norm import _load
+from feasibility.nn_mppi.channel_layer_norm import _max_rel
+from feasibility.nn_mppi.channel_layer_norm import _time_ms
 from feasibility.nn_mppi.channel_layer_norm import nchw_layer_norm
 from feasibility.nn_mppi.mppi_cost import _dense_kernel
+from feasibility.nn_mppi.mppi_cost import _padded_rows
+from feasibility.nn_mppi.mppi_cost import _quads
 from feasibility.nn_mppi.mppi_cost import _silu
 from feasibility.nn_mppi.mppi_cost import _silu4
 from feasibility.nn_mppi.mppi_cost import ROWS_PER_THREAD
@@ -261,12 +265,6 @@ def _pack_kernel(patch: wp.array3d(dtype=float), x: wp.array4d(dtype=wp.vec4)):
     x[b, i, j, 0] = wp.vec4(patch[b, i, j], 0.0, 0.0, 0.0)
 
 
-def _quads(t: torch.Tensor, device: wp.context.Device) -> wp.array:
-    """[..., n] -> vec4 [..., n / 4] on `device`."""
-    a = t.detach().float().cpu().numpy()
-    return wp.array(np.ascontiguousarray(a.reshape(*a.shape[:-1], -1, 4)), dtype=wp.vec4, device=device)
-
-
 def _check_trunk(net: ArcDivergenceNet) -> list[tuple[int, int, int, int, int]]:
     """Per block (Cin, Cout, stride, Ho, Wo) at patch size; raises on anything these kernels do not
     implement."""
@@ -277,13 +275,32 @@ def _check_trunk(net: ArcDivergenceNet) -> list[tuple[int, int, int, int, int]]:
         if conv.kernel_size != (3, 3) or conv.padding != (1, 1) or conv.padding_mode != "replicate":
             raise ValueError(f"only replicate-padded 3x3 convs are implemented, got {conv}")
         stride = conv.stride[0]
-        height, width = (height - 1) // stride + 1, (width - 1) // stride + 1
+        height, width = _conv3_out(height, stride), _conv3_out(width, stride)
         shapes.append((conv.in_channels, conv.out_channels, stride, height, width))
     if net.geometry.kernel_size != (height, width):
         raise ValueError(f"geometry kernel {net.geometry.kernel_size} != trunk output {(height, width)}")
     if any(cout % 4 or wo % PIXELS for _, cout, _, _, wo in shapes) or net.squeeze.out_channels % 4:
         raise ValueError(f"widths must be multiples of 4 and output widths of {PIXELS}: {shapes}")
     return shapes
+
+
+# The steps are module functions, not methods: a closure over `self`, stored in `self.steps`, would
+# put every trunk into a reference cycle that only the cycle collector frees, ~0.2 GB of buffers late.
+def _launcher(kernel: wp.Kernel, inputs: list, dim: Callable[[int], tuple[int, ...]],
+              device: wp.context.Device) -> Callable[[int], None]:
+    def launch(b: int) -> None:
+        wp.launch(kernel, dim(b), inputs=inputs, device=device)
+    return launch
+
+
+def _dense_launcher(x: wp.array, weight: torch.Tensor, bias: torch.Tensor, y: wp.array, rows_per_patch: int,
+                    device: wp.context.Device) -> Callable[[int], None]:
+    inputs = [x, _quads(weight, device), _quads(bias, device), 0, y]
+
+    def launch(b: int) -> None:
+        groups = _padded_rows(b) // ROWS_PER_THREAD * rows_per_patch  # b rounded up to whole row groups
+        wp.launch(_dense_kernel, (groups, y.shape[1]), inputs=inputs, device=device)
+    return launch
 
 
 class WarpTrunk:
@@ -297,16 +314,17 @@ class WarpTrunk:
         self.ny, self.nx = spec.ny, spec.nx
         # the dense layers take rows in groups of ROWS_PER_THREAD; batch rows past a call's B are
         # computed on stale buffers and never read
-        self.max_batch = -(-max_batch // ROWS_PER_THREAD) * ROWS_PER_THREAD
-        batch = self.max_batch
+        self.max_batch = _padded_rows(max_batch)
+        batch, dev = self.max_batch, self.device
         largest = max([spec.ny * spec.nx * 4] + [ho * wo * cout for _, cout, _, ho, wo in self.shapes])
         with wp.ScopedDevice(self.device):
             # two ping-pong buffers big enough for any block; each layer gets a view of the right shape
             self._buffers = [wp.zeros(batch * largest // 4, dtype=wp.vec4) for _ in range(2)]
             self.steps: list[tuple[str, Callable[[int], None]]] = []
             source = self._view(1, (batch, spec.ny, spec.nx, 1))
-            self._packed = source
-            self.steps.append(("pack", self._launcher(_pack_kernel, None, lambda b: (b, self.ny, self.nx))))
+            self._pack_inputs = [None, source]  # the patch is set per call
+            self.steps.append(("pack", _launcher(_pack_kernel, self._pack_inputs,
+                                                 lambda b, ny=spec.ny, nx=spec.nx: (b, ny, nx), dev)))
             height, width, in_quads = spec.ny, spec.nx, 1
             for k, (block, (cin, cout, stride, ho, wo)) in enumerate(zip(net.blocks, self.shapes)):
                 weight = block.conv.weight.detach().permute(2, 3, 1, 0)  # [3, 3, Cin, Cout]
@@ -316,17 +334,15 @@ class WarpTrunk:
                 # 6.0 ms against 8.4 / 6.6 / 6.4); at 32 they halve the threads for less reuse and lose
                 qpt = 2 if cout >= 64 and (cout // 4) % 2 == 0 else 1
                 kernel = _conv_kernel(stride, qpt)
-                conv_inputs = [self._buffers[(k + 1) % 2], _quads(weight, self.device), _quads(block.conv.bias, self.device),
+                conv_inputs = [self._buffers[(k + 1) % 2], _quads(weight, dev), _quads(block.conv.bias, dev),
                                height, width, in_quads, ho, wo, cout // 4, self._buffers[k % 2]]
-                self.steps.append((f"block {k} conv", self._launcher(
-                    kernel, conv_inputs,
-                    lambda b, ho=ho, wo=wo, t=cout // 4 // qpt: (b, ho, wo // PIXELS, t))))
+                self.steps.append((f"block {k} conv", _launcher(
+                    kernel, conv_inputs, lambda b, ho=ho, wo=wo, t=cout // 4 // qpt: (b, ho, wo // PIXELS, t), dev)))
                 height, width, in_quads = ho, wo, cout // 4
                 layer_norm = block.norm.norm
-                norm_inputs = [target, _quads(layer_norm.weight, self.device), _quads(layer_norm.bias, self.device),
-                               float(layer_norm.eps)]
-                self.steps.append((f"block {k} norm", self._launcher(
-                    _nhwc_norm_kernel(cout // 4), norm_inputs, lambda b, ho=ho, wo=wo: (b, ho, wo))))
+                norm_inputs = [target, _quads(layer_norm.weight, dev), _quads(layer_norm.bias, dev), float(layer_norm.eps)]
+                self.steps.append((f"block {k} norm", _launcher(
+                    _nhwc_norm_kernel(cout // 4), norm_inputs, lambda b, ho=ho, wo=wo: (b, ho, wo), dev)))
                 source = target
             _, cout, _, ho, wo = self.shapes[-1]
             squeeze_out = net.squeeze.out_channels
@@ -335,14 +351,15 @@ class WarpTrunk:
             assert squeeze_in.ptr == source.ptr
             self._squeezed = wp.zeros((batch * rows, squeeze_out // 4), dtype=wp.vec4)
             squeeze_weight = net.squeeze.weight.detach().reshape(squeeze_out, cout).T
-            self._dense_step("squeeze", squeeze_in, squeeze_weight, net.squeeze.bias, self._squeezed, rows)
+            self.steps.append(("squeeze", _dense_launcher(squeeze_in, squeeze_weight, net.squeeze.bias, self._squeezed,
+                                                          rows, dev)))
             # the squeeze output, row-major over (b, h, w, c), IS the NHWC flattening per patch
             geometry_in = wp.array(ptr=self._squeezed.ptr, dtype=wp.vec4, shape=(batch, rows * squeeze_out // 4),
                                    device=self.device)
             geometry_weight = net.geometry.weight.detach().permute(2, 3, 1, 0).reshape(-1, net.geometry.out_channels)
             self.code = wp.zeros((batch, net.geometry.out_channels // 4), dtype=wp.vec4)
-            self._dense_step("geometry", geometry_in, geometry_weight, net.geometry.bias, self.code, 1)
-            self._keep = [squeeze_in, geometry_in]
+            self.steps.append(("geometry", _dense_launcher(geometry_in, geometry_weight, net.geometry.bias, self.code,
+                                                           1, dev)))
         self._graphs: dict[int, object] = {}
 
     def _view(self, which: int, shape: tuple[int, ...]) -> wp.array:
@@ -350,28 +367,12 @@ class WarpTrunk:
         assert np.prod(shape) <= base.shape[0], (shape, base.shape)
         return wp.array(ptr=base.ptr, dtype=wp.vec4, shape=shape, device=self.device)
 
-    def _launcher(self, kernel: wp.Kernel, inputs: list | None, dim: Callable[[int], tuple[int, ...]]) -> Callable[[int], None]:
-        def launch(b: int) -> None:
-            args = inputs if inputs is not None else [self._patch, self._packed]
-            wp.launch(kernel, dim(b), inputs=args, device=self.device)
-        return launch
-
-    def _dense_step(self, name: str, x: wp.array, weight: torch.Tensor, bias: torch.Tensor, y: wp.array,
-                    rows_per_patch: int) -> None:
-        inputs = [x, _quads(weight, self.device), _quads(bias, self.device), 0, y]
-
-        def launch(b: int) -> None:
-            groups = -(-b // ROWS_PER_THREAD) * rows_per_patch  # b rounded up to whole row groups
-            wp.launch(_dense_kernel, (groups, y.shape[1]), inputs=inputs, device=self.device)
-
-        self.steps.append((name, launch))
-
     def __call__(self, patch: wp.array) -> wp.array:
         """[B, ny, nx] float relief -> [B, geometry_channels / 4] vec4 terrain codes (a view)."""
         b = patch.shape[0]
         if b > self.max_batch or patch.shape[1:] != (self.ny, self.nx):
             raise ValueError(f"patch {patch.shape}: at most {self.max_batch} x {self.ny} x {self.nx}")
-        self._patch = patch
+        self._pack_inputs[0] = patch
         for _, step in self.steps:
             step(b)
         return self.code[:b]
@@ -438,10 +439,6 @@ class HybridTrunk:
 # --- self-test and timing ------------------------------------------------------------------------
 
 
-def _max_rel(got: torch.Tensor, expected: torch.Tensor) -> float:
-    return ((got - expected).abs().max() / expected.abs().max().clamp_min(1e-6)).item()
-
-
 def _test_patches(net: ArcDivergenceNet, device: torch.device) -> dict[str, torch.Tensor]:
     from feasibility.heightmap.create_box_obstacles import build_centered_box
     from feasibility.heightmap.create_rough_terrain import build_rough_terrain
@@ -471,22 +468,6 @@ def self_test(net: ArcDivergenceNet, warp_trunk: WarpTrunk, hybrid: HybridTrunk,
         errors = {k: _max_rel(v, expected) for k, v in (("hybrid", got_hybrid), ("warp", got_warp), ("graph", got_graph))}
         assert max(errors.values()) < 1e-4, (name, errors)
         print(f"[check] {name}: max rel diff vs terrain_code " + ", ".join(f"{k} {v:.1e}" for k, v in errors.items()))
-
-
-def _time_ms(fn: Callable[[], object], trials: int = 5, reps: int = 5) -> float:
-    """The fastest of `trials` means over `reps` calls: this laptop GPU drops its clock in bursts
-    (software power cap), and one burst inflates every number it overlaps ~10x, torch's included."""
-    for _ in range(3):
-        fn()
-    best = float("inf")
-    for _ in range(trials):
-        torch.cuda.synchronize()
-        start = time.perf_counter()
-        for _ in range(reps):
-            fn()
-        torch.cuda.synchronize()
-        best = min(best, (time.perf_counter() - start) / reps * 1e3)
-    return best
 
 
 def bench_layers(net: ArcDivergenceNet, fast: ArcDivergenceNet, warp_trunk: WarpTrunk, hybrid: HybridTrunk,
