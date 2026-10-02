@@ -86,6 +86,7 @@ import pathlib
 import torch
 import wandb
 
+from feasibility.checkpoints.artifacts import log_checkpoint
 from feasibility.comparator.common import OUT_DIR
 from feasibility.comparator.provenance import git_provenance
 from feasibility.grid_learning.custom_dataset import GridPoseErrorDataset
@@ -425,7 +426,7 @@ def final_report(
     )
 
 
-def train(args: argparse.Namespace, run: wandb.sdk.wandb_run.Run) -> None:
+def train(args: argparse.Namespace, run: wandb.sdk.wandb_run.Run) -> pathlib.Path | None:
     device = torch.device(args.device)
     torch.manual_seed(args.seed)
 
@@ -556,13 +557,14 @@ def train(args: argparse.Namespace, run: wandb.sdk.wandb_run.Run) -> None:
         # val_loss never improved on inf -- every epoch produced a non-finite loss (e.g. blown-up
         # gradients). Nothing was ever saved, so there is no checkpoint for final_report to load.
         print("[done]  no checkpoint saved (val_loss never improved) -- skipping final report")
-        return
+        return None
 
     run.save(str(checkpoint_path), base_path=str(checkpoint_path.parent), policy="now")
     final_report(
         checkpoint_path, ds, val_loader, val_subset.indices, spawn_xy, device, run,
         blur_terrain=args.blur_terrain,
     )
+    return checkpoint_path
 
 
 def main() -> None:
@@ -599,7 +601,7 @@ def main() -> None:
         config=vars(args),
     )
     try:
-        train(args, run)
+        log_checkpoint(run, train(args, run))
     finally:
         run.finish()
 

@@ -114,6 +114,7 @@ import torch
 import wandb
 from helhest.engine import RobotParams
 
+from feasibility.checkpoints.artifacts import log_checkpoint
 from feasibility.comparator.common import OUT_DIR
 from feasibility.comparator.provenance import git_provenance
 from feasibility.lattice_learning.arc import ARC_DURATION_S
@@ -947,7 +948,7 @@ def main() -> None:
         config=vars(args),
     )
     try:
-        train(args, run)
+        log_checkpoint(run, train(args, run))
     finally:
         run.finish()
 
