@@ -36,6 +36,9 @@ Run:
         --tau-pitch 0.2 --repeats 5
     python demos/ostrich_follow_path.py --map assets/uphill_series/uphill_a0500 --planner nn-gated-fused \
         --start-side left --goal-side right --view
+    # vanilla-off climbs the 65 deg face and flips; the gated planners go round by the 20 deg ramp
+    python demos/ostrich_follow_path.py --map assets/ramp_detour/ramp_detour_s0650_g0200_a040 --planner vanilla-off
+    python demos/ostrich_follow_path.py --map assets/ramp_detour/ramp_detour_s0650_g0200_a040 --planner nn-gated-pos
 
 CLI parameters:
     --map PATH            heightmap stem (PNG + YAML), required

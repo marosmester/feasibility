@@ -91,6 +91,7 @@ import tempfile
 import torch
 import wandb
 
+from feasibility.checkpoints.artifacts import log_checkpoint
 from feasibility.comparator.common import OUT_DIR
 from feasibility.comparator.provenance import git_provenance
 from feasibility.grid_learning_2.custom_dataset import GridDivergenceDataset
@@ -824,7 +825,7 @@ def main() -> None:
         config=vars(args),
     )
     try:
-        train(args, run)
+        log_checkpoint(run, train(args, run))
     finally:
         run.finish()
 
