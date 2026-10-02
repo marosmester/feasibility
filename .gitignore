@@ -8,9 +8,9 @@ assets
 imgui.ini
 wandb
 *.aux
-*.fls
-*.pdf
-*synctex.gz
-*.tex
+*.fdb_latexmk
 *.log
-*fdb_latexmk
+*.pdf
+*.synctex.gz
+*.tex
+*.fls
