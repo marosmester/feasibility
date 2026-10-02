@@ -77,6 +77,7 @@ import numpy as np
 import torch
 import wandb
 
+from feasibility.checkpoints.artifacts import log_checkpoint
 from feasibility.comparator.common import OUT_DIR
 from feasibility.comparator.provenance import git_provenance
 from feasibility.lattice_learning.model import DEFAULT_BASE_WIDTH
@@ -629,7 +630,7 @@ def main() -> None:
     run = wandb.init(project=args.wandb_project, entity=args.wandb_entity, name=args.wandb_name,
                      mode=args.wandb_mode, config={**vars(args), "dataset": [str(p) for p in args.dataset]})
     try:
-        train(args, run)
+        log_checkpoint(run, train(args, run))
     finally:
         run.finish()
 

@@ -71,6 +71,7 @@ import torch
 import torch.nn.functional as F
 import wandb
 
+from feasibility.checkpoints.artifacts import log_checkpoint
 from feasibility.comparator.common import OUT_DIR
 from feasibility.comparator.provenance import git_provenance
 from feasibility.learning.custom_dataset import make_dataloaders
@@ -178,7 +179,7 @@ def describe_input_structure(ds: PoseErrorDataset) -> str:
     return "\n".join(lines)
 
 
-def train(args: argparse.Namespace, run: wandb.sdk.wandb_run.Run) -> None:
+def train(args: argparse.Namespace, run: wandb.sdk.wandb_run.Run) -> pathlib.Path:
     device = torch.device(args.device)
     torch.manual_seed(args.seed)
 
@@ -283,6 +284,7 @@ def train(args: argparse.Namespace, run: wandb.sdk.wandb_run.Run) -> None:
     run.summary["best_val_loss"] = best_val_loss
     run.summary["best_epoch"] = best_epoch
     run.save(str(checkpoint_path), base_path=str(checkpoint_path.parent), policy="now")
+    return checkpoint_path
 
 
 def main() -> None:
@@ -317,7 +319,7 @@ def main() -> None:
         config=vars(args),
     )
     try:
-        train(args, run)
+        log_checkpoint(run, train(args, run))
     finally:
         run.finish()
 
