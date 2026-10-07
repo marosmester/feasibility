@@ -5,25 +5,32 @@ TensorRT's profile of the original fp16 trunk spends only ~40% in convolution: t
 replicate pad before every conv (~17%), the permute-based `ChannelLayerNorm` (~12-17%) and layout
 copies between the two (~20-25%), none of which it fuses. Here every trunk block is instead
 
-    Conv2d(k=3, zero padding, no bias) -> BatchNorm2d -> SiLU
+    Conv2d(k=3, no bias) -> BatchNorm2d -> SiLU
 
 and at inference BatchNorm is a per-channel affine that folds into the conv's weights and bias, so a
-block is one conv + bias + SiLU kernel. Everything after the trunk (squeeze, geometry layer, FiLM
+block is one conv + bias + SiLU kernel. The FIRST block keeps replicate padding (`first_padding`,
+default "replicate"); every later block pads with zeros. The first block reads the relief itself,
+where a zero border is a fake step wherever the patch edge is not at wheel height (on a slope, say),
+and it has one input channel, so its pad is one cheap op on the smallest tensor in the trunk. The
+later blocks pad learned activations, where zero means nothing physical anyway, and they are where
+the pads cost time. `first_padding="zeros"` is the all-zero trunk of the first trained checkpoint,
+which was clearly worse than the original on rows that do not touch terrain (e_pos R^2 0.33 -> 0.07). Everything after the trunk (squeeze, geometry layer, FiLM
 head, `TargetTransform`, command features) is `WindowDivergenceNet`'s, unchanged; channels and
 strides follow `TRUNK_PLAN`, so the trunk still ends at 6 x 9.
 
 What this gives up, against `lattice_learning/model.py`'s reasons for its blocks:
 
-  * zero padding says "level ground at wheel-contact height" beyond the patch edge rather than
-    "the edge extended" -- for a relief patch (heights relative to the wheels) that is a physical
-    statement too, but a different one, and the net sees the border;
+  * past the first block, zero padding makes the border visible to the net, where replicate
+    padding extends the edge;
   * the patch <-> map crop equivalence no longer holds near the border, so `encode_map` is not the
     dense form of patch mode. MPPI (`nn_mppi`) only uses patch mode;
   * BatchNorm pools statistics over (batch, H, W) in TRAINING only; at eval it is a fixed affine,
     so the trunk's receptive field at inference is still local.
 
-`train.py --trunk trt_friendly` trains it; the checkpoint's `trunk` key makes `load_checkpoint`
-rebuild this class. `nn_mppi.warp_trunk` hard-codes the original blocks and refuses this net, so in
+`train.py --trunk trt_friendly [--trunk-first-padding zeros]` trains it. The checkpoint's `trunk`
+and `trunk_first_padding` keys make `load_checkpoint` rebuild this class. A trt_friendly checkpoint
+without `trunk_first_padding` predates it and is all-zero; the padding mode is not in the
+`state_dict`, so without that key it would load silently into the wrong trunk. `nn_mppi.warp_trunk` hard-codes the original blocks and refuses this net, so in
 MPPI it runs through a TensorRT trunk (`bench_full_tensorrt.TrtTrunk`).
 
 Usage:
@@ -50,18 +57,20 @@ from feasibility.mppi_learning.model import window_command_features
 from feasibility.mppi_learning.model import WindowDivergenceNet
 from feasibility.mppi_learning.spawn_sampling import PATCH_SPEC
 
-__all__ = ["TRUNK_STYLE", "TRUNK_STYLES", "TrtConvBlock", "TrtFriendlyWindowDivergenceNet", "fold_batchnorm"]
+__all__ = ["FIRST_PADDINGS", "TRUNK_STYLE", "TRUNK_STYLES", "TrtConvBlock", "TrtFriendlyWindowDivergenceNet", "fold_batchnorm"]
 
 TRUNK_STYLE = "trt_friendly"
 TRUNK_STYLES = ("original", TRUNK_STYLE)  # train.py --trunk; a checkpoint without a `trunk` key is "original"
+FIRST_PADDINGS = ("replicate", "zeros")  # the first block's padding_mode
 
 
 class TrtConvBlock(nn.Module):
-    """conv3 (zero padding, no bias: BatchNorm's shift replaces it) -> BatchNorm2d -> SiLU."""
+    """conv3 (no bias: BatchNorm's shift replaces it) -> BatchNorm2d -> SiLU."""
 
-    def __init__(self, in_channels: int, out_channels: int, stride: int) -> None:
+    def __init__(self, in_channels: int, out_channels: int, stride: int, padding_mode: str = "zeros") -> None:
         super().__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False,
+                              padding_mode=padding_mode)
         self.norm = nn.BatchNorm2d(out_channels)
         self.act = nn.SiLU()
 
@@ -70,14 +79,19 @@ class TrtConvBlock(nn.Module):
 
 
 class TrtFriendlyWindowDivergenceNet(WindowDivergenceNet):
-    """`WindowDivergenceNet` with `TrtConvBlock`s in the trunk; everything else inherited."""
+    """`WindowDivergenceNet` with `TrtConvBlock`s in the trunk (the first one padded `first_padding`,
+    the rest with zeros); everything else inherited."""
 
-    def __init__(self, *, base_width: int = 32, **kwargs: object) -> None:
+    def __init__(self, *, base_width: int = 32, first_padding: str = "replicate", **kwargs: object) -> None:
         super().__init__(base_width=base_width, **kwargs)
+        if first_padding not in FIRST_PADDINGS:
+            raise ValueError(f"first_padding must be one of {FIRST_PADDINGS}, got {first_padding!r}")
+        self.first_padding = first_padding
         blocks: list[nn.Module] = []
         in_channels = N_CHANNELS
-        for mult, block_stride in TRUNK_PLAN:
-            blocks.append(TrtConvBlock(in_channels, base_width * mult, block_stride))
+        for k, (mult, block_stride) in enumerate(TRUNK_PLAN):
+            padding_mode = first_padding if k == 0 else "zeros"
+            blocks.append(TrtConvBlock(in_channels, base_width * mult, block_stride, padding_mode))
             in_channels = base_width * mult
         self.blocks = nn.ModuleList(blocks)
 
@@ -90,7 +104,8 @@ def fold_batchnorm(net: TrtFriendlyWindowDivergenceNet) -> TrtFriendlyWindowDive
     for block in folded.blocks:
         conv, bn = block.conv, block.norm
         scale = bn.weight / torch.sqrt(bn.running_var + bn.eps)
-        fused = nn.Conv2d(conv.in_channels, conv.out_channels, 3, stride=conv.stride, padding=1, bias=True)
+        fused = nn.Conv2d(conv.in_channels, conv.out_channels, 3, stride=conv.stride, padding=1, bias=True,
+                          padding_mode=conv.padding_mode)
         fused.weight.copy_(conv.weight * scale[:, None, None, None])
         fused.bias.copy_(bn.bias - bn.running_mean * scale)
         block.conv, block.norm = fused, nn.Identity()
@@ -120,8 +135,21 @@ if __name__ == "__main__":
     assert all(isinstance(b, TrtConvBlock) for b in net.blocks) and len(net.blocks) == len(TRUNK_PLAN)
     assert net.geometry.kernel_size == (6, 9) and net.terrain_code(patch).shape[-2:] == (1, 1)
     assert not any("ChannelLayerNorm" in type(m).__name__ for m in net.modules())
+    assert [b.conv.padding_mode for b in net.blocks] == ["replicate"] + ["zeros"] * (len(TRUNK_PLAN) - 1)
     print(f"[forward] TrtFriendlyWindowDivergenceNet ({n_params} params, original {n_original}): "
-          f"6 x TrtConvBlock, trunk 6x9, y [B, K] in both label modes")
+          f"6 x TrtConvBlock (block 0 replicate-padded, the rest zeros), trunk 6x9, y [B, K] in both label modes")
+
+    # a level patch raised by h: with a replicated first border the first block sees no edge, so
+    # its output is uniform over the whole patch; with zeros it sees a step at the border
+    level = torch.full((1, N_CHANNELS, spec.ny, spec.nx), 0.7)
+    zeros_net = TrtFriendlyWindowDivergenceNet(base_width=args.base_width, first_padding="zeros").eval()
+    zeros_net.blocks[0].load_state_dict(net.blocks[0].state_dict())
+    with torch.no_grad():
+        spread = {name: (m.blocks[0](level).amax(dim=(-2, -1)) - m.blocks[0](level).amin(dim=(-2, -1))).abs().max().item()
+                  for name, m in (("replicate", net.eval()), ("zeros", zeros_net))}
+    assert spread["replicate"] < 1e-6 < spread["zeros"], spread
+    print(f"[padding] level raised patch through block 0: spread {spread['replicate']:.1e} replicate, "
+          f"{spread['zeros']:.1e} zeros (the fake border step)")
 
     # the trunk never sees the command
     probe = command.clone().requires_grad_(True)
@@ -145,6 +173,7 @@ if __name__ == "__main__":
         code, code_folded = net.terrain_code(patch), folded.terrain_code(patch)
     err = ((code - code_folded).abs().max() / code.abs().max()).item()
     assert err < 1e-5, err
+    assert folded.blocks[0].conv.padding_mode == "replicate"
     print(f"[bn-fold] eval trunk == conv+bias+SiLU with BatchNorm folded in, max rel diff {err:.1e}")
 
     net.target_transform = TargetTransform.fit(torch.rand(64, len(net.target_names)) * 2.0)
