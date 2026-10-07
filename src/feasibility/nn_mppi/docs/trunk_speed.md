@@ -117,5 +117,38 @@ All forms roll out identical trajectories (asserted). Against `WarpTrunk` + Warp
 - **The fastest form is a TensorRT fp16 trunk with the Warp head**, saving ~15 ms per refine (~26%). It runs inside the refine graph with no Warp changes: an engine enqueued on Warp's stream during `ScopedCapture` is captured like any kernel, after one uncaptured warm-up enqueue at the shape. Its cost is ~0.6% error in the errors and a GPU-specific engine.
 - In this test, ~18 ms of the `WarpTrunk` arm's ~70 ms is outside the trunk's ~54 ms: the head, the patch sampling and the torch window-0 trunk. That leaves the head (`_dense_kernel`, below) as the next target.
 
+## Potential speed-ups (2026-10-07)
+
+Where one refine goes with the TensorRT fp16 trunk + Warp head at 512 × 3 on the GTX 1650 Max-Q. Each stage was timed alone, on a cooler GPU than the table above, so the totals are lower:
+
+| stage | ms |
+|---|---|
+| **TensorRT fp16 trunk, 1025 patches** | **42–44** |
+| MPPI itself (vanilla replan) | ~2.5 |
+| Warp head, windows 1–2 (1024 rows) | 0.8 |
+| Warp head, window 0 (512 rows) | 0.5 |
+| `update()`: window-0 patch + torch trunk | 0.8 |
+| patch sampling, 1024 patches | 0.3 |
+
+The head, `update()` and sampling together are ~2.5 ms, so speeding them up (the `_dense_kernel` fix below) is worth ~1 ms. Halving the replan has to come from the trunk. TensorRT's per-layer profile (`IProfiler`, eager) shows only ~40% of the trunk is convolution arithmetic:
+
+| share | what |
+|---|---|
+| ~40% | the 7 convolutions |
+| ~20% | layout-conversion copies between the convolutions and the LayerNorms |
+| ~17% | separate replicate-pad ops, one before every conv |
+| ~12% | the channel LayerNorm, as transpose → mean → … → transpose → SiLU |
+
+TensorRT cannot fuse replicate padding or a per-pixel channel LayerNorm into its convolutions, so every block makes several extra trips through memory. Ideas, cheapest first (estimates, not measurements):
+
+1. ~~**Export with `--nchw-norm`**~~ **Tried, slower.** The fp16 static engine at 1025 patches took 71.1 ms against 50.8 ms for the current export (fastest of 9 interleaved rounds on a warm GPU; `WarpTrunk` 67.7 ms in the same run). Both match torch to 1.0e-2 on the code. The profile shows why. The NCHW form removed ~6 ms of layout copies as intended (14.7 → 8.6 ms), but TensorRT splits a LayerNorm over dim 1 into many separate layers (46 → 85 in total; norm and other 9.8 → 26.0 ms), and the convs got slower (24.6 → 31.0 ms). The permute-based form is the one TensorRT fuses into its own norm kernels, the opposite of torch, where the NCHW form is 1.6× faster. Reshaping the graph does not remove the glue: the replicate pads and the channel LayerNorm themselves are the problem, which leaves 2 and 3.
+2. **Evaluate the nn cost only on the top-K candidates by vanilla cost** (no retraining). MPPI keeps ~5 elites of 512 (`elite_frac` 0.01). The nn cost is ≥ 0, so a rollout outside the top K with a vanilla cost above the 5th-best total inside it cannot become an elite. That gives an exactness check each refine can run on the GPU and count failures of. K = 256 halves the trunk rows, K = 128 quarters them. It needs a top-K selection inside the graph, which can bisect for its cutoff as `_cem_reweight` already does. This is the one idea that halves the time on its own.
+3. **Retrain with TensorRT-friendly blocks: zero padding and BatchNorm** instead of replicate padding and channel LayerNorm. BatchNorm folds into the conv at inference, so each block becomes one fused conv + bias + SiLU kernel. That removes the ~50% glue, roughly 20–25 ms. Slimming the two heavy blocks (1: 32→32 at full resolution, 3: 64→64 at half) would cut it further. The cost is a retrain, re-validation, recalibrated cost weights and matching `WarpTrunk` changes.
+   **Speed measured with random weights; not retrained yet.** The trunk is `mppi_learning/model_tensorRT_friendly.py`. Its static fp16 engine at 1025 patches takes **23.2 ms against 50.3 ms** for the current one (2.16×; `WarpTrunk` 69.6 ms in the same run, fastest of 9 interleaved rounds). TensorRT builds it as 13 layers instead of 46: one fused conv + SiLU per block, with 96% of the time in convolution and no pads or norms left. The two heaviest blocks are still 1 (32→32 at full resolution, 6.8 ms) and 3 (64→64 at half resolution, 5.8 ms), so slimming them is the next lever. Whether the retrained net is as accurate as the original is still open: `train.py --trunk trt_friendly`, then `mppi_learning/compare_checkpoints.py <original.pt> <trt.pt>`.
+4. **INT8 TensorRT.** The 1650 has no tensor cores, but its int8 instructions run up to 4× the fp32 rate. It needs calibration data and an accuracy check. It matters more on the Orin, which has int8 tensor cores.
+5. **Cache terrain codes on a pose lattice** (x, y, yaw bins), filled lazily and kept across replans. The map is static within a replan and the robot moves ~0.15 m per replan, so most codes would be reused. The cost is pose-quantization error, which has to be measured against the net's own error.
+
+With 1 ruled out, 2 is the remaining lever without retraining: K = 256 would bring the trunk from ~43 to ~22 ms. 3 is the structural fix if the net is retrained anyway.
+
 ## Open
 - `mppi_cost._dense_kernel`, which runs the head, has the same scalar-`vec4`-load problem, so the same fix should speed it up.

@@ -42,6 +42,9 @@ CLI parameters:
     --embed-dim INT              command-embedding / FiLM width (default: 64)
     --head-fusion {film,concat}  (default: film)
     --label-mode {pos_rot,pos_rpy}  (e_pos, e_rot), or (e_pos, e_roll, e_pitch, e_yaw) (default: pos_rot)
+    --trunk {original,trt_friendly}  the trunk blocks: replicate pad + channel LayerNorm, or zero pad +
+                              BatchNorm (model_tensorRT_friendly.py, which TensorRT fuses); stored in the
+                              checkpoint, which load_checkpoint rebuilds from (default: original)
     --no-augment                 disable the y-mirror augmentation (on by default)
     --blur-terrain               baseline: relief replaced by its per-sample mean, train AND eval
     --batch-size INT             default: 256
@@ -111,6 +114,9 @@ from feasibility.mppi_learning.model import TargetTransform
 from feasibility.mppi_learning.model import V_SCALE
 from feasibility.mppi_learning.model import WindowDivergenceNet
 from feasibility.mppi_learning.model import WZ_SCALE
+from feasibility.mppi_learning.model_tensorRT_friendly import TRUNK_STYLE
+from feasibility.mppi_learning.model_tensorRT_friendly import TRUNK_STYLES
+from feasibility.mppi_learning.model_tensorRT_friendly import TrtFriendlyWindowDivergenceNet
 
 # Pseudo-observations pulling each family's mean toward the global mean (lattice's kappa-bin value).
 FAMILY_MEAN_PSEUDO_COUNTS = KAPPA_MEAN_PSEUDO_COUNTS
@@ -202,6 +208,7 @@ def build_checkpoint(
         base_width=args.base_width,
         embed_dim=args.embed_dim,
         head_fusion=args.head_fusion,
+        trunk=TRUNK_STYLE if isinstance(model, TrtFriendlyWindowDivergenceNet) else "original",
         label_mode=model.label_mode,
         target_names=model.target_names,
         target_transform_mean=target_transform.normalizer.mean.cpu(),
@@ -238,7 +245,8 @@ def load_checkpoint(
             mean=ckpt["target_transform_mean"].to(device), std=ckpt["target_transform_std"].to(device)
         )
     )
-    model = WindowDivergenceNet(
+    net_class = TrtFriendlyWindowDivergenceNet if ckpt.get("trunk") == TRUNK_STYLE else WindowDivergenceNet
+    model = net_class(
         base_width=ckpt["base_width"],
         embed_dim=ckpt["embed_dim"],
         head_fusion=ckpt["head_fusion"],
@@ -375,7 +383,8 @@ def default_checkpoint_path(args: argparse.Namespace) -> pathlib.Path:
     stem = args.dataset[0].stem + (f"_plus{len(args.dataset) - 1}" if len(args.dataset) > 1 else "")
     tags = [("_blur", args.blur_terrain), (f"_{args.head_fusion}", args.head_fusion != "film"),
             ("_rpy", args.label_mode != "pos_rot"), ("_noinfeasible", args.drop_endpoint_infeasible),
-            ("_noflagged", args.drop_twin_flagged), ("_noaug", args.no_augment)]
+            ("_noflagged", args.drop_twin_flagged), ("_noaug", args.no_augment),
+            ("_trt", args.trunk == TRUNK_STYLE)]
     return OUT_DIR / "checkpoints" / f"{stem}{''.join(t for t, on in tags if on)}.pt"
 
 
@@ -402,7 +411,8 @@ def train(args: argparse.Namespace, run: wandb.sdk.wandb_run.Run) -> pathlib.Pat
     checkpoint_path = args.checkpoint or default_checkpoint_path(args)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
 
-    model = WindowDivergenceNet(
+    net_class = TrtFriendlyWindowDivergenceNet if args.trunk == TRUNK_STYLE else WindowDivergenceNet
+    model = net_class(
         base_width=args.base_width,
         embed_dim=args.embed_dim,
         head_fusion=args.head_fusion,
@@ -543,16 +553,17 @@ def self_test(args: argparse.Namespace) -> None:
         args.log_every = 1
 
         n_rows: dict[bool, int] = {}
-        # the filters, label mode and head fusion are independent, so one second run covers them all
-        for drop, label_mode, head_fusion in ((False, "pos_rot", "film"), (True, "pos_rpy", "concat")):
+        # the filters, label mode, head fusion and trunk are independent, so one second run covers them all
+        for drop, label_mode, head_fusion, trunk in ((False, "pos_rot", "film", "original"),
+                                                     (True, "pos_rpy", "concat", TRUNK_STYLE)):
             args.drop_endpoint_infeasible = args.drop_twin_flagged = drop
-            args.label_mode, args.head_fusion = label_mode, head_fusion
+            args.label_mode, args.head_fusion, args.trunk = label_mode, head_fusion, trunk
             args.checkpoint = None
             expected = default_checkpoint_path(args)
             args.checkpoint = pathlib.Path(tmp) / expected.name
-            assert expected.name == ("dataset_mppi_a_plus1_concat_rpy_noinfeasible_noflagged.pt" if drop
+            assert expected.name == ("dataset_mppi_a_plus1_concat_rpy_noinfeasible_noflagged_trt.pt" if drop
                                      else "dataset_mppi_a_plus1.pt"), expected.name
-            print(f"\n[self-test] training with filters={drop}, label_mode={label_mode}, head_fusion={head_fusion}")
+            print(f"\n[self-test] training with filters={drop}, label_mode={label_mode}, head_fusion={head_fusion}, trunk={trunk}")
             run = wandb.init(mode="disabled", config=vars(args))
             try:
                 checkpoint_path = train(args, run)
@@ -565,6 +576,7 @@ def self_test(args: argparse.Namespace) -> None:
             n_rows[drop] = len(ds)
             model, ckpt = load_checkpoint(checkpoint_path, torch.device("cpu"))
             assert model.label_mode == label_mode == ckpt["label_mode"] and model.head_fusion == head_fusion
+            assert isinstance(model, TrtFriendlyWindowDivergenceNet) == (ckpt["trunk"] == trunk == TRUNK_STYLE)
             assert tuple(ckpt["target_names"]) == model.target_names == ds.TARGET_NAMES
             assert ckpt["label_attrs"] == label_attrs(ds) and ckpt["label_attrs"]["k_turn"] == 1.0
             assert all(type(v) in (str, float, int) for v in ckpt["label_attrs"].values()), ckpt["label_attrs"]
@@ -601,6 +613,7 @@ def main() -> None:
     parser.add_argument("--base-width", type=int, default=DEFAULT_BASE_WIDTH, help=f"trunk channel unit (default: {DEFAULT_BASE_WIDTH})")
     parser.add_argument("--embed-dim", type=int, default=DEFAULT_EMBED_DIM, help=f"command-embedding / FiLM width (default: {DEFAULT_EMBED_DIM})")
     parser.add_argument("--head-fusion", type=str, default="film", choices=HEAD_FUSIONS, help="(default: film)")
+    parser.add_argument("--trunk", type=str, default="original", choices=TRUNK_STYLES, help="original (replicate pad + channel LayerNorm) or trt_friendly (zero pad + BatchNorm, model_tensorRT_friendly.py) (default: original)")
     parser.add_argument("--label-mode", type=str, default="pos_rot", choices=LABEL_MODES, help="(e_pos, e_rot), or (e_pos, e_roll, e_pitch, e_yaw) (default: pos_rot)")
     parser.add_argument("--no-augment", action="store_true", help="disable the y-mirror augmentation (on by default)")
     parser.add_argument("--blur-terrain", action="store_true", help="baseline: relief replaced by its per-sample mean, at train AND eval time")
