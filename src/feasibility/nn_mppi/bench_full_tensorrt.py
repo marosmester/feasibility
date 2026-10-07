@@ -33,8 +33,13 @@ replan is what `time_replan.py` times: `update` if any, `replan`, and the plan r
 Also reported: the mean GPU ms of MPPI's "cost" stage (cost kernel + hook) in that round, from
 `MppiGpu`'s CUDA events.
 
+Several `--checkpoint`s are timed in one interleaved run, each form named by the checkpoint's stem
+suffix, so two nets compare on one GPU state. A net `WarpTrunk` refuses (`model_tensorRT_friendly`)
+gets the TensorRT forms only, and its checks compare against its own first TRT-trunk form. Every
+`WindowCost` trunk is also checked against `net.terrain_code` on the patches the refine sampled.
+
 CLI parameters:
-    --checkpoint PATH   mppi_learning train.py checkpoint the ONNX files were exported from
+    --checkpoint PATH ...  mppi_learning train.py checkpoint(s) the ONNX files were exported from
     --onnx-dir PATH     ONNX export dir; engines are written there (default outputs/nn_mppi/onnx)
     --rollouts INT      MPPI rollouts (default 512)
     --windows INT       charged windows, 2 or 3 (default 3)
@@ -44,16 +49,19 @@ CLI parameters:
 
 Usage:
     python src/feasibility/nn_mppi/bench_full_tensorrt.py --checkpoint outputs/checkpoints/<ckpt>.pt
+    python src/feasibility/nn_mppi/bench_full_tensorrt.py --checkpoint outputs/checkpoints/<a>.pt outputs/checkpoints/<b>.pt
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import time
 
 import numpy as np
 import tensorrt as trt
+import torch
 import warp as wp
 from helhest.control.mppi import MppiGpu
 from helhest.engine.terrain import Grid
@@ -69,12 +77,15 @@ from feasibility.nn_mppi.build_tensorRt_engine import build
 from feasibility.nn_mppi.build_tensorRt_engine import LOGGER
 from feasibility.nn_mppi.build_tensorRt_engine import onnx_metadata
 from feasibility.nn_mppi.closed_loop import node_planner
+from feasibility.mppi_learning.model import WindowDivergenceNet
+from feasibility.nn_mppi.channel_layer_norm import _max_rel
 from feasibility.nn_mppi.closed_loop import routing_field
 from feasibility.nn_mppi.mppi_cost import _load
 from feasibility.nn_mppi.mppi_cost import _relief
 from feasibility.nn_mppi.mppi_cost import check_planner
 from feasibility.nn_mppi.mppi_cost import trunk_rows
 from feasibility.nn_mppi.mppi_cost import WindowCost
+from feasibility.nn_mppi.warp_trunk import _check_trunk
 
 DEVICE = "cuda:0"
 ROUTING_CELL = 0.32  # closed_loop.py's --routing-cell default
@@ -270,7 +281,7 @@ def window_cost_predictions(cost: WindowCost) -> np.ndarray:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--checkpoint", type=pathlib.Path, required=True, help="mppi_learning checkpoint")
+    parser.add_argument("--checkpoint", type=pathlib.Path, nargs="+", required=True, help="mppi_learning checkpoint(s)")
     parser.add_argument("--onnx-dir", type=pathlib.Path, default=pathlib.Path("outputs/nn_mppi/onnx"))
     parser.add_argument("--rollouts", type=int, default=512)
     parser.add_argument("--windows", type=int, default=3, choices=(2, 3))
@@ -281,14 +292,22 @@ def main() -> None:
 
     init_warp_device(DEVICE)
     device = wp.get_device(DEVICE)
-    net, attrs, blur = _load(args.checkpoint)
-    if blur:
-        raise SystemExit("blur_terrain checkpoints have no ONNX export")
+    stems = [c.stem for c in args.checkpoint]
+    common = os.path.commonprefix(stems) if len(stems) > 1 else None
+
+    def tag(stem: str) -> str:
+        return "" if common is None else f"[{stem[len(common):].lstrip('_') or 'base'}] "
+
+    nets = []
+    for checkpoint in args.checkpoint:
+        net, attrs, blur = _load(checkpoint)
+        if blur:
+            raise SystemExit(f"{checkpoint}: blur_terrain checkpoints have no ONNX export")
+        nets.append((checkpoint.stem, net, attrs))
+    attrs = nets[0][2]
     k_turn, mu = float(attrs["k_turn"]), float(attrs["mu"])
     terrain = build_centered_box(0.3, 0.08, 70.0, 12.0)
     lattice, lattice_grid, vcap = routing_field(terrain, GOAL, k_turn, ROUTING_CELL, 0.0, DEVICE)
-    weights = {k: WEIGHT for k in net.target_names}
-    stem, spec, width = args.checkpoint.stem, net.patch_spec, net.geometry.out_channels
 
     def planner() -> MppiGpu:
         p = node_planner(terrain, k_turn, mu, args.rollouts, 0.0, seed=0, device=DEVICE)
@@ -296,28 +315,42 @@ def main() -> None:
         p.cw.lattice_cap = vcap
         return p
 
-    # form -> (planner, cost hook or None, the window-0 update or None)
+    # form -> (planner, cost hook or None, the window-0 update or None); groups: (net, form names)
+    # per checkpoint, its first form the reference its other forms are checked against
     forms: dict[str, tuple[MppiGpu, object, object]] = {"vanilla": (planner(), None, None)}
-    p = planner()
-    cost = WindowCost(net, attrs, p, weights, baseline="none", n_windows=args.windows)
-    forms["WarpTrunk + Warp head"] = (p, cost, cost.update)
+    groups: list[tuple[WindowDivergenceNet, list[str]]] = []
     n_trunk = trunk_rows(args.rollouts, args.windows)
-    for precision in args.precision:
-        p = planner()
-        trunk = TrtTrunk(static_engine(args.onnx_dir, stem, "trunk", precision, n_trunk), n_trunk, spec.ny, spec.nx,
-                         width, device)
-        cost = WindowCost(net, attrs, p, weights, baseline="none", n_windows=args.windows, trunk=trunk)
-        forms[f"TRT trunk {precision} + Warp head"] = (p, cost, cost.update)
-    for precision in args.precision:
-        p = planner()
-        rows = p.n_cand + (args.windows - 1) * p.n_rollouts
-        cost = FullTrtCost(static_engine(args.onnx_dir, stem, "full", precision, rows), net, attrs, p, args.windows,
-                           weights)
-        forms[f"full TRT {precision}"] = (p, cost, None)
+    n_full = 0
+    for stem, net, attrs in nets:
+        weights = {k: WEIGHT for k in net.target_names}
+        spec, width, names = net.patch_spec, net.geometry.out_channels, []
+        try:
+            _check_trunk(net)
+        except ValueError:
+            print(f"[skip] {tag(stem)}WarpTrunk + Warp head: WarpTrunk does not implement this trunk")
+        else:
+            p = planner()
+            cost = WindowCost(net, attrs, p, weights, baseline="none", n_windows=args.windows)
+            names.append(f"{tag(stem)}WarpTrunk + Warp head")
+            forms[names[-1]] = (p, cost, cost.update)
+        for precision in args.precision:
+            p = planner()
+            trunk = TrtTrunk(static_engine(args.onnx_dir, stem, "trunk", precision, n_trunk), n_trunk, spec.ny,
+                             spec.nx, width, device)
+            cost = WindowCost(net, attrs, p, weights, baseline="none", n_windows=args.windows, trunk=trunk)
+            names.append(f"{tag(stem)}TRT trunk {precision} + Warp head")
+            forms[names[-1]] = (p, cost, cost.update)
+        for precision in args.precision:
+            p = planner()
+            n_full = p.n_cand + (args.windows - 1) * p.n_rollouts
+            cost = FullTrtCost(static_engine(args.onnx_dir, stem, "full", precision, n_full), net, attrs, p,
+                               args.windows, weights)
+            names.append(f"{tag(stem)}full TRT {precision}")
+            forms[names[-1]] = (p, cost, None)
+        groups.append((net, names))
     for p, cost, _ in forms.values():
         if cost is not None:
             p.set_cost_hook(cost)
-    n_full = next(c.rows for _, c, _ in forms.values() if isinstance(c, FullTrtCost))
     print(f"{device.name}, TensorRT {trt.__version__}: {args.rollouts} rollouts x {args.windows} windows x 1 refine; "
           f"trunk rows: WindowCost {n_trunk} (+ 1 torch patch in update), full TRT {n_full}")
 
@@ -327,21 +360,30 @@ def main() -> None:
             update(STATE)
         p.replan(STATE, GOAL, 1)
     vanilla = forms["vanilla"][0]
-    reference_planner, reference_cost, _ = forms["WarpTrunk + Warp head"]
-    reference = window_cost_predictions(reference_cost)
-    charge_ref = reference_planner.J.numpy() - vanilla.J.numpy()
-    for name, (p, cost, _) in forms.items():
-        assert np.array_equal(p.sim.controlled.numpy(), vanilla.sim.controlled.numpy()), name
-        if cost is None or cost is reference_cost:
-            continue
-        got = cost.predictions() if isinstance(cost, FullTrtCost) else window_cost_predictions(cost)
-        err = np.abs(got - reference).max() / np.abs(reference).max()
-        charge = p.J.numpy() - vanilla.J.numpy()
-        err_j = np.abs(charge - charge_ref).max() / np.abs(charge_ref).max()
-        print(f"[check] {name}: errors max rel diff {err:.1e}, charge to J max rel diff {err_j:.1e} "
-              f"(vs WarpTrunk + Warp head)")
-    print(f"[check] identical rollouts in every form; errors {', '.join(net.target_names)} span "
-          + ", ".join(f"[{reference[:, k].min():.3f}, {reference[:, k].max():.3f}]" for k in range(reference.shape[1])))
+    for p, _, _ in forms.values():
+        assert np.array_equal(p.sim.controlled.numpy(), vanilla.sim.controlled.numpy())
+    for net, names in groups:
+        for name in names:  # every in-graph trunk against torch on the patches this refine sampled
+            cost = forms[name][1]
+            if isinstance(cost, WindowCost):
+                with torch.no_grad():
+                    expected = net.terrain_code(wp.to_torch(cost.patches).unsqueeze(1)).flatten(1)
+                got = wp.to_torch(cost.terrain_trunk.code).reshape(cost.terrain_trunk.code.shape[0], -1)[:n_trunk]
+                print(f"[check] {name}: trunk code max rel diff vs torch {_max_rel(got, expected):.1e}")
+        reference_planner, reference_cost, _ = forms[names[0]]
+        reference = window_cost_predictions(reference_cost)
+        charge_ref = reference_planner.J.numpy() - vanilla.J.numpy()
+        for name in names[1:]:
+            p, cost, _ = forms[name]
+            got = cost.predictions() if isinstance(cost, FullTrtCost) else window_cost_predictions(cost)
+            err = np.abs(got - reference).max() / np.abs(reference).max()
+            charge = p.J.numpy() - vanilla.J.numpy()
+            err_j = np.abs(charge - charge_ref).max() / np.abs(charge_ref).max()
+            print(f"[check] {name}: errors max rel diff {err:.1e}, charge to J max rel diff {err_j:.1e} "
+                  f"(vs {names[0]})")
+        print(f"[check] {names[0]}: errors {', '.join(net.target_names)} span "
+              + ", ".join(f"[{reference[:, k].min():.3f}, {reference[:, k].max():.3f}]" for k in range(reference.shape[1])))
+    print("[check] identical rollouts in every form")
 
     rng = np.random.default_rng(0)
     states = [STATE + rng.normal(0.0, JITTER) for _ in range(args.reps)]
@@ -363,10 +405,11 @@ def main() -> None:
     print(f"[replan] wall ms per replan (median of {args.reps}, fastest of {args.rounds} interleaved rounds), "
           "and the GPU ms of MPPI's cost stage in that round")
     base = best["vanilla"][0]
-    ref = best["WarpTrunk + Warp head"][0]
+    ref_name = groups[0][1][0]  # the first checkpoint's first form: WarpTrunk + Warp head where it exists
+    ref = best[ref_name][0]
     for name, (wall, cost_ms) in best.items():
-        extra = "" if name == "vanilla" else f"  nn {wall - base:6.1f} ms  ({ref / wall:.2f}x WarpTrunk + Warp head's speed)"
-        print(f"  {name:28s} {wall:7.1f} ms   cost stage {cost_ms:6.1f} ms{extra}")
+        extra = "" if name == "vanilla" else f"  nn {wall - base:6.1f} ms  ({ref / wall:.2f}x {ref_name}'s speed)"
+        print(f"  {name:40s} {wall:7.1f} ms   cost stage {cost_ms:6.1f} ms{extra}")
 
 
 if __name__ == "__main__":
