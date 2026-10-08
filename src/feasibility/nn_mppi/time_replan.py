@@ -127,7 +127,7 @@ def main() -> None:
     device = wp.get_device(DEVICE)
     system = {"host": platform.node(), "gpu": device.name, "arch": f"sm_{device.arch}", "torch": str(torch.__version__),
               "warp": wp.__version__, "cuda_driver": ".".join(map(str, wp.get_cuda_driver_version()))}
-    terrain, map_name, start, goal = load_map(args.map, None, None)
+    terrain, map_name, start, goal, _ = load_map(args.map, None, None)
     net, attrs, blur = _load(args.checkpoint)
     k_turn, mu = float(attrs["k_turn"]), float(attrs["mu"])
     lattice, lattice_grid, vcap = routing_field(terrain, goal, k_turn, ROUTING_CELL, 0.0, DEVICE)

@@ -14,17 +14,24 @@ one replan per perception frame on the robot) each world:
      and sends its first step to ostrich -- yaw-compensated by the checkpoint's `ostrich_yaw_gain`,
      exactly as the dataset commanded ostrich, since that gain is part of what the net's labels mean.
 
-Every (arm, repeat) is one replicated world of ONE ostrich build (replicated worlds do not collide
-with each other), each with its own `MppiGpu`. Arms: `vanilla` (no hook), one `nn` arm per
-`--nn-weights` entry (the raw predicted error), and one `nnflat` arm per `--nn-flat-weights` entry
-(`WindowCost`'s baseline "flat": only the error predicted above the same command on level ground).
-Those charge window 0 only; `--windows 1 3` gives every weight entry a second arm, suffixed `w3`,
-that charges windows 1 and 2 as well, at the same per-window weights, so the pair differs only in
-the later windows. Their terrain codes come from one `WarpTrunk` shared by all arms. `--nn-refines
-1` charges the cost in the first refine of every replan only, suffix `r1`: the net ranks the
-rollouts once and the remaining refines use MPPI's own cost (`WindowCost.replan_split`, the hook
-behind a conditional graph node, so no recapture). Ostrich is nondeterministic, so repeats of one
-arm differ too.
+Two arms, each one replicated world of ONE ostrich build (replicated worlds do not collide with each
+other) with its own `MppiGpu`, from the same start: `vanilla` (no hook) and ONE nn arm. The nn arm
+charges `WindowCost` at `--nn-weights`, with `--baseline` "flat" (only the error predicted above the
+same command on level ground, arm `nnflat[...]`) or "none" (the raw prediction, arm `nn[...]`), over
+`--windows` windows (1 = window 0 only; 3 also charges windows 1 and 2 through a graph-captured
+`WarpTrunk`, suffix `w3`), in the first `--nn-refines` refines of each replan (suffix `rK`; the rest
+rank the rollouts by MPPI's own cost, `WindowCost.replan_split`, the hook behind a conditional graph
+node, so no recapture). Ostrich is nondeterministic, so two runs of one arm differ too.
+
+`--view` shows the run LIVE in Newton's ViewerGL as it is computed: each robot in its arm's colour
+(the PNG's), its driven trail, its current MPPI plan (the line above the trail: the twin's rollout of
+the nominal U as it entered the last refine, i.e. before the final reweight and the plan blend), and
+the goal's arrival circle in red. It starts paused: SPACE runs, "." steps one frame, ESC quits (the
+run ends there and is still saved). The run is paced to wall-clock real time when the planners are
+faster than that; otherwise it runs as fast as it can, and the window title shows the real-time
+factor. On the GTX 1050 even the window-0 pair cannot keep up: ostrich's own 4 steps take ~110 ms
+per 0.1 s frame (0.8x real time headless), the viewer's ~40 FPS cap brings it to ~0.55x, and a
+`--windows 3` arm adds ~100 ms of replan per frame (~70 ms on the 1650), ~0.45x.
 
 Timing: every replan is timed on the wall clock (`WindowCost.update` + `replan` + reading the plan
 back, which waits for the GPU), and every planner profiles its refine stages with CUDA events (the
@@ -58,35 +65,37 @@ CLI parameters:
                             `flat` (a 12 m flat map, start (-4, 0, 0), goal (4, 0))
     --start X Y YAW         override the sidecar's start
     --goal X Y              override the sidecar's goal
-    --nn-weights W [W ...]  one nn arm per entry, comma-separated weights in the checkpoint's
-                            target order (e.g. 100,100 for e_pos [1/m], e_rot [1/rad]); default 100,100
-    --nn-flat-weights W [W ...]  the same, one nnflat arm per entry (default none)
-    --no-vanilla            skip the vanilla arm
-    --repeats INT           worlds per arm (default 1)
+    --nn-weights W          the nn arm's comma-separated weights in the checkpoint's target order
+                            (e.g. 100,100 for e_pos [1/m], e_rot [1/rad]); default 100,100
+    --baseline none|flat    the nn arm's WindowCost baseline (default flat)
+    --no-vanilla            skip the vanilla arm (the nn arm alone)
+    --no-nn                 skip the nn arm (vanilla alone; the checkpoint still sets k_turn and the yaw gain)
+    --view                  live GL viewer (default: headless)
     --max-time S            per-run time limit (default 40)
-    --spin-frac F           MPPI SPIN prior fraction (default 0, the node's)
+    --spin-frac F           MPPI SPIN prior fraction (default: the sidecar's `spin_frac`, else 0, the node's)
     --reach-radius M        arrival radius (default 0.3, the node's plan_reach_radius)
     --batch INT             MPPI rollouts (default 4096)
     --n-refine INT          MPPI refines per replan (default 3)
-    --windows N [N ...]     windows each nn/nnflat arm charges, 1 (window 0) to 3; one arm per entry
-                            and weight entry (default 1)
-    --nn-refines K [K ...]  charge the nn cost in the first K refines of each replan only, 1 to
-                            --n-refine; one arm per entry, crossed with --windows (default: every refine)
+    --windows N             windows the nn arm charges, 1 (window 0) to 3 (default 1)
+    --nn-refines K          charge the nn cost in the first K refines of each replan only, 1 to
+                            --n-refine (default: every refine)
     --routing-cell M        cost-to-go cell size, the map max-pooled to it (default 0.32)
-    --pivot-cost C          cost-to-go point-turn primitives (default 0, the node's; a map whose only
-                            way out is a turn in place, like the garage, needs > 0 and --spin-frac)
+    --pivot-cost C          cost-to-go point-turn primitives (default: the sidecar's `pivot_cost`, else 0,
+                            the node's; a map whose only way out is a turn in place, like the garage,
+                            needs > 0 and --spin-frac)
     --tag STR               output file suffix (default: the arms)
 
 Usage:
+    python src/feasibility/nn_mppi/closed_loop.py --checkpoint outputs/checkpoints/dataset_mppi_default_maps0_centered_M200_R10_seed0.pt \
+    --map assets/curb_detour/curb_detour_h015_g04 --batch 512 --n-refine 1 --windows 3 --view
     python src/feasibility/nn_mppi/closed_loop.py --checkpoint outputs/checkpoints/<ckpt>.pt --map flat
     python src/feasibility/nn_mppi/closed_loop.py --checkpoint outputs/checkpoints/<ckpt>.pt \\
-        --map assets/garage/garage_b --pivot-cost 0.15 --spin-frac 0.1 --nn-weights 3,3 10,10 --repeats 2
+        --map assets/curb_detour/curb_detour_h015_g04 --batch 512 --n-refine 1 --windows 3 --view
     python src/feasibility/nn_mppi/closed_loop.py --checkpoint outputs/checkpoints/<ckpt>.pt \\
-        --map assets/curb_detour/curb_detour_h015_g04 --batch 512 --n-refine 1 --nn-weights \\
-        --nn-flat-weights 30,30 100,100 300,300 --windows 1 3 --repeats 2
+        --map assets/curb_detour/curb_detour_h015_g04 --batch 512 --n-refine 3 --windows 3 --nn-refines 1 \\
+        --nn-weights 300,300
     python src/feasibility/nn_mppi/closed_loop.py --checkpoint outputs/checkpoints/<ckpt>.pt \\
-        --map assets/curb_detour/curb_detour_h015_g04 --batch 512 --n-refine 3 --nn-weights \\
-        --nn-flat-weights 100,100 300,300 --windows 3 --nn-refines 1 3 --repeats 2
+        --map assets/garage/garage_b --pivot-cost 0.15 --spin-frac 0.1 --baseline none --nn-weights 10,10
 """
 from __future__ import annotations
 
@@ -94,8 +103,10 @@ import argparse
 import dataclasses
 import pathlib
 import time
+from collections.abc import Callable
 
 import h5py
+import newton
 import numpy as np
 import torch
 import warp as wp
@@ -134,9 +145,7 @@ from feasibility.mppi_learning.train import load_checkpoint
 from feasibility.mppi_learning.twin import run_twin
 from feasibility.nn_mppi.mppi_cost import HORIZON
 from feasibility.nn_mppi.mppi_cost import N_KNOTS
-from feasibility.nn_mppi.mppi_cost import trunk_rows
 from feasibility.nn_mppi.mppi_cost import WindowCost
-from feasibility.nn_mppi.warp_trunk import WarpTrunk
 
 OUT = OUT_DIR / "nn_mppi"
 SETTLE_STEPS = 15  # ostrich steps dropping onto the terrain at zero command (mppi configs' settle_steps)
@@ -146,6 +155,12 @@ STAGES = ("sample", "rollout", "cost", "reweight")  # MppiGpu's profiled refine 
 PLAN_CONSISTENCY = 0.3  # the node's EMA of the new plan toward the previous one, shifted a step
 EDGE_MARGIN = 0.5  # [m] a world this close to the map edge is stopped as off_map
 FLIP_DEG = 60.0  # |pitch| or |roll| past this: flipped
+GOAL_COLOR = (1.0, 0.1, 0.1)  # --view: the arrival circle
+PLAN_DZ = 0.10  # [m] --view: a plan line this far above its trail
+# --view: the camera behind the start, looking along start -> goal from above
+CAMERA_BACK = 4.0  # [m]
+CAMERA_UP = 6.0  # [m] above the highest terrain
+CAMERA_PITCH = -40.0
 
 
 def node_planner(
@@ -182,7 +197,21 @@ def routing_field(
 class OstrichStepper(HelhestBatchSimulator):
     """`HelhestBatchSimulator` driven one MPPI frame at a time: the host writes each world's wheel
     command for the next STEPS_PER_FRAME rows of the setpoint buffer, then the captured physics step
-    runs that many times. The pose and wheel logs cover the whole run, settle included."""
+    runs that many times. The pose and wheel logs cover the whole run, settle included. World w's
+    shapes are tinted `world_colors[w]`, which only the live viewer shows."""
+
+    def __init__(self, *args, world_colors: list[tuple[float, float, float]], **kwargs) -> None:
+        self._world_colors = world_colors  # before super().__init__, which calls build_model
+        super().__init__(*args, **kwargs)
+
+    def build_model(self) -> newton.Model:
+        """Tint each world's shapes here: the viewer reads shape_color in set_model, right after."""
+        model = super().build_model()
+        world, color = model.shape_world.numpy(), model.shape_color.numpy()
+        for w, rgb in enumerate(self._world_colors):
+            color[world == w] = rgb  # the terrain (world -1) keeps its colour
+        model.shape_color.assign(color)
+        return model
 
     def begin(self, n_frames: int) -> None:
         worlds, dev = self.simulation_config.num_worlds, self.model.device
@@ -204,11 +233,15 @@ class OstrichStepper(HelhestBatchSimulator):
             wp.capture_launch(self._graph)
         self.step += n
 
-    def drive(self, command: np.ndarray) -> None:
-        """[W, 3] ostrich wheel speeds, held for one MPPI frame."""
+    def drive(self, command: np.ndarray, after_step: Callable[[bool], None] | None = None) -> None:
+        """[W, 3] ostrich wheel speeds, held for one MPPI frame; `after_step(last)` runs after every
+        ostrich step, `last` on the frame's final one (the live view draws there)."""
         rows = self._setpoints_wp[self.step : self.step + STEPS_PER_FRAME]
         rows.assign(np.ascontiguousarray(np.broadcast_to(command, rows.shape), np.float32))
-        self._launch(STEPS_PER_FRAME)
+        for k in range(STEPS_PER_FRAME):
+            self._launch(1)
+            if after_step is not None:
+                after_step(k == STEPS_PER_FRAME - 1)
 
     def state(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Now, per world: (x, y, yaw) [W, 3], wheel speeds [W, 3], body twist [W, 3], pose [W, 7]."""
@@ -231,6 +264,82 @@ class Arm:
     nn_refines: int = 0  # charge the cost in the first nn_refines refines only (nn arms)
 
 
+class LiveView:
+    """`--view`: the ostrich build's own ViewerGL, drawn after the ostrich steps and paced to
+    wall-clock real time per MPPI frame (never catching up: a slow frame just runs late, and a pause
+    costs nothing). Draws each world's robot
+    (tinted by `OstrichStepper`), driven trail, current MPPI plan and the goal's arrival circle."""
+
+    def __init__(self, ostrich: OstrichStepper, terrain: HeightMapReader, start: np.ndarray, goal: tuple[float, float],
+                 reach_radius: float, colors: list[tuple[float, float, float]]) -> None:
+        from feasibility.mppi_learning.gl_dataset_browser import ground_polyline  # pyglet: only with a display
+
+        self._ground = ground_polyline
+        self.ostrich, self.terrain, self.colors = ostrich, terrain, colors
+        self.viewer = ostrich.viewer
+        # Newton spreads worlds apart for display, which would put the robots beside the one shared
+        # terrain (demos/ostrich_follow_path_dual.py explains); here they belong on top of each other
+        self.viewer.set_world_offsets((0.0, 0.0, 0.0))
+        heading = np.arctan2(goal[1] - start[1], goal[0] - start[0])
+        self.viewer.set_camera(
+            pos=wp.vec3(start[0] - CAMERA_BACK * np.cos(heading), start[1] - CAMERA_BACK * np.sin(heading),
+                        terrain.max_z + CAMERA_UP),
+            pitch=CAMERA_PITCH, yaw=float(np.degrees(heading)),
+        )
+        self.viewer._paused = True  # start paused: SPACE runs, "." steps (no public setter)
+        angle = np.linspace(0.0, 2.0 * np.pi, 33)
+        self._goal = self._segments(ground_polyline(terrain, goal[0] + reach_radius * np.cos(angle),
+                                                    goal[1] + reach_radius * np.sin(angle)))
+        self.trails: list[list[np.ndarray]] = [[] for _ in colors]
+        self.plans: list[np.ndarray | None] = [None] * len(colors)
+        self.start_frame()
+
+    def _segments(self, points: np.ndarray) -> tuple[wp.array, wp.array]:
+        device = self.ostrich.model.device
+        return wp.array(points[:-1], dtype=wp.vec3, device=device), wp.array(points[1:], dtype=wp.vec3, device=device)
+
+    def record(self, w: int, xy: np.ndarray, plan: np.ndarray | None) -> None:
+        """World w is at `xy` [2]; `plan` [H, 2] is its MPPI plan from there (None: it stopped)."""
+        self.trails[w].append(np.asarray(xy[:2], np.float64))
+        self.plans[w] = plan
+
+    def render(self, title: str | None = None) -> None:
+        if title is not None:
+            self.viewer.renderer.set_title(title)
+        self.viewer.begin_frame(self.ostrich.step * OSTRICH_DT)
+        self.viewer.log_state(self.ostrich.current_state)
+        self.viewer.log_lines("/goal", *self._goal, colors=GOAL_COLOR)
+        for w, color in enumerate(self.colors):
+            trail = np.array(self.trails[w])
+            if len(trail) >= 2:
+                self.viewer.log_lines(f"/trail_{w}", *self._segments(self._ground(self.terrain, trail[:, 0], trail[:, 1])),
+                                      colors=color)
+            plan = self.plans[w]
+            if plan is not None and len(plan) >= 2:
+                points = self._ground(self.terrain, plan[:, 0], plan[:, 1])
+                points[:, 2] += PLAN_DZ
+                self.viewer.log_lines(f"/plan_{w}", *self._segments(points), colors=tuple(0.5 + 0.5 * c for c in color))
+            elif plan is None:
+                self.viewer.log_lines(f"/plan_{w}", None, None, None)  # a stopped world's plan goes
+        self.viewer.end_frame()
+
+    def start_frame(self) -> None:
+        """An MPPI frame starts now: its MPPI_DT of wall clock, planning included, runs from here."""
+        self._frame_t0, self._steps = time.perf_counter(), 0
+
+    def pace(self, last: bool) -> None:
+        """After an ostrich step: draw it unless the frame is already late (the viewer caps at ~40
+        FPS, so drawing every step of a late frame would double its time), always the frame's last
+        step; then wait out the step's OSTRICH_DT of wall clock if it is early."""
+        self._steps += 1
+        deadline = self._frame_t0 + self._steps * OSTRICH_DT
+        if last or time.perf_counter() < deadline:
+            self.render()
+        remaining = deadline - time.perf_counter()
+        if remaining > 0:
+            time.sleep(remaining)
+
+
 def pitch_roll(q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """[..., 4] (qx, qy, qz, qw) -> (pitch, roll) [...], ZYX."""
     qx, qy, qz, qw = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
@@ -239,7 +348,9 @@ def pitch_roll(q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return pitch, roll
 
 
-def load_map(spec: str, start: list[float] | None, goal: list[float] | None) -> tuple[HeightMapReader, str, np.ndarray, tuple[float, float]]:
+def load_map(spec: str, start: list[float] | None, goal: list[float] | None
+             ) -> tuple[HeightMapReader, str, np.ndarray, tuple[float, float], dict]:
+    """(terrain, name, start, goal, sidecar) -- the sidecar may also carry `spin_frac`/`pivot_cost`."""
     if spec == "flat":
         terrain, name, meta = HeightMapReader.flat(xlim=(-6.0, 6.0), ylim=(-6.0, 6.0), cell=0.05), "flat", {"start": [-4.0, 0.0, 0.0], "goal": [4.0, 0.0]}
     else:
@@ -250,56 +361,55 @@ def load_map(spec: str, start: list[float] | None, goal: list[float] | None) -> 
     goal = goal if goal is not None else meta.get("goal")
     if start is None or goal is None:
         raise SystemExit(f"{spec}: no start/goal in the sidecar -- pass --start X Y YAW --goal X Y")
-    return terrain, name, np.asarray(start[:3], np.float64), (float(goal[0]), float(goal[1]))
+    return terrain, name, np.asarray(start[:3], np.float64), (float(goal[0]), float(goal[1])), meta
 
 
 def run(args: argparse.Namespace) -> None:
     device = "cuda:0"
     init_warp_device(device)
-    terrain, map_name, start, goal = load_map(args.map, args.start, args.goal)
+    terrain, map_name, start, goal, meta = load_map(args.map, args.start, args.goal)
+    for key in ("spin_frac", "pivot_cost"):  # the CLI, else the map's sidecar, else the node's 0
+        if getattr(args, key) is None:
+            setattr(args, key, float(meta.get(key, 0.0)))
+    if args.no_vanilla and args.no_nn:
+        raise SystemExit("--no-vanilla and --no-nn leave nothing to run")
     net, ckpt = load_checkpoint(args.checkpoint, torch.device(device))
     net.eval()
     attrs = ckpt["label_attrs"]
     k_turn, mu, yaw_gain = float(attrs["k_turn"]), float(attrs["mu"]), float(attrs["ostrich_yaw_gain"])
 
-    nn_refines_list = args.nn_refines or [args.n_refine]
-    if not all(1 <= k <= args.n_refine for k in nn_refines_list):
-        raise SystemExit(f"--nn-refines {nn_refines_list}: each must be in [1, --n-refine {args.n_refine}]")
-    arms = [] if args.no_vanilla else [Arm("vanilla", None)]
-    for flag, prefix, baseline, entries in (("--nn-weights", "nn", "none", args.nn_weights),
-                                            ("--nn-flat-weights", "nnflat", "flat", args.nn_flat_weights)):
-        for text in entries:
-            values = [float(v) for v in text.split(",")]
-            if len(values) != len(net.target_names):
-                raise SystemExit(f"{flag} {text}: need {len(net.target_names)} values for {net.target_names}")
-            for n_windows in args.windows:
-                for nn_refines in nn_refines_list:
-                    # window 0 alone, charged in every refine, keeps the old arm names
-                    suffix = (f"w{n_windows}" if n_windows > 1 else "") + (f"r{nn_refines}" if nn_refines < args.n_refine else "")
-                    arms.append(Arm(f"{prefix}[{text}]{suffix}", dict(zip(net.target_names, values)), baseline, n_windows,
-                                    nn_refines))
-    worlds = [(arm, r) for arm in arms for r in range(args.repeats)]
-    n_worlds, n_frames = len(worlds), int(round(args.max_time / MPPI_DT))
+    nn_refines = args.nn_refines or args.n_refine
+    if not 1 <= nn_refines <= args.n_refine:
+        raise SystemExit(f"--nn-refines {nn_refines}: must be in [1, --n-refine {args.n_refine}]")
+    if not 1 <= args.windows <= N_KNOTS - 1:
+        raise SystemExit(f"--windows {args.windows}: must be in [1, {N_KNOTS - 1}]")
+    values = [float(v) for v in args.nn_weights.split(",")]
+    if len(values) != len(net.target_names):
+        raise SystemExit(f"--nn-weights {args.nn_weights}: need {len(net.target_names)} values for {net.target_names}")
+    # window 0 alone, charged in every refine, keeps the plain arm name
+    suffix = (f"w{args.windows}" if args.windows > 1 else "") + (f"r{nn_refines}" if nn_refines < args.n_refine else "")
+    prefix = "nnflat" if args.baseline == "flat" else "nn"
+    nn_arm = Arm(f"{prefix}[{args.nn_weights}]{suffix}", dict(zip(net.target_names, values)), args.baseline,
+                 args.windows, nn_refines)
+    arms = [nn_arm] if args.no_vanilla else [Arm("vanilla", None)] if args.no_nn else [Arm("vanilla", None), nn_arm]
+    n_worlds, n_frames = len(arms), int(round(args.max_time / MPPI_DT))
     print(f"[map]      {map_name}: {terrain.nx}x{terrain.ny} @ {terrain.cell} m, start {start.tolist()}, goal {goal}")
     print(f"[labels]   k_turn {k_turn}, mu {mu}, ostrich yaw gain {yaw_gain} ({args.checkpoint.name})")
-    print(f"[planner]  {args.batch} rollouts, {args.n_refine} refine(s) per replan")
-    print(f"[worlds]   {n_worlds}: " + ", ".join(f"{a.name} x{args.repeats}" for a in arms))
+    print(f"[planner]  {args.batch} rollouts, {args.n_refine} refine(s) per replan, spin_frac {args.spin_frac}, "
+          f"pivot_cost {args.pivot_cost}")
+    print("[arms]     " + ", ".join(a.name for a in arms))
 
     t0 = time.perf_counter()
     V, lattice_grid, vcap = routing_field(terrain, goal, k_turn, args.routing_cell, args.pivot_cost, device)
-    # one WarpTrunk for every arm charging later windows: the replans run one after another on one
-    # stream, so they can share its activation buffers (~0.2 GB per 1000 patches)
-    most_windows = max([a.windows for a in arms if a.weights is not None], default=1)
-    trunk = WarpTrunk(net, trunk_rows(args.batch, most_windows), device) if most_windows > 1 else None
     planners, costs = [], []
-    for i, (arm, _) in enumerate(worlds):
+    for i, arm in enumerate(arms):
         planner = node_planner(terrain, k_turn, mu, args.batch, args.spin_frac, seed=i, device=device)
         planner.set_lattice(V, lattice_grid)
         planner.cw.lattice_cap = vcap
         cost = None
         if arm.weights is not None:
             cost = WindowCost(net, attrs, planner, arm.weights, blur_terrain=bool(ckpt["blur_terrain"]), baseline=arm.baseline,
-                              n_windows=arm.windows, trunk=trunk, switchable=arm.nn_refines < args.n_refine)
+                              n_windows=arm.windows, switchable=arm.nn_refines < args.n_refine)
             planner.set_cost_hook(cost)
         planners.append(planner)
         costs.append(cost)
@@ -309,14 +419,19 @@ def run(args: argparse.Namespace) -> None:
     spawn_zpr = spawn_zpr.astype(np.float64)
     spawn_zpr[:, 0] += SPAWN_CLEARANCE
     sim_config, render_config, engine_config, logging_config = compose_ostrich_config(())
-    render_config.vis_type = "null"
+    render_config.vis_type = "gl" if args.view else "null"
     sim_config.target_timestep_seconds = OSTRICH_DT
     sim_config.num_worlds = n_worlds
+    colors = arm_colors([a.name for a in arms])
     ostrich = OstrichStepper(
         sim_config, render_config, engine_config, logging_config, k_p=K_P, **friction_kwargs(mu),
         terrain=terrain, spawn_pose=np.repeat(start[None], n_worlds, 0), spawn_zpr=np.repeat(spawn_zpr, n_worlds, 0),
+        world_colors=colors,
     )
+    view = LiveView(ostrich, terrain, start, goal, args.reach_radius, colors) if args.view else None
     ostrich.begin(n_frames)
+    if view is not None:
+        print("[view]     paused: SPACE runs, '.' steps one frame, ESC quits (the run is still saved)")
 
     x_lo, y_lo = terrain.x0 + EDGE_MARGIN, terrain.y0 + EDGE_MARGIN
     x_hi, y_hi = terrain.x0 + terrain.nx * terrain.cell - EDGE_MARGIN, terrain.y0 + terrain.ny * terrain.cell - EDGE_MARGIN
@@ -327,7 +442,19 @@ def run(args: argparse.Namespace) -> None:
     driving = np.zeros((n_frames, n_worlds), bool)  # the frame's command came from MPPI
     previous_plan = [None] * n_worlds
     plan_ms = np.full((n_frames, n_worlds), np.nan, np.float32)  # update + replan + the plan's readback
-    for f in range(n_frames):
+    t_run, rtf = time.perf_counter(), 1.0
+    f = 0
+    while f < n_frames:
+        if view is not None:
+            if not view.viewer.is_running():  # closed: end the run here, keep what was driven
+                status[~done], end_frame[~done], done[:] = "closed", f, True
+                n_frames = f
+                break
+            if not view.viewer.should_step():  # paused (SPACE runs, "." steps one frame)
+                view.render()
+                continue
+            view.start_frame()
+        t_frame = time.perf_counter()
         xy_yaw, wheels, twist, pose = ostrich.state()
         pitch, roll = pitch_roll(pose[:, 3:7])
         for w in range(n_worlds):
@@ -344,6 +471,8 @@ def run(args: argparse.Namespace) -> None:
                 reason = "arrived"
             if reason is not None:
                 status[w], done[w], end_frame[w] = reason, True, f
+                if view is not None:
+                    view.record(w, xy_yaw[w], None)
         for w in np.flatnonzero(~done):
             t_world = time.perf_counter()
             planner, cost = planners[w], costs[w]
@@ -353,9 +482,12 @@ def run(args: argparse.Namespace) -> None:
                 planner.replan(xy_yaw[w], goal, args.n_refine)
             else:
                 cost.update(xy_yaw[w])
-                cost.replan_split(xy_yaw[w], goal, args.n_refine, worlds[w][0].nn_refines)
+                cost.replan_split(xy_yaw[w], goal, args.n_refine, arms[w].nn_refines)
             plan = planner.nominal()  # a device-to-host copy: waits for the replan's GPU work
             plan_ms[f, w] = (time.perf_counter() - t_world) * 1e3
+            if view is not None:
+                # candidate 0 is the nominal U: its twin rollout, [H + 1] poses, from the last refine
+                view.record(w, xy_yaw[w], planner.sim.controlled.numpy()[:, 0, :2])
             if previous_plan[w] is not None:
                 shifted = np.roll(previous_plan[w], -1, axis=0)
                 shifted[-1] = previous_plan[w][-1]
@@ -367,24 +499,36 @@ def run(args: argparse.Namespace) -> None:
         if done.all():
             n_frames = f
             break
-        ostrich.drive(compensate(commands[f], yaw_gain))
+        if view is not None:
+            title = f"{map_name}  t {f * MPPI_DT:5.1f} s  {rtf:4.2f}x real time  |  " + "  ".join(
+                f"{a.name}: {status[w] if done[w] else 'driving'}" for w, a in enumerate(arms))
+            view.viewer.renderer.set_title(title)
+        ostrich.drive(compensate(commands[f], yaw_gain), view.pace if view is not None else None)
+        rtf = 0.8 * rtf + 0.2 * MPPI_DT / (time.perf_counter() - t_frame)  # smoothed, for the title
         if f % 50 == 0:
             print(f"  t={f * MPPI_DT:5.1f} s: " + ", ".join(f"{status[w] if done[w] else 'driving'}" for w in range(n_worlds)))
+        f += 1
     n_run = min(n_frames, commands.shape[0])
     print(f"[run]      {n_run} frames, planning {np.nansum(plan_ms[:n_run]) / max(n_run, 1):.0f} ms per frame for {n_worlds} worlds")
+    print(f"[run]      {n_run * MPPI_DT:.1f} s simulated in {time.perf_counter() - t_run:.1f} s of wall clock"
+          + (" (pauses included)" if view is not None else ""))
 
     pose_log, wheel_log = ostrich.logs()
     windows = window_errors(terrain, pose_log, wheel_log, commands[:n_run], driving[:n_run], net, mu, k_turn, device)
-    report(worlds, status, end_frame, pose_log, windows, goal)
+    report(arms, status, end_frame, pose_log, windows)
     # per world, the mean ms of each refine stage over its replans, the first (cold) refine excluded
     stage_ms = np.array([[p.timing_stats()[s]["mean_ms"] for s in STAGES] for p in planners], np.float32)
-    report_timing(arms, worlds, plan_ms[:n_run], stage_ms)
+    report_timing(arms, plan_ms[:n_run], stage_ms)
     OUT.mkdir(parents=True, exist_ok=True)
     tag = args.tag or "_".join(a.name.replace("[", "").replace("]", "").replace(",", "-") for a in arms)
     stem = OUT / f"{map_name}_{tag}"
-    save(stem.with_suffix(".h5"), args, map_name, terrain, start, goal, worlds, status, end_frame, pose_log, wheel_log,
+    save(stem.with_suffix(".h5"), args, map_name, terrain, start, goal, arms, status, end_frame, pose_log, wheel_log,
          commands[:n_run], driving[:n_run], windows, attrs, plan_ms[:n_run], stage_ms)
-    plot(stem.with_suffix(".png"), terrain, start, goal, worlds, status, pose_log)
+    plot(stem.with_suffix(".png"), terrain, start, goal, arms, status, pose_log, colors)
+    if view is not None:
+        print("[view]     run over: the viewer holds the last frame until closed")
+        while view.viewer.is_running():
+            view.render()
 
 
 def frame_rows(frame: int) -> int:
@@ -433,11 +577,11 @@ def window_errors(
             "pred_level": predict(torch.zeros_like(patch))}
 
 
-def report(worlds: list[tuple[Arm, int]], status: np.ndarray, end_frame: np.ndarray, pose_log: np.ndarray,
-           windows: dict[str, np.ndarray], goal: tuple[float, float]) -> None:
-    print(f"\n{'world':>22} {'status':>9} {'time s':>7} {'path m':>7} {'|pitch|':>8} {'|roll|':>7} "
+def report(arms: list[Arm], status: np.ndarray, end_frame: np.ndarray, pose_log: np.ndarray,
+           windows: dict[str, np.ndarray]) -> None:
+    print(f"\n{'arm':>22} {'status':>9} {'time s':>7} {'path m':>7} {'|pitch|':>8} {'|roll|':>7} "
           f"{'e_pos true/pred':>16} {'e_rot true/pred':>16}")
-    for w, (arm, r) in enumerate(worlds):
+    for w, arm in enumerate(arms):
         rows = pose_log[SETTLE_STEPS : frame_rows(end_frame[w]), w]
         path = np.linalg.norm(np.diff(rows[:, :2], axis=0), axis=1).sum()
         pitch, roll = pitch_roll(rows[:, 3:7])
@@ -445,33 +589,32 @@ def report(worlds: list[tuple[Arm, int]], status: np.ndarray, end_frame: np.ndar
         true, pred = windows["true"][k], windows["pred"][k]
         errors = (f"{true[:, 0].mean():6.3f} / {pred[:, 0].mean():6.3f}   {true[:, 1].mean():6.3f} / {pred[:, 1].mean():6.3f}"
                   if k.any() else "      (no full window)")
-        print(f"{arm.name + f' #{r}':>22} {status[w]:>9} {end_frame[w] * MPPI_DT:7.1f} {path:7.2f} "
-              f"{np.degrees(np.abs(pitch).max()):7.1f}° {np.degrees(np.abs(roll).max()):6.1f}°   {errors}")
+        tilt = (f"{np.degrees(np.abs(pitch).max()):7.1f}° {np.degrees(np.abs(roll).max()):6.1f}°" if len(rows)
+                else f"{'-':>8} {'-':>7}")
+        print(f"{arm.name:>22} {status[w]:>9} {end_frame[w] * MPPI_DT:7.1f} {path:7.2f} {tilt}   {errors}")
     if len(windows["frame"]) > 2:
         true, pred = windows["true"], windows["pred"]
         corr = [np.corrcoef(true[:, j], pred[:, j])[0, 1] if np.isfinite(pred[:, j]).all() else np.nan for j in range(2)]
-        print(f"\n{len(true)} executed 1 s windows: mean over windows per world above (true = twin re-run vs "
+        print(f"\n{len(true)} executed 1 s windows: mean over windows per arm above (true = twin re-run vs "
               f"ostrich, pred = the net); correlation true vs pred e_pos {corr[0]:.2f}, e_rot {corr[1]:.2f}")
 
 
-def report_timing(arms: list[Arm], worlds: list[tuple[Arm, int]], plan_ms: np.ndarray, stage_ms: np.ndarray) -> None:
-    """Per arm, pooled over its worlds: wall time per replan (median and 90th percentile, the first
-    replan -- graph capture -- excluded) and the mean GPU time per refine stage. Worlds replan one
-    after another, so a replan has the GPU to itself, as on the robot."""
+def report_timing(arms: list[Arm], plan_ms: np.ndarray, stage_ms: np.ndarray) -> None:
+    """Per arm: wall time per replan (median and 90th percentile, the first replan -- graph capture
+    -- excluded) and the mean GPU time per refine stage. The arms replan one after another, so a
+    replan has the GPU to itself, as on the robot."""
     print(f"\n{'arm':>22} {'replan ms':>10} {'p90':>6}   per refine, ms: " + "  ".join(f"{s:>8}" for s in STAGES))
-    for arm in arms:
-        k = [w for w, (a, _) in enumerate(worlds) if a is arm]
-        times = plan_ms[1:, k]
+    for w, arm in enumerate(arms):
+        times = plan_ms[1:, w]
         times = times[np.isfinite(times)]
         if times.size == 0:
             continue
-        stages = stage_ms[k].mean(axis=0)
         print(f"{arm.name:>22} {np.median(times):10.1f} {np.percentile(times, 90):6.1f}                   "
-              + "  ".join(f"{t:8.2f}" for t in stages))
+              + "  ".join(f"{t:8.2f}" for t in stage_ms[w]))
 
 
 def save(path: pathlib.Path, args: argparse.Namespace, map_name: str, terrain: HeightMapReader, start: np.ndarray,
-         goal: tuple[float, float], worlds: list[tuple[Arm, int]], status: np.ndarray, end_frame: np.ndarray,
+         goal: tuple[float, float], arms: list[Arm], status: np.ndarray, end_frame: np.ndarray,
          pose_log: np.ndarray, wheel_log: np.ndarray, commands: np.ndarray, driving: np.ndarray,
          windows: dict[str, np.ndarray], label_attrs: dict[str, object], plan_ms: np.ndarray,
          stage_ms: np.ndarray) -> None:
@@ -488,14 +631,14 @@ def save(path: pathlib.Path, args: argparse.Namespace, map_name: str, terrain: H
             f.attrs[key] = getattr(args, key)
         for key, value in label_attrs.items():
             f.attrs[f"label_{key}"] = value
-        f["arm"] = np.array([a.name for a, _ in worlds], dtype=h5py.string_dtype())
-        f["arm_baseline"] = np.array([a.baseline for a, _ in worlds], dtype=h5py.string_dtype())
-        f["arm_windows"] = np.array([a.windows for a, _ in worlds])
-        f["arm_nn_refines"] = np.array([a.nn_refines for a, _ in worlds])  # refines charged, 0 = vanilla
+        # one world per arm, in this order
+        f["arm"] = np.array([a.name for a in arms], dtype=h5py.string_dtype())
+        f["arm_baseline"] = np.array([a.baseline for a in arms], dtype=h5py.string_dtype())
+        f["arm_windows"] = np.array([a.windows for a in arms])
+        f["arm_nn_refines"] = np.array([a.nn_refines for a in arms])  # refines charged, 0 = vanilla
         f["plan_ms"] = plan_ms  # [frames, W] wall time of update + replan + readback, NaN when not planning
         f["stage_ms"] = stage_ms  # [W, stages] mean GPU ms per refine stage
         f["stage_ms"].attrs["stages"] = list(STAGES)
-        f["repeat"] = np.array([r for _, r in worlds])
         f["status"] = np.array(list(status), dtype=h5py.string_dtype())
         f["end_frame"] = end_frame
         f["terrain"] = terrain.H.astype(np.float32)
@@ -512,14 +655,16 @@ def save(path: pathlib.Path, args: argparse.Namespace, map_name: str, terrain: H
 
 
 def arm_colors(names: list[str]) -> list[tuple[float, float, float]]:
-    """One RGB per arm, in arm order: matplotlib's tab10, as the PNG and gl_replay_closed_loop.py draw them."""
+    """One RGB per arm from matplotlib's tab10, in the PNG and the live view alike: vanilla purple,
+    the nn arm orange (fixed by name, so --no-vanilla does not recolour it)."""
     import matplotlib
 
-    return [tuple(float(c) for c in matplotlib.colormaps["tab10"](i)[:3]) for i in range(len(names))]
+    tab10 = matplotlib.colormaps["tab10"]
+    return [tuple(float(c) for c in tab10(4 if name == "vanilla" else 1)[:3]) for name in names]
 
 
 def plot(path: pathlib.Path, terrain: HeightMapReader, start: np.ndarray, goal: tuple[float, float],
-         worlds: list[tuple[Arm, int]], status: np.ndarray, pose_log: np.ndarray) -> None:
+         arms: list[Arm], status: np.ndarray, pose_log: np.ndarray, colors: list[tuple[float, float, float]]) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
@@ -529,12 +674,9 @@ def plot(path: pathlib.Path, terrain: HeightMapReader, start: np.ndarray, goal: 
     extent = (terrain.x0, terrain.x0 + terrain.nx * terrain.cell, terrain.y0, terrain.y0 + terrain.ny * terrain.cell)
     im = ax.imshow(terrain.H, origin="lower", extent=extent, cmap="gray")
     fig.colorbar(im, ax=ax, shrink=0.7, label="height [m]")
-    names = list(dict.fromkeys(a.name for a, _ in worlds))
-    colors = arm_colors(names)
-    for w, (arm, r) in enumerate(worlds):
+    for w, arm in enumerate(arms):
         xy = pose_log[SETTLE_STEPS:, w, :2]
-        ax.plot(xy[:, 0], xy[:, 1], color=colors[names.index(arm.name)], lw=1.5,
-                label=f"{arm.name} #{r}: {status[w]}")
+        ax.plot(xy[:, 0], xy[:, 1], color=colors[w], lw=1.5, label=f"{arm.name}: {status[w]}")
     ax.plot(*start[:2], "go", ms=8)
     ax.plot(*goal, "r*", ms=14)
     ax.set_aspect("equal")
@@ -551,19 +693,19 @@ if __name__ == "__main__":
     parser.add_argument("--map", type=str, default="flat", help="heightmap .png/stem with a start/goal sidecar, or 'flat'")
     parser.add_argument("--start", type=float, nargs=3, default=None, metavar=("X", "Y", "YAW"))
     parser.add_argument("--goal", type=float, nargs=2, default=None, metavar=("X", "Y"))
-    parser.add_argument("--nn-weights", type=str, nargs="*", default=["100,100"], help="one nn arm per entry, weights in the checkpoint's target order")
-    parser.add_argument("--nn-flat-weights", type=str, nargs="*", default=[], help="one nnflat arm (baseline 'flat') per entry")
+    parser.add_argument("--nn-weights", type=str, default="100,100", help="the nn arm's weights in the checkpoint's target order")
+    parser.add_argument("--baseline", choices=("none", "flat"), default="flat", help="the nn arm's WindowCost baseline")
     parser.add_argument("--no-vanilla", action="store_true", help="skip the vanilla arm")
-    parser.add_argument("--repeats", type=int, default=1, help="worlds per arm")
+    parser.add_argument("--no-nn", action="store_true", help="skip the nn arm (vanilla alone)")
+    parser.add_argument("--view", action="store_true", help="live GL viewer")
     parser.add_argument("--max-time", type=float, default=40.0, help="per-run time limit [s]")
-    parser.add_argument("--spin-frac", type=float, default=0.0, help="MPPI SPIN prior fraction (the node's 0)")
+    parser.add_argument("--spin-frac", type=float, default=None, help="MPPI SPIN prior fraction (default: the sidecar's, else the node's 0)")
     parser.add_argument("--reach-radius", type=float, default=0.3, help="arrival radius [m]")
     parser.add_argument("--batch", type=int, default=4096, help="MPPI rollouts")
     parser.add_argument("--n-refine", type=int, default=N_REFINE, help="MPPI refines per replan (the node's 3)")
-    parser.add_argument("--windows", type=int, nargs="+", default=[1], help="windows charged: one nn/nnflat arm per entry and weights")
-    parser.add_argument("--nn-refines", type=int, nargs="+", default=None,
-                        help="charge the nn cost in the first K refines only: one arm per entry (default: every refine)")
+    parser.add_argument("--windows", type=int, default=1, help="windows the nn arm charges, 1 to 3")
+    parser.add_argument("--nn-refines", type=int, default=None, help="charge the nn cost in the first K refines only (default: every refine)")
     parser.add_argument("--routing-cell", type=float, default=0.32, help="cost-to-go cell size [m]")
-    parser.add_argument("--pivot-cost", type=float, default=0.0, help="cost-to-go point-turn cost (the node's 0 = off)")
+    parser.add_argument("--pivot-cost", type=float, default=None, help="cost-to-go point-turn cost (default: the sidecar's, else the node's 0 = off)")
     parser.add_argument("--tag", type=str, default=None, help="output file suffix")
     run(parser.parse_args())

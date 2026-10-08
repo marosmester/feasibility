@@ -6,7 +6,7 @@ as `MppiGpu`'s cost hook INSIDE the captured refine graph. Default: 512 rollouts
 The forms differ in how much of the network they compute, which is what is being compared:
 
   * `WarpTrunk + Warp head`: the deployed `WindowCost(n_windows=3)`. Window 0 has one patch (every
-    rollout starts at one pose); `update` runs the torch trunk on it once, OUTSIDE the graph,
+    rollout starts at one pose); `update` runs a one-patch `WarpTrunk` on it once, OUTSIDE the graph,
     before the replan, and is timed as part of it. Inside the graph: every rollout's patches at
     steps 10 and 20, `WarpTrunk` over those `trunk_rows` patches, and the head per (window, rollout).
   * `TRT trunk + Warp head`: the same `WindowCost` with `WarpTrunk` swapped for a TensorRT trunk
@@ -352,7 +352,7 @@ def main() -> None:
         if cost is not None:
             p.set_cost_hook(cost)
     print(f"{device.name}, TensorRT {trt.__version__}: {args.rollouts} rollouts x {args.windows} windows x 1 refine; "
-          f"trunk rows: WindowCost {n_trunk} (+ 1 torch patch in update), full TRT {n_full}")
+          f"trunk rows: WindowCost {n_trunk} (+ 1 window-0 patch in update), full TRT {n_full}")
 
     # checks: one refine each from the same seed, nominal and start
     for p, cost, update in forms.values():

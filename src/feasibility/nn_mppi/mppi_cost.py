@@ -9,9 +9,11 @@ therefore split at the terrain code:
   * `update(state)`, called before each `planner.replan`, OUTSIDE the graph: a Warp kernel samples
     the body-frame patch at `state` from the planner's own elevation buffer (`sample_patches`'s
     cell centres, bilinear, edge clamping, wheel-contact reference, / wheel radius -- helhest's
-    `sample_field` has the same cell-centre convention as `HeightMapReader.sample`), torch runs
-    the trunk on it zero-copy, and the 256-number code is copied into a fixed Warp buffer. All on
-    Warp's stream, so the graph launched next reads the finished code.
+    `sample_field` has the same cell-centre convention as `HeightMapReader.sample`), a one-patch
+    `warp_trunk.WarpTrunk` runs the trunk on it (~40 torch launches cost more than the trunk's
+    arithmetic on one patch), and the 256-number code is copied into a fixed Warp buffer. All on
+    Warp's stream, so the graph launched next reads the finished code. A net `WarpTrunk` does not
+    implement (the `trt_friendly` trunk) or a `blur_terrain` checkpoint runs the torch trunk instead.
   * the hook (`MppiGpu.set_cost_hook(self)`), INSIDE the graph, pure Warp: window 0's command from
     `target_wheel_omega[0:10]` with `command.encode`'s least-squares mean + slope, the 7 features,
     the FiLM head, `TargetTransform`'s inverse, and `sum_k weight_k * e_k` added to `planner.J`.
@@ -514,13 +516,22 @@ class WindowCost:
             with torch.no_grad():
                 level = torch.zeros_like(self._patch_torch)
                 self._code_torch[1].copy_(self.net.terrain_code(prepare_patch(level, blur_terrain)).reshape(-1))
+        from feasibility.nn_mppi.warp_trunk import WarpTrunk  # warp_trunk imports this module's kernels
+
+        # window 0's one patch: WarpTrunk where it can (CUDA, no blur, a trunk it implements), else torch
+        self._window0_trunk: WarpTrunk | None = None
+        if self.device.is_cuda and not blur_terrain:
+            try:
+                self._window0_trunk = WarpTrunk(net, 1, self.device)
+            except ValueError as error:
+                print(f"[WindowCost] window 0 runs the torch trunk: {error}")
+        self._patch_batch = self.patch.reshape((1, spec.ny, spec.nx))
+        self._code_quads = width // 4
 
         # windows 1 .. n_windows - 1: a patch per rollout, so the trunk runs inside the graph (Warp)
         self.later: _Head | None = None
         if n_windows == 1:
             return
-        from feasibility.nn_mppi.warp_trunk import WarpTrunk  # warp_trunk imports this module's kernels
-
         needed = trunk_rows(planner.n_rollouts, n_windows)
         self.terrain_trunk = trunk if trunk is not None else WarpTrunk(net, needed, self.device)
         if self.terrain_trunk.max_batch < needed:
@@ -583,6 +594,10 @@ class WindowCost:
             inputs=[sim.elevation, sim.grid, self.pose, spec.x_min, spec.y_min, spec.cell, self.contacts, HEIGHT_SCALE],
             outputs=[self.patch], device=self.device,
         )
+        if self._window0_trunk is not None:
+            # into row 0 of this cost's own buffer: a shared later-window trunk is reused by other costs
+            wp.copy(self.code, self._window0_trunk(self._patch_batch), count=self._code_quads)
+            return
         with self._stream_context():
             code = self.net.terrain_code(prepare_patch(self._patch_torch, self.blur_terrain))
             self._code_torch[0].copy_(code.reshape(-1))
