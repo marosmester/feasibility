@@ -7,3 +7,10 @@ outputs/*
 assets
 imgui.ini
 wandb
+*.aux
+*.fls
+*.pdf
+*synctex.gz
+*.tex
+*.log
+*fdb_latexmk
