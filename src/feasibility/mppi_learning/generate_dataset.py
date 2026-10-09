@@ -224,12 +224,14 @@ def rollout_group(
     return results
 
 
-def realized_start(pose_log: np.ndarray, wheel_log: np.ndarray, w: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def realized_start(pose_log: np.ndarray, wheel_log: np.ndarray, w: int, steps_per_mppi_step: int | None = None
+                   ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Ostrich's state at the window start from the warm-up's logs [w, n, ...] (row k is the state
     after step k + 1, so row w - 1 is the window start): (x, y, yaw) [n, 3], wheel speeds [n, 3],
     body twist (vx, vy, yaw_rate) [n, 3] as the mean over the last MPPI step (the pose difference
-    across it, rotated into the body frame at the mid-step heading)."""
-    k = _exact_steps(MPPI_DT, OSTRICH_DT)
+    across it, rotated into the body frame at the mid-step heading). `steps_per_mppi_step` is the
+    ostrich steps in one MPPI step for logs run at another dt (None: OSTRICH_DT's, the dataset's)."""
+    k = _exact_steps(MPPI_DT, OSTRICH_DT) if steps_per_mppi_step is None else int(steps_per_mppi_step)
     last, prev = pose_log[w - 1].astype(np.float64), pose_log[w - 1 - k].astype(np.float64)
     yaw, yaw_prev = quat_to_yaw(last[:, 3:7]), quat_to_yaw(prev[:, 3:7])
     turn = np.angle(np.exp(1j * (yaw - yaw_prev)))

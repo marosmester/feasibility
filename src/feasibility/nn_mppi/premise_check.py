@@ -93,8 +93,11 @@ def score(h5: pathlib.Path, meta: dict) -> dict:
         pose = f["ostrich_pose"][:, 0]
         shape, (x0, y0), cell = f["terrain"].shape, f["terrain"].attrs["origin"], float(f["terrain"].attrs["cell"])
         dt = float(f.attrs["ostrich_dt"])
+        # read from the run, so a closed_loop --steps-per-frame run is scored on its own grid
+        n_step = int(f.attrs.get("steps_per_frame", STEPS_PER_FRAME))
+        settle = int(f.attrs.get("settle_steps", SETTLE_STEPS))
     extent = (shape[0] - 1) * cell
-    rows = pose[SETTLE_STEPS : SETTLE_STEPS + end_frame * STEPS_PER_FRAME + 1]
+    rows = pose[settle : settle + end_frame * n_step + 1]
     xy, yaw = rows[:, :2], quat_to_yaw(rows[:, 3:7])
     wheels = wheels_of(np.concatenate([xy, yaw[:, None]], -1))  # [T, 3, 2]
     # the CURB footprint is rasterised from the with map's rectangles for both runs, so the ctrl run
@@ -103,8 +106,8 @@ def score(h5: pathlib.Path, meta: dict) -> dict:
     d_wall = distance_field(meta["walls"], meta["wall_height"], extent, cell)
     contact = (sample_field(d_curb, x0, y0, cell, wheels).min(axis=1) < r).sum() * dt
     wall = float(sample_field(d_wall, x0, y0, cell, wheels).min()) - r
-    frames = rows[::STEPS_PER_FRAME]  # one per 0.1 s replan
-    fdt = STEPS_PER_FRAME * dt
+    frames = rows[::n_step]  # one per 0.1 s replan
+    fdt = n_step * dt
     v = np.linalg.norm(np.diff(frames[:, :2], axis=0), axis=1) / fdt
     fyaw = np.unwrap(quat_to_yaw(frames[:, 3:7]))
     wz = np.abs(np.diff(fyaw)) / fdt
